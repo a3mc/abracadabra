@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# xtask is a build tool, not production code.
+# It carries its own relaxed lint profile so its CLI printlns and panics
+# do not pollute production lint reports.
+[lints.clippy]
+pedantic = { level = "allow", priority = -1 }
+nursery  = { level = "allow", priority = -1 }
+cargo    = { level = "allow", priority = -1 }
+unwrap_used = "allow"
+expect_used = "allow"
+
+[dependencies]
+serde      = { version = "1.0.203", features = ["derive"] }  # audited 2026-05-24 [✓]
+serde_json = "1.0.120"                                       # audited 2026-05-24 [✓]

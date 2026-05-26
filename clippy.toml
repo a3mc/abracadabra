@@ -1,0 +1,10 @@
+msrv = "1.90.0"
+
+cognitive-complexity-threshold = 20
+too-many-arguments-threshold   = 6
+too-many-lines-threshold       = 100
+type-complexity-threshold      = 150
+enum-variant-size-threshold    = 200
+max-struct-bools               = 8
+
+avoid-breaking-exported-api = true

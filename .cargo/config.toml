@@ -1,0 +1,4 @@
+# Aliases: `cargo xtask <cmd>` runs the prebuilt xtask binary.
+# After the first build, target/release/xtask is cached and reused.
+[alias]
+xtask = "run --release --package xtask --"

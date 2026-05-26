@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: build · test · lint
+    # Pinned to ubuntu-22.04 to mirror the release runner so CI catches
+    # glibc / toolchain issues before they reach tag-time. Bumping the
+    # release runner forward in time should bump this one too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+      - name: build (release, locked)
+        run: cargo build --workspace --release --locked
+
+      - name: test (workspace, locked)
+        run: cargo test --workspace --locked
+
+      - name: clippy (production code)
+        run: cargo xtask lint-prod
+
+      # Strict: all targets (lib + bins + tests + examples), all
+      # crates including xtask, deny warnings. Tests get
+      # `#![cfg_attr(test, allow(...))]` exemptions at lib.rs for
+      # rules CLAUDE.md explicitly waives in test code (unwrap/expect,
+      # unreadable_literal, float_cmp).
+      - name: clippy (strict, all targets)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

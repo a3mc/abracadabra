@@ -1,0 +1,149 @@
+name: release
+
+# Triggered by publishing a tag matching `v*` (e.g. push `v0.1.0`).
+# Cargo.toml version must already match the tag — the workflow asserts
+# that and fails loudly otherwise.
+#
+# Linux-only build matrix:
+#
+#   x86_64-unknown-linux-gnu   built on `ubuntu-22.04` (glibc 2.35) so
+#                              the binary runs on Ubuntu 22.04, 24.04
+#                              and every newer release (glibc is
+#                              backwards-compatible — a binary built
+#                              against an OLDER glibc runs against
+#                              NEWER glibc, but not the other way
+#                              around). Building on `ubuntu-latest`
+#                              (= 24.04 today) would emit binaries
+#                              that refuse to run on still-supported
+#                              Ubuntu 22.04 systems.
+#
+#   x86_64-unknown-linux-musl  static binary linked against musl libc.
+#                              Zero glibc dependency — drop-anywhere
+#                              on any Linux distro, any version, any
+#                              libc, including containers and Alpine.
+#                              Slightly larger; slightly slower DNS.
+#                              The "if nothing else works, this will"
+#                              artefact.
+#
+# Both build with `--locked` so the released binary is bit-for-bit
+# reproducible from the committed Cargo.lock.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build · ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            apt: musl-tools
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: assert tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate_ver="$(grep -E '^version' crates/abracadabra/Cargo.toml | head -1 | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          if [[ "$tag" != "$crate_ver" ]]; then
+            echo "::error::tag '$GITHUB_REF_NAME' (=>$tag) does not match crate version '$crate_ver'"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches crate version $crate_ver"
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: install musl-tools
+        if: matrix.apt == 'musl-tools'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin abracadabra
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="abracadabra-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p dist staging
+          cp "target/${{ matrix.target }}/release/abracadabra" "staging/abracadabra"
+          tar czf "dist/${name}.tar.gz" -C staging abracadabra
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      # Extract the CHANGELOG.md section for this tag and use it as
+      # the release body. Avoids the duplicate "Full Changelog" footer
+      # that `generate_release_notes: true` produces for first tags
+      # and gives us deterministic notes that don't depend on commit
+      # history (relevant for the public release where history will
+      # be squashed). Sourced from `## [X.Y.Z]` through the next
+      # `## [` heading (exclusive). Missing entry => empty body
+      # (release still publishes, with a CI warning).
+      - name: extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 - <<EOF > release_notes.md
+          import re
+          with open("CHANGELOG.md") as f:
+              text = f.read()
+          pat = re.compile(
+              r"^## \[" + re.escape("$version") + r"\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          m = pat.search(text)
+          body = m.group(1).strip() if m else ""
+          # Trim trailing markdown link reference defs (e.g.
+          # `[Unreleased]: URL`) — they live at the bottom of the
+          # CHANGELOG file but render as nothing in the release body
+          # and add visual noise to the raw source.
+          lines = body.split("\n")
+          while lines and re.match(r"^\[[^\]]+\]:\s", lines[-1]):
+              lines.pop()
+          while lines and not lines[-1].strip():
+              lines.pop()
+          print("\n".join(lines), end="")
+          EOF
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::No CHANGELOG.md entry found for v$version — release body will be empty"
+          else
+            echo "Extracted release notes ($(wc -l < release_notes.md) lines)"
+          fi
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,14 @@
+# Rust build artefacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local-only state
+/log/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
