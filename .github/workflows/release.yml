@@ -27,6 +27,23 @@ name: release
 #
 # Both build with `--locked` so the released binary is bit-for-bit
 # reproducible from the committed Cargo.lock.
+#
+# Workflow shape — two phases:
+#
+#   Phase 1 (matrix `build`): each target builds its binary, packages
+#     into tar.gz + sha256, uploads the pair as a per-target Actions
+#     artifact. Targets run in parallel, fully isolated.
+#
+#   Phase 2 (single `publish`): depends on `build`. Downloads every
+#     artifact, extracts release notes from CHANGELOG.md, and runs
+#     softprops/action-gh-release ONCE with all files.
+#
+# This shape eliminates the parallel-write race that bit v0.1.1, where
+# both matrix jobs called softprops simultaneously, one created the
+# release with its files, the other raced for the same tag, retries
+# exhausted, and ended up creating a stray Draft release. With a
+# single `publish` job the release is created exactly once with the
+# complete file set.
 
 on:
   push:
@@ -98,14 +115,61 @@ jobs:
           tar czf "dist/${name}.tar.gz" -C staging abracadabra
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
+      - name: upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release
+    # Wait for every matrix expansion of `build` to succeed. If either
+    # target fails the build, `publish` is skipped and no release is
+    # created — the workflow ends with a "Failed" status and no asset
+    # half-publish is possible.
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          # Each matrix job uploaded a `dist-<target>/` artifact;
+          # merge-multiple collapses them so all tar.gz / sha256 files
+          # land flat in ./artifacts/ regardless of which target
+          # produced them.
+          merge-multiple: true
+
+      - name: list downloaded files
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "downloaded artifacts:"
+          ls -la artifacts/
+          # Sanity check: refuse to publish unless both tarballs are
+          # present. download-artifact only produces files we
+          # successfully uploaded, so this guards against any future
+          # change to `needs:` semantics that might let `publish` run
+          # with a partial artifact set.
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            f="artifacts/abracadabra-${GITHUB_REF_NAME}-${target}.tar.gz"
+            if [[ ! -f "$f" ]]; then
+              echo "::error::missing expected artifact: $f"
+              exit 1
+            fi
+          done
+
       # Extract the CHANGELOG.md section for this tag and use it as
       # the release body. Avoids the duplicate "Full Changelog" footer
       # that `generate_release_notes: true` produces for first tags
       # and gives us deterministic notes that don't depend on commit
-      # history (relevant for the public release where history will
-      # be squashed). Sourced from `## [X.Y.Z]` through the next
-      # `## [` heading (exclusive). Missing entry => empty body
-      # (release still publishes, with a CI warning).
+      # history. Sourced from `## [X.Y.Z]` through the next `## [`
+      # heading (exclusive). Missing entry => empty body (release
+      # still publishes, with a CI warning).
       - name: extract release notes from CHANGELOG.md
         shell: bash
         run: |
@@ -138,12 +202,12 @@ jobs:
             echo "Extracted release notes ($(wc -l < release_notes.md) lines)"
           fi
 
-      - name: upload to release
-        uses: softprops/action-gh-release@v3
+      - name: publish release
+        uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
           body_path: release_notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
