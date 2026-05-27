@@ -4,7 +4,7 @@
 
 **Solana Alpenglow validator log analyzer — terminal UI**
 
-[![ci](https://github.com/matsuro-hadouken/abracadabra/actions/workflows/ci.yml/badge.svg)](https://github.com/matsuro-hadouken/abracadabra/actions/workflows/ci.yml)
+[![ci](https://github.com/a3mc/abracadabra/actions/workflows/ci.yml/badge.svg)](https://github.com/a3mc/abracadabra/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![rustc](https://img.shields.io/badge/rustc-1.90%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -19,7 +19,7 @@ cargo build --release
 ./target/release/abracadabra path/to/validator.log
 ```
 
-Or grab a prebuilt binary from [Releases](https://github.com/matsuro-hadouken/abracadabra/releases) — Linux `gnu` (glibc ≥ 2.35) or fully-static `musl`.
+Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/releases) — Linux `gnu` (glibc ≥ 2.35) or fully-static `musl`.
 
 ## Tour
 
