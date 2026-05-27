@@ -122,25 +122,31 @@ pub fn pcts(sorted: &[i64]) -> (i64, i64, i64, i64) {
 
 /// For each `TimeoutCrashedLeader` event, the time until we next cast a
 /// `Voting notarize` for any subsequent slot.
+///
+/// Inverted pairs (`vn_at < tcl_at`, observable only via clock skew) are
+/// dropped via `SlotRecord::delta_us` and never surface to bucket/window
+/// aggregators or `Severity::from_us`.
 pub fn vote_resumes_after_tcl(state: &State) -> Vec<VoteResumeRecord> {
     let mut resumes = Vec::new();
     for evt in state.slots.values() {
-        let Some(tcl_at) = evt.timeout_crashed_leader_at else {
+        if evt.timeout_crashed_leader_at.is_none() {
             continue;
-        };
+        }
         let next = state
             .slots
             .range(evt.slot.saturating_add(1)..)
             .find_map(|(_, candidate)| candidate.voted_notarize_at.map(|ts| (candidate.slot, ts)));
-        if let Some((resume_slot, vn_at)) = next {
-            #[allow(clippy::cast_possible_truncation)]
-            let us = (vn_at - tcl_at).whole_microseconds() as i64;
-            resumes.push(VoteResumeRecord {
-                tcl_slot: evt.slot,
-                resume_slot,
-                resume_us: us,
-            });
-        }
+        let Some((resume_slot, vn_at)) = next else {
+            continue;
+        };
+        let Some(us) = SlotRecord::delta_us(evt.timeout_crashed_leader_at, Some(vn_at)) else {
+            continue;
+        };
+        resumes.push(VoteResumeRecord {
+            tcl_slot: evt.slot,
+            resume_slot,
+            resume_us: us,
+        });
     }
     resumes
 }
@@ -204,11 +210,14 @@ pub fn voting_gaps(state: &State, min_size: u64) -> Vec<VotingGap> {
 }
 
 /// Compute a percentile from a SORTED `i64` slice. Index = floor((len-1) * p).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// `p` is clamped to `[0.0, 1.0]`; non-finite `p` clamps to `0.0`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // safe: idx ∈ [0, len-1] after clamp
 pub fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
     if sorted.is_empty() {
         return None;
     }
+    // NaN-safe clamp: replace NaN with 0.0, then clamp to [0, 1].
+    let p = if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) };
     let idx = ((sorted.len() - 1) as f64 * p) as usize;
     sorted.get(idx).copied()
 }
@@ -222,9 +231,18 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// Classify a non-negative microsecond duration.
+    ///
+    /// Negative inputs (which TIME-01 prevents upstream) are treated as
+    /// `Severe` rather than silently sliding into `Normal` via integer
+    /// division truncation toward zero. `debug_assert` flags the upstream
+    /// invariant break in debug builds.
     pub const fn from_us(us: i64) -> Self {
-        let s = us / 1_000_000;
-        if s >= 3 {
+        debug_assert!(us >= 0, "Severity::from_us called with negative µs");
+        if us < 0 {
+            return Self::Severe;
+        }
+        if us >= 3_000_000 {
             Self::Severe
         } else if us >= 1_500_000 {
             Self::Elevated
@@ -328,5 +346,70 @@ mod tests {
         assert_eq!(percentile(&xs, 0.5), Some(5));
         assert_eq!(percentile(&xs, 1.0), Some(10));
         assert_eq!(percentile(&[], 0.5), None);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        assert_eq!(percentile(&[42], 0.0), Some(42));
+        assert_eq!(percentile(&[42], 0.5), Some(42));
+        assert_eq!(percentile(&[42], 1.0), Some(42));
+    }
+
+    #[test]
+    fn percentile_three_at_p1() {
+        assert_eq!(percentile(&[1, 2, 3], 1.0), Some(3));
+    }
+
+    #[test]
+    fn percentile_clamps_out_of_range() {
+        let xs = vec![10, 20, 30, 40, 50];
+        // p > 1 saturates at last element.
+        assert_eq!(percentile(&xs, 1.5), Some(50));
+        // p < 0 saturates at first element.
+        assert_eq!(percentile(&xs, -0.5), Some(10));
+        // NaN treated as 0.
+        assert_eq!(percentile(&xs, f64::NAN), Some(10));
+    }
+
+    #[test]
+    fn severity_thresholds() {
+        // Boundaries: <1.5 s Normal, [1.5, 3.0) Elevated, >=3.0 Severe.
+        assert_eq!(Severity::from_us(0), Severity::Normal);
+        assert_eq!(Severity::from_us(1_499_999), Severity::Normal);
+        assert_eq!(Severity::from_us(1_500_000), Severity::Elevated);
+        assert_eq!(Severity::from_us(2_999_999), Severity::Elevated);
+        assert_eq!(Severity::from_us(3_000_000), Severity::Severe);
+        assert_eq!(Severity::from_us(i64::MAX), Severity::Severe);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn severity_negative_releases_to_severe() {
+        // In release builds the debug_assert is elided; negative input still
+        // classifies as Severe rather than silently Normal.
+        assert_eq!(Severity::from_us(-1), Severity::Severe);
+        assert_eq!(Severity::from_us(-500), Severity::Severe);
+    }
+
+    #[test]
+    fn voting_gaps_empty_state() {
+        let s = mk_state();
+        assert!(voting_gaps(&s, 1).is_empty());
+    }
+
+    #[test]
+    fn vote_resume_skips_inverted_clock_skew() {
+        // Voting-notarize timestamp falls *before* the TCL timestamp (clock
+        // skew). Must be dropped, not emitted as a negative resume_us.
+        let mut s = mk_state();
+        {
+            let r = s.slot_mut(100);
+            r.timeout_crashed_leader_at = Some(datetime!(2026-05-23 16:00:14.000 UTC));
+        }
+        {
+            let r = s.slot_mut(104);
+            r.voted_notarize_at = Some(datetime!(2026-05-23 16:00:13.000 UTC));
+        }
+        assert!(vote_resumes_after_tcl(&s).is_empty());
     }
 }

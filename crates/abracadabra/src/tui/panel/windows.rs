@@ -14,14 +14,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Row, Table};
 use ratatui::Frame;
 
-use crate::model::state::State;
-use crate::model::window::{self, WindowStats};
+use crate::model::window::WindowStats;
+use crate::tui::app::App;
 use crate::tui::theme;
+use crate::tui::widget::commas;
 
 const DEFAULT_MS_PER_SLOT: f64 = 400.0;
 
-pub fn render(state: &State, frame: &mut Frame<'_>, area: Rect) {
-    let stats = window::compute(state, &window::default_windows());
+pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    let stats = app.window_stats.as_slice();
     if stats.is_empty() {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -30,12 +31,12 @@ pub fn render(state: &State, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
-    let header = build_header(&stats);
-    let rows = build_rows(&stats);
+    let header = build_header(stats);
+    let rows = build_rows(stats);
 
     // Constraints: 1 label column + 1 per window.
     let mut constraints = vec![Constraint::Length(24)];
-    for _ in &stats {
+    for _ in stats {
         constraints.push(Constraint::Length(11));
     }
 
@@ -226,18 +227,4 @@ fn humanize_dur(secs: i64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     format!("{h}h {m}m")
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

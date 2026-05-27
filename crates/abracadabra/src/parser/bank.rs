@@ -13,9 +13,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::parser::EventKind;
-
-const HASH_CHARS: &str = "[1-9A-HJ-NP-Za-km-z]+";
+use crate::parser::{must_compile, EventKind, HASH_CHARS, SLOT_DIGITS};
 
 pub fn parse_body(body: &str) -> Option<EventKind> {
     let caps = re_bank_frozen().captures(body)?;
@@ -29,16 +27,11 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
     })
 }
 
-fn must_compile(pattern: &str) -> Regex {
-    #[allow(clippy::expect_used)]
-    Regex::new(pattern).expect("static regex must compile")
-}
-
 fn re_bank_frozen() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^bank frozen: ([0-9]+) hash: ({HASH_CHARS}) signature_count: ([0-9]+)"
+            r"^bank frozen: ({SLOT_DIGITS}) hash: ({HASH_CHARS}) signature_count: ({SLOT_DIGITS})"
         ))
     })
 }

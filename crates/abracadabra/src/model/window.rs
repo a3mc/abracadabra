@@ -29,9 +29,13 @@ pub struct WindowStats {
     pub slot_count: u64,
     pub slot_rate_per_sec: f64,
 
-    /// Median observed inter-slot duration (microseconds).
+    /// Median observed inter-slot duration (microseconds). Counted over
+    /// strictly adjacent slot pairs `(n, n+1)` whose `first_shred_at`
+    /// timestamps both fall inside the window. Pairs separated by a gap in
+    /// the slot stream (skips, timeouts, missing observations) are
+    /// excluded.
     pub slot_duration_p50_us: i64,
-    /// p95 observed inter-slot duration (microseconds).
+    /// p95 of the same strictly-adjacent inter-slot duration distribution.
     pub slot_duration_p95_us: i64,
 
     pub fast_finalize_pct: f64,
@@ -91,9 +95,13 @@ fn compute_one(
     #[allow(clippy::cast_precision_loss)]
     let slot_rate_per_sec = slot_count as f64 / secs;
 
-    // Inter-slot duration: pair consecutive slots within the window.
+    // Inter-slot duration: pair *strictly adjacent* slots (n, n+1) within the
+    // window. Pairs separated by holes in the BTreeMap (timeouts, skipped
+    // slots, missing observations) are excluded so p95 reflects single-slot
+    // durations rather than `k × ideal_slot_time` for some `k > 1`.
     let mut durations: Vec<i64> = in_window
         .windows(2)
+        .filter(|pair| pair[1].slot == pair[0].slot.saturating_add(1))
         .filter_map(|pair| SlotRecord::slot_duration_us(pair[0], pair[1]))
         .collect();
     durations.sort_unstable();
@@ -153,27 +161,16 @@ fn compute_one(
         0.0
     };
 
-    // Vote-resume times: collect from TCL-bearing slots inside window where
-    // we have a next Voting notarize.
-    let mut resumes: Vec<i64> = Vec::new();
-    for r in &in_window {
-        let Some(tcl_at) = r.timeout_crashed_leader_at else {
-            continue;
-        };
-        let Some((_, next_vn_at)) = state
-            .slots
-            .range(r.slot.saturating_add(1)..)
-            .find_map(|(_, cand)| cand.voted_notarize_at.map(|ts| (cand.slot, ts)))
-        else {
-            continue;
-        };
-        let us = (next_vn_at - tcl_at).whole_microseconds();
-        #[allow(clippy::cast_possible_truncation)]
-        let us_i64 = us as i64;
-        if us_i64 >= 0 {
-            resumes.push(us_i64);
-        }
-    }
+    // Vote-resume times: reuse the canonical `analysis::vote_resumes_after_tcl`
+    // computation and keep only events whose TCL slot is part of this window.
+    // Inverted pairs are already dropped upstream by `SlotRecord::delta_us`.
+    let in_window_slots: std::collections::BTreeSet<u64> =
+        in_window.iter().map(|r| r.slot).collect();
+    let mut resumes: Vec<i64> = analysis::vote_resumes_after_tcl(state)
+        .into_iter()
+        .filter(|r| in_window_slots.contains(&r.tcl_slot))
+        .map(|r| r.resume_us)
+        .collect();
     resumes.sort_unstable();
 
     WindowStats {
@@ -247,6 +244,55 @@ mod tests {
     fn empty_state_yields_empty_vec() {
         let s = State::new(PathBuf::from("/tmp/x"), 0);
         assert!(compute(&s, &default_windows()).is_empty());
+    }
+
+    #[test]
+    fn single_slot_window_has_zero_duration_pcts() {
+        // One in-window slot → no pairs → percentile returns None → fallback 0.
+        let lo = datetime!(2026-05-23 00:00:00 UTC);
+        let hi = datetime!(2026-05-23 01:00:00 UTC);
+        let mut s = mk(lo, hi);
+        let r = s.slot_mut(1);
+        r.first_shred_at = Some(datetime!(2026-05-23 00:30:00 UTC));
+        let stats = compute(&s, &default_windows());
+        assert_eq!(stats[0].slot_duration_p50_us, 0);
+        assert_eq!(stats[0].slot_duration_p95_us, 0);
+    }
+
+    #[test]
+    fn slot_duration_excludes_non_adjacent_pairs() {
+        // Three observed slots: 1, 2, 100. Only (1, 2) is strictly adjacent;
+        // the (2, 100) pair has a 98-slot hole and must be excluded.
+        let lo = datetime!(2026-05-23 00:00:00 UTC);
+        let hi = datetime!(2026-05-23 01:00:00 UTC);
+        let mut s = mk(lo, hi);
+        s.slot_mut(1).first_shred_at = Some(datetime!(2026-05-23 00:30:00.000 UTC));
+        s.slot_mut(2).first_shred_at = Some(datetime!(2026-05-23 00:30:00.400 UTC));
+        s.slot_mut(100).first_shred_at = Some(datetime!(2026-05-23 00:30:45.000 UTC));
+        let stats = compute(&s, &default_windows());
+        // p95 over the one-element distribution {400_000 µs} == 400_000.
+        assert_eq!(stats[0].slot_duration_p50_us, 400_000);
+        assert_eq!(stats[0].slot_duration_p95_us, 400_000);
+    }
+
+    #[test]
+    fn vote_resume_in_window_uses_canonical_path() {
+        // TCL at slot 100, voted_notarize at slot 104, both inside window.
+        let lo = datetime!(2026-05-23 00:00:00 UTC);
+        let hi = datetime!(2026-05-23 02:00:00 UTC);
+        let mut s = mk(lo, hi);
+        {
+            let r = s.slot_mut(100);
+            r.first_shred_at = Some(datetime!(2026-05-23 01:00:00.000 UTC));
+            r.timeout_crashed_leader_at = Some(datetime!(2026-05-23 01:00:00.000 UTC));
+        }
+        {
+            let r = s.slot_mut(104);
+            r.first_shred_at = Some(datetime!(2026-05-23 01:00:01.500 UTC));
+            r.voted_notarize_at = Some(datetime!(2026-05-23 01:00:01.500 UTC));
+        }
+        let stats = compute(&s, &default_windows());
+        assert_eq!(stats[0].resume_p50_us, 1_500_000);
     }
 
     #[test]

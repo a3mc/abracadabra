@@ -21,9 +21,12 @@ pub struct BucketStats {
     /// Count of slots in this bucket for which the local validator was
     /// the leader (`we_are_leader`).
     pub our_leader_slots: u64,
-    /// First_shred -> finalized latencies (microseconds) for slots in this bucket.
+    /// First_shred -> finalized latencies (microseconds) for slots in this
+    /// bucket. Sorted ascending after `TimeBuckets::from_state` returns so
+    /// percentile queries on the TUI render path don't re-sort per frame.
     pub lifecycle_us: Vec<i64>,
     /// TimeoutCrashedLeader -> next Voting notarize times (microseconds).
+    /// Sorted ascending after `TimeBuckets::from_state` returns.
     pub resume_us: Vec<i64>,
 }
 
@@ -53,11 +56,17 @@ impl TimeBuckets {
         let n = ((total_secs + bucket_secs - 1) / bucket_secs).max(1) as usize;
         let bucket_size = Duration::seconds(bucket_secs);
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        // Use `Duration::seconds(bucket_secs * i)` with `i` widened to i64 so
+        // bucket offsets cannot wrap when callers exceed the CLI-enforced
+        // bucket-secs floor of 60s on a multi-year time range. saturating_mul
+        // is the safety net for the theoretical overflow case.
         let mut buckets: Vec<BucketStats> = (0..n)
-            .map(|i| BucketStats {
-                start: Some(lo + bucket_size * (i as i32)),
-                ..BucketStats::default()
+            .map(|i| {
+                let offset_secs = bucket_secs.saturating_mul(i as i64);
+                BucketStats {
+                    start: Some(lo + Duration::seconds(offset_secs)),
+                    ..BucketStats::default()
+                }
             })
             .collect();
 
@@ -110,6 +119,13 @@ impl TimeBuckets {
             };
             let idx = bucket_idx(tcl_at, lo, bucket_secs, n);
             buckets[idx].resume_us.push(r.resume_us);
+        }
+
+        // Sort per-bucket distributions once so subsequent percentile queries
+        // (called from the TUI render loop) are O(1) on already-sorted data.
+        for b in &mut buckets {
+            b.lifecycle_us.sort_unstable();
+            b.resume_us.sort_unstable();
         }
 
         Some(Self {
@@ -175,6 +191,11 @@ impl TimeBuckets {
     /// fraction of `fast + slow` (i.e. of finalized slots). Buckets
     /// with no finalize activity return `(0, 0)`. Useful as a dual
     /// series for the Time-series tab's stacked card.
+    ///
+    /// `slow_pct` is derived as `100 - fast_pct` (when `tot > 0`) so the
+    /// two shares are an exact partition of 100 by construction —
+    /// independent integer rounding would otherwise sum to 99 for
+    /// cases like `(fast=1, slow=2, tot=3)`.
     pub fn fast_slow_pct(&self) -> (Vec<u64>, Vec<u64>) {
         let mut fast = Vec::with_capacity(self.buckets.len());
         let mut slow = Vec::with_capacity(self.buckets.len());
@@ -185,53 +206,47 @@ impl TimeBuckets {
             // surface it as (0, 0). Spelled this way (rather than
             // `if tot == 0 ... else / tot`) to satisfy the
             // `manual_checked_ops` lint introduced in clippy 1.95.
-            fast.push(
-                b.finalized_fast
-                    .saturating_mul(100)
-                    .checked_div(tot)
-                    .unwrap_or(0),
-            );
-            slow.push(
-                b.finalized_slow
-                    .saturating_mul(100)
-                    .checked_div(tot)
-                    .unwrap_or(0),
-            );
+            let fast_pct = b
+                .finalized_fast
+                .saturating_mul(100)
+                .checked_div(tot)
+                .unwrap_or(0);
+            let slow_pct = if tot == 0 {
+                0
+            } else {
+                // fast_pct ≤ 100 by construction, so this never underflows.
+                100u64.saturating_sub(fast_pct)
+            };
+            fast.push(fast_pct);
+            slow.push(slow_pct);
         }
         (fast, slow)
     }
 
     /// p95 of lifecycle latency in microseconds per bucket (0 if empty).
+    /// Relies on `BucketStats::lifecycle_us` being pre-sorted in
+    /// `from_state`; called per TUI frame so cloning per query is a
+    /// non-starter.
     pub fn lifecycle_p95_us(&self) -> Vec<i64> {
         self.buckets
             .iter()
-            .map(|b| {
-                if b.lifecycle_us.is_empty() {
-                    return 0;
-                }
-                let mut v = b.lifecycle_us.clone();
-                v.sort_unstable();
-                analysis::percentile(&v, 0.95).unwrap_or(0)
-            })
+            .map(|b| analysis::percentile(&b.lifecycle_us, 0.95).unwrap_or(0))
             .collect()
     }
 
     /// p95 of vote-resume time in microseconds per bucket (0 if empty).
+    /// Relies on `BucketStats::resume_us` being pre-sorted in `from_state`.
     pub fn resume_p95_us(&self) -> Vec<i64> {
         self.buckets
             .iter()
-            .map(|b| {
-                if b.resume_us.is_empty() {
-                    return 0;
-                }
-                let mut v = b.resume_us.clone();
-                v.sort_unstable();
-                analysis::percentile(&v, 0.95).unwrap_or(0)
-            })
+            .map(|b| analysis::percentile(&b.resume_us, 0.95).unwrap_or(0))
             .collect()
     }
 }
 
+// safe: `elapsed >= 0` after `max(0)`, `bucket_secs >= 1` enforced in
+// `from_state`, so `elapsed / bucket_secs` ≥ 0 and fits in usize on any
+// realistic log time range (bounded by i64::MAX seconds).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn bucket_idx(ts: OffsetDateTime, lo: OffsetDateTime, bucket_secs: i64, n: usize) -> usize {
     let elapsed = (ts - lo).whole_seconds().max(0);
@@ -312,5 +327,78 @@ mod tests {
         let series = b.fast_finalize_pct();
         // 3 fast + 1 slow in the first bucket -> 75%
         assert_eq!(series[0], 75.0);
+    }
+
+    #[test]
+    fn bucket_idx_boundaries() {
+        // bucket_secs = 60, n = 10 → buckets cover [lo, lo+600).
+        let lo = datetime!(2026-05-23 16:00:00 UTC);
+        let n = 10;
+        let secs = 60;
+        // ts == lo → bucket 0.
+        assert_eq!(bucket_idx(lo, lo, secs, n), 0);
+        // ts == lo + 59s → still bucket 0.
+        assert_eq!(bucket_idx(lo + Duration::seconds(59), lo, secs, n), 0);
+        // ts == lo + 60s → bucket 1.
+        assert_eq!(bucket_idx(lo + Duration::seconds(60), lo, secs, n), 1);
+        // ts == lo + 599s → bucket 9.
+        assert_eq!(bucket_idx(lo + Duration::seconds(599), lo, secs, n), 9);
+        // ts > hi → clamps to last bucket (n-1).
+        assert_eq!(bucket_idx(lo + Duration::seconds(100_000), lo, secs, n), 9);
+        // ts < lo → elapsed clamped to 0 → bucket 0.
+        assert_eq!(bucket_idx(lo - Duration::seconds(5), lo, secs, n), 0);
+    }
+
+    #[test]
+    fn fast_slow_pct_partitions_to_100() {
+        // (fast=1, slow=2) — naive integer division gives (33, 66) = 99.
+        // Deriving slow = 100 - fast forces an exact partition.
+        let lo = datetime!(2026-05-23 16:00:00 UTC);
+        let hi = lo + Duration::hours(1);
+        let mut s = mk_state(lo, hi);
+        s.slot_mut(1).first_shred_at = Some(lo + Duration::seconds(10));
+        s.slot_mut(1).fast_finalize = Some(true);
+        s.slot_mut(2).first_shred_at = Some(lo + Duration::seconds(10));
+        s.slot_mut(2).fast_finalize = Some(false);
+        s.slot_mut(3).first_shred_at = Some(lo + Duration::seconds(10));
+        s.slot_mut(3).fast_finalize = Some(false);
+
+        let b = TimeBuckets::from_state(&s, DEFAULT_BUCKET_SECS).unwrap();
+        let (fast, slow) = b.fast_slow_pct();
+        assert_eq!(fast[0], 33);
+        assert_eq!(slow[0], 67);
+        assert_eq!(fast[0] + slow[0], 100);
+    }
+
+    #[test]
+    fn fast_slow_pct_empty_bucket_yields_zero_zero() {
+        let lo = datetime!(2026-05-23 16:00:00 UTC);
+        let hi = lo + Duration::hours(1);
+        let s = mk_state(lo, hi);
+        let b = TimeBuckets::from_state(&s, DEFAULT_BUCKET_SECS).unwrap();
+        let (fast, slow) = b.fast_slow_pct();
+        for i in 0..b.buckets.len() {
+            assert_eq!(fast[i], 0);
+            assert_eq!(slow[i], 0);
+        }
+    }
+
+    #[test]
+    fn lifecycle_us_is_sorted_after_construction() {
+        // Pre-sort invariant — used by lifecycle_p95_us / resume_p95_us
+        // without re-sorting. Insert latencies in non-sorted order.
+        let lo = datetime!(2026-05-23 16:00:00 UTC);
+        let hi = lo + Duration::hours(1);
+        let mut s = mk_state(lo, hi);
+        let times = [(1u64, 300_000i64), (2, 100_000), (3, 500_000)];
+        for (slot, lat_us) in times {
+            let r = s.slot_mut(slot);
+            r.first_shred_at = Some(lo + Duration::seconds(10));
+            r.finalized_at = Some(lo + Duration::seconds(10) + Duration::microseconds(lat_us));
+            r.fast_finalize = Some(true);
+        }
+        let b = TimeBuckets::from_state(&s, DEFAULT_BUCKET_SECS).unwrap();
+        let bucket0 = &b.buckets[0];
+        assert_eq!(bucket0.lifecycle_us, vec![100_000, 300_000, 500_000]);
     }
 }

@@ -2,7 +2,10 @@
 
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Variant order is significant: derived `Ord` returns
+/// `Info < Warn < Critical`, matching the alert ranking the surface
+/// functions rely on (Critical-first sort).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Severity {
     Info,
     Warn,
@@ -17,9 +20,6 @@ pub enum AlertKind {
 
     /// Standstill firing — finalization stalled for ≥10s.
     StandstillObserved { at_slot: u64 },
-
-    /// Local node observed leader crashed timer.
-    LeaderTimeoutCrashed { at_slot: u64 },
 
     /// Repeated WARN/ERROR lines from a single module that no dedicated
     /// parser recognises. Aggregated by `(severity, module)` so noisy

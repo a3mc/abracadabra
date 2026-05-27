@@ -7,11 +7,29 @@
 use time::OffsetDateTime;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
-use crate::model::state::{LogIssueGroup, State};
+use crate::model::state::{LogIssueGroup, State, MAX_GROUP_TIMESTAMPS};
 use crate::parser::line::Level;
 use crate::parser::{Event, EventKind};
 
+/// Maximum tolerated `end - start` span on an `EventKind::ProduceWindow`.
+///
+/// Solana's `NUM_CONSECUTIVE_LEADER_SLOTS = 4` makes the real span exactly
+/// `3` (i.e. `end_slot - start_slot == 3`, four inclusive slots). The cap
+/// is `16` — four times the spec — so a window with a damaged digit still
+/// fits but a truncated `u64::MAX` end_slot does not. Rejected events are
+/// counted in `OverallStats::malformed_produce_window` and the slot loop
+/// is skipped entirely; otherwise a single malformed log line could force
+/// the aggregator to materialise exabytes of `SlotRecord`s.
+pub const MAX_LEADER_WINDOW_SPAN: u64 = 16;
+
 /// Apply a single event to `state`.
+///
+/// Single-shot per `Event`: replaying the same event onto the same
+/// `State` would duplicate inline-pushed alerts (`StandstillObserved`,
+/// `IdentityChanged`, `ClusterSlotsShutdownObserved`) because those are
+/// emitted unconditionally during ingest rather than reconstructed by
+/// `analyze`. The single production caller (`runner::run`) honours this;
+/// future callers must too.
 pub fn ingest(state: &mut State, event: Event) {
     state.observe_ts(event.ts);
 
@@ -55,11 +73,10 @@ pub fn ingest(state: &mut State, event: Event) {
             state.overall.block_notarized_count =
                 state.overall.block_notarized_count.saturating_add(1);
         }
-        EventKind::BlockNotarFallback { slot, .. } => {
-            state
-                .slot_mut(slot)
-                .notar_fallback_at
-                .get_or_insert(event.ts);
+        EventKind::BlockNotarFallback { slot, hash } => {
+            let rec = state.slot_mut(slot);
+            rec.notar_fallback_at.get_or_insert(event.ts);
+            rec.block_id.get_or_insert(hash);
             state.overall.block_notar_fallback_count =
                 state.overall.block_notar_fallback_count.saturating_add(1);
         }
@@ -94,11 +111,10 @@ pub fn ingest(state: &mut State, event: Event) {
             state.overall.timeout_crashed_leaders =
                 state.overall.timeout_crashed_leaders.saturating_add(1);
         }
-        EventKind::SafeToNotar { slot, .. } => {
-            state
-                .slot_mut(slot)
-                .safe_to_notar_at
-                .get_or_insert(event.ts);
+        EventKind::SafeToNotar { slot, hash } => {
+            let rec = state.slot_mut(slot);
+            rec.safe_to_notar_at.get_or_insert(event.ts);
+            rec.block_id.get_or_insert(hash);
             state.overall.safe_to_notar = state.overall.safe_to_notar.saturating_add(1);
         }
         EventKind::SafeToSkip { slot } => {
@@ -106,6 +122,16 @@ pub fn ingest(state: &mut State, event: Event) {
             state.overall.safe_to_skip = state.overall.safe_to_skip.saturating_add(1);
         }
         EventKind::ProduceWindow { start, end, .. } => {
+            // Corruption guard: reject windows whose span exceeds
+            // `MAX_LEADER_WINDOW_SPAN`. See the constant's docstring for
+            // the rationale (defends against `end = u64::MAX` from a
+            // truncated log line that would otherwise materialise an
+            // unbounded number of `SlotRecord`s).
+            if end < start || end.saturating_sub(start) > MAX_LEADER_WINDOW_SPAN {
+                state.overall.malformed_produce_window =
+                    state.overall.malformed_produce_window.saturating_add(1);
+                return;
+            }
             for s in start..=end {
                 state.slot_mut(s).we_are_leader = true;
             }
@@ -154,7 +180,7 @@ pub fn ingest(state: &mut State, event: Event) {
                 event.ts,
                 Severity::Critical,
                 CLUSTER_SLOTS_MODULE,
-                format!("No epoch_metadata record for epoch {epoch}"),
+                || format!("No epoch_metadata record for epoch {epoch}"),
             );
         }
         EventKind::NoEpochInfoForSlot { slot } => {
@@ -165,7 +191,7 @@ pub fn ingest(state: &mut State, event: Event) {
                 event.ts,
                 Severity::Critical,
                 CLUSTER_SLOTS_MODULE,
-                format!("No epoch info for slot {slot}"),
+                || format!("No epoch info for slot {slot}"),
             );
         }
         EventKind::UpdatingEpochMetadata { .. } => {
@@ -195,7 +221,7 @@ pub fn ingest(state: &mut State, event: Event) {
                 event.ts,
                 Severity::Warn,
                 CLUSTER_SLOTS_MODULE,
-                "Invalid update call to ClusterSlots, can not roll time backwards!".to_owned(),
+                || "Invalid update call to ClusterSlots, can not roll time backwards!".to_owned(),
             );
         }
         EventKind::EventHandlerStats { .. } | EventKind::BlockCommitmentCache { .. } => {
@@ -223,20 +249,45 @@ pub fn ingest_issue(
         Level::Warn => Severity::Warn,
         _ => return, // Only WARN/ERROR are surfaced as issues.
     };
-    record_log_pattern(state, ts, severity, &module, body);
+    // Body is already owned here, so the closure is just a move — no
+    // alloc deferral benefit, but uniform with the call-site signature.
+    record_log_pattern(state, ts, severity, &module, move || body);
 }
 
 /// Add (or update) a `LogIssueGroup` keyed by `(severity, module)`.
-/// Used both by `ingest_issue` (unparsed lines) and by the known-issue
-/// event handlers below — so a structured event with a documented
-/// investigation (e.g. `NoEpochMetadata`) still shows up in the same
-/// raw `LogPattern` alerts list as the unparsed errors, with a count.
-fn record_log_pattern(
+///
+/// Used both by `ingest_issue` (parser-failure WARN/ERROR lines from
+/// unknown modules) and by structured `EventKind` handlers for modules
+/// with a documented investigation (e.g. `NoEpochMetadata`). Both paths
+/// share the same `(severity, module)` bucket, so the alerts panel
+/// surfaces one row per module with a unified count.
+///
+/// `body` is a `FnOnce() -> String` so the caller's body string is only
+/// materialised on the insert path. The update path is the hot one
+/// (~137k hits per 21h log on `cluster_slots`); deferring the alloc
+/// behind a closure avoids that many wasted `String` constructions.
+///
+/// The `timestamps` vector is capped at `MAX_GROUP_TIMESTAMPS`. Overflow
+/// timestamps are counted in `timestamps_dropped` but not stored; `count`
+/// always reflects the true total. See `LogIssueGroup` for the rationale.
+///
+/// Note (intentional aggregation): for `cluster_slots`, `count` may
+/// exceed `state.overall.no_epoch_metadata` when unparsed WARN/ERROR
+/// lines from the same module also land here. The structured per-event
+/// counter measures only the structured branch; the group `count`
+/// measures structured + unstructured combined.
+//
+// [REVIEW] `module.to_owned()` still allocates a fresh `String` per
+// entry probe. Removing it would require `hashbrown::raw_entry_mut` or a
+// `Borrow`-impl newtype; measured negligible against I/O at current call
+// rates (~137k/log). Body allocation is deferred via the closure
+// argument so the update path pays no `String` cost.
+fn record_log_pattern<F: FnOnce() -> String>(
     state: &mut State,
     ts: OffsetDateTime,
     severity: Severity,
     module: &str,
-    sample_body: String,
+    body: F,
 ) {
     let entry = state
         .overall
@@ -248,12 +299,17 @@ fn record_log_pattern(
             count: 0,
             first_at: ts,
             last_at: ts,
-            sample_body,
+            sample_body: body(),
             timestamps: Vec::new(),
+            timestamps_dropped: 0,
         });
     entry.count = entry.count.saturating_add(1);
     entry.last_at = ts;
-    entry.timestamps.push(ts);
+    if entry.timestamps.len() < MAX_GROUP_TIMESTAMPS {
+        entry.timestamps.push(ts);
+    } else {
+        entry.timestamps_dropped = entry.timestamps_dropped.saturating_add(1);
+    }
 }
 
 const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_slots";
@@ -268,8 +324,45 @@ const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_
 /// `docs/alpenglow/investigations/01-cluster-slots-loose-end.md` for
 /// the analytical context.
 pub fn analyze(state: &mut State) {
+    // Guard against duplicate emission. `surface_*` push unconditionally;
+    // calling `analyze` twice would double every derived alert. Single
+    // caller today (`runner`), but a regression would silently inflate
+    // counts in the TUI.
+    debug_assert!(
+        !state.alerts.iter().any(|a| matches!(
+            a.kind,
+            AlertKind::LogPattern { .. } | AlertKind::LocalLeaderSummary { .. }
+        )),
+        "analyze() must run at most once per State",
+    );
     surface_log_pattern_alerts(state);
     surface_local_leader_summary(state);
+    // Establish the post-analyze invariant on `state.alerts`: Critical
+    // before Warn before Info, stream order within a severity bucket, a
+    // stable kind discriminant as last tiebreaker. The TUI alerts panel
+    // title advertises "CRIT first" and consumers index into the vector
+    // by `app.alert_scroll` — both rely on this ordering.
+    state.alerts.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.at.cmp(&b.at))
+            .then_with(|| alert_kind_rank(&a.kind).cmp(&alert_kind_rank(&b.kind)))
+    });
+}
+
+/// Stable integer rank per `AlertKind` variant. Used only as the last
+/// tiebreaker in the `state.alerts` sort — the absolute values do not
+/// leak into any user-visible artefact, but the relative order must not
+/// change across runs (HashMap iteration order on the `LogPattern`
+/// source would otherwise drift).
+const fn alert_kind_rank(kind: &AlertKind) -> u8 {
+    match kind {
+        AlertKind::LogPattern { .. } => 0,
+        AlertKind::StandstillObserved { .. } => 1,
+        AlertKind::ClusterSlotsShutdownObserved => 2,
+        AlertKind::IdentityChanged => 3,
+        AlertKind::LocalLeaderSummary { .. } => 4,
+    }
 }
 
 /// Emit a single INFO alert summarising the validator's leader windows.
@@ -283,17 +376,19 @@ fn surface_local_leader_summary(state: &mut State) {
         return;
     }
     let slot_count: u64 = state.slots.values().filter(|s| s.we_are_leader).count() as u64;
-    let at = state
-        .overall
-        .produce_window_timestamps
-        .first()
-        .copied()
-        .unwrap_or_else(|| {
-            state
-                .file_meta
-                .time_range
-                .map_or_else(time::OffsetDateTime::now_utc, |(lo, _)| lo)
-        });
+    // `window_count > 0` implies at least one `ProduceWindow` event was
+    // ingested, which pushes its timestamp; so the first-timestamp path
+    // always wins. The `time_range.lo` arm guards a future refactor that
+    // separates the counter from the timestamp list — it stays
+    // deterministic (no `now_utc()` wall-clock leak into output). If
+    // both are missing we skip the alert.
+    let at = match state.overall.produce_window_timestamps.first().copied() {
+        Some(ts) => ts,
+        None => match state.file_meta.time_range {
+            Some((lo, _)) => lo,
+            None => return,
+        },
+    };
     // Show the math so the relationship is unambiguous in the alerts
     // panel preview: a "window" is a 4-slot burst assigned to one
     // leader (Solana `NUM_CONSECUTIVE_LEADER_SLOTS = 4`).
@@ -316,14 +411,38 @@ fn surface_local_leader_summary(state: &mut State) {
 /// lines. Sorted Critical-first, then by count, so the alerts panel
 /// reads worst-first.
 fn surface_log_pattern_alerts(state: &mut State) {
-    let mut groups: Vec<LogIssueGroup> = state.overall.log_issues.values().cloned().collect();
-    if groups.is_empty() {
+    if state.overall.log_issues.is_empty() {
         return;
     }
+    // Projection: copy only the scalar fields plus owned strings for
+    // `module` and `sample_body`. `LogIssueGroup.timestamps` is *not*
+    // copied — the TUI looks the canonical group up via
+    // `State::log_issues_get` when it needs the sparkline. Cloning the
+    // full group here would copy up to ~16 MB per group at
+    // `MAX_GROUP_TIMESTAMPS` for data this function never reads.
+    let mut groups: Vec<LogPatternView> = state
+        .overall
+        .log_issues
+        .values()
+        .map(|g| LogPatternView {
+            severity: g.severity,
+            count: g.count,
+            first_at: g.first_at,
+            module: g.module.clone(),
+            sample_body: g.sample_body.clone(),
+        })
+        .collect();
+    // Deterministic order: severity desc, then count desc, then module
+    // asc, then first_at asc. The two tiebreakers below the count guard
+    // against HashMap iteration order leaking into the TUI cursor
+    // position — two groups with the same (severity, count) must always
+    // emit in the same order across runs.
     groups.sort_by(|a, b| {
-        severity_rank(b.severity)
-            .cmp(&severity_rank(a.severity))
-            .then(b.count.cmp(&a.count))
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.module.cmp(&b.module))
+            .then_with(|| a.first_at.cmp(&b.first_at))
     });
     for g in groups {
         let label = match g.severity {
@@ -349,159 +468,17 @@ fn surface_log_pattern_alerts(state: &mut State) {
     }
 }
 
-const fn severity_rank(s: Severity) -> u8 {
-    match s {
-        Severity::Critical => 2,
-        Severity::Warn => 1,
-        Severity::Info => 0,
-    }
+/// Sorting/projection view over `LogIssueGroup` for
+/// `surface_log_pattern_alerts`. Carries only the fields the surface
+/// reads; in particular it omits `timestamps`, which can be up to
+/// `MAX_GROUP_TIMESTAMPS * 16` bytes and is never inspected here.
+struct LogPatternView {
+    severity: Severity,
+    count: u64,
+    first_at: OffsetDateTime,
+    module: String,
+    sample_body: String,
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::{self, Parsed};
-
-    fn parse_and_ingest(state: &mut State, line: &str) {
-        let parsed = parser::parse(line).expect("parse");
-        if let Parsed::Event(ev) = parsed {
-            ingest(state, ev);
-        }
-    }
-
-    #[test]
-    fn ingest_lifecycle_round_trip() {
-        let mut state = State::default();
-        let lines = [
-            "[2026-05-23T16:00:07.187019566Z INFO  agave_votor::event_handler] \
-             ALNSCya: First shred 1028070",
-            "[2026-05-23T16:00:07.257045933Z INFO  agave_votor::event_handler] \
-             ALNSCya: Block (1028070, EEZ7rFB) parent (1028069, CdJR4iF3)",
-            "[2026-05-23T16:00:07.257052546Z INFO  agave_votor::event_handler] \
-             ALNSCya: Voting notarize for 1028070 EEZ7rFB",
-            "[2026-05-23T16:00:07.301219441Z INFO  agave_votor::event_handler] \
-             ALNSCya: Block Notarized (1028070, EEZ7rFB)",
-            "[2026-05-23T16:00:07.301228498Z INFO  agave_votor::event_handler] \
-             ALNSCya: Voting finalize for 1028070",
-            "[2026-05-23T16:00:07.339120015Z INFO  agave_votor::event_handler] \
-             ALNSCya: Finalized (1028070, EEZ7rFB) fast: true",
-            "[2026-05-23T16:00:07.339131506Z INFO  agave_votor::root_utils] \
-             ALNSCya: setting root 1028070",
-            "[2026-05-23T16:00:07.346089002Z INFO  agave_votor::root_utils] \
-             ALNSCya: new root 1028070",
-        ];
-        for line in lines {
-            parse_and_ingest(&mut state, line);
-        }
-
-        let rec = &state.slots[&1_028_070];
-        assert!(rec.first_shred_at.is_some());
-        assert!(rec.block_emitted_at.is_some());
-        assert!(rec.voted_notarize_at.is_some());
-        assert!(rec.block_notarized_at.is_some());
-        assert!(rec.voted_finalize_at.is_some());
-        assert!(rec.finalized_at.is_some());
-        assert!(rec.setting_root_at.is_some());
-        assert!(rec.new_root_at.is_some());
-        assert_eq!(rec.fast_finalize, Some(true));
-        assert_eq!(rec.status(), crate::model::slot::SlotStatus::FastFinalized);
-
-        assert_eq!(state.overall.votes_notarize, 1);
-        assert_eq!(state.overall.votes_finalize, 1);
-        assert_eq!(state.overall.first_shreds, 1);
-        assert_eq!(state.overall.finalized_fast, 1);
-        assert_eq!(state.overall.finalized_slow, 0);
-        assert_eq!(state.overall.setting_root_count, 1);
-        assert_eq!(state.overall.new_root_count, 1);
-    }
-
-    #[test]
-    fn voting_skip_marks_slot() {
-        let mut state = State::default();
-        parse_and_ingest(
-            &mut state,
-            "[2026-05-23T16:00:14.187459305Z INFO  agave_votor::event_handler] \
-             ALNSCya: Voting skip for 1028084",
-        );
-        let rec = &state.slots[&1_028_084];
-        assert!(rec.voted_skip_at.is_some());
-        assert_eq!(rec.status(), crate::model::slot::SlotStatus::Skipped);
-        assert_eq!(state.overall.votes_skip, 1);
-    }
-
-    #[test]
-    fn produce_window_marks_leader_window() {
-        let mut state = State::default();
-        parse_and_ingest(
-            &mut state,
-            "[2026-05-23T16:01:22.065145178Z INFO  agave_votor::event_handler] \
-             ALNSCya: ProduceWindow LeaderWindowInfo { \
-             start_slot: 1028248, end_slot: 1028251, \
-             parent_block: (1028247, GG5ybXkS), \
-             block_timer: Instant { tv_sec: 654042, tv_nsec: 317064752 } }",
-        );
-        for slot in 1_028_248..=1_028_251 {
-            assert!(
-                state.slots[&slot].we_are_leader,
-                "slot {slot} should be marked leader"
-            );
-        }
-        assert_eq!(state.overall.produce_windows, 1);
-    }
-
-    #[test]
-    fn cluster_slots_errors_surface_as_log_pattern() {
-        // The cluster_slots ERROR group surfaces via the LogPattern path
-        // (count + sparkline) — the analytical loose-end WARN is no
-        // longer emitted because it duplicated the count for the same
-        // root cause.
-        let mut state = State::default();
-        for epoch in 0..150 {
-            let line = format!(
-                "[2026-05-23T16:00:07.171303148Z ERROR \
-                 solana_core::cluster_slots_service::cluster_slots] \
-                 No epoch_metadata record for epoch {epoch}"
-            );
-            parse_and_ingest(&mut state, &line);
-        }
-        analyze(&mut state);
-        assert!(state.alerts.iter().any(|a| matches!(
-            &a.kind,
-            AlertKind::LogPattern {
-                severity: Severity::Critical,
-                count: 150,
-                ..
-            },
-        )));
-    }
-
-    #[test]
-    fn cluster_slots_shutdown_still_observed_separately() {
-        // The shutdown event still fires its own INFO marker — it's a
-        // distinct signal from the ERROR count.
-        let mut state = State::default();
-        parse_and_ingest(
-            &mut state,
-            "[2026-05-23T16:00:07.171303148Z ERROR solana_core::cluster_slots_service::cluster_slots] \
-             No epoch_metadata record for epoch 19",
-        );
-        parse_and_ingest(
-            &mut state,
-            "[2026-05-21T04:42:15.117334745Z INFO  solana_core::cluster_slots_service] \
-             ClusterSlotsService has stopped because we have finished the alpenglow migration epoch",
-        );
-        analyze(&mut state);
-        assert!(state
-            .alerts
-            .iter()
-            .any(|a| matches!(a.kind, AlertKind::ClusterSlotsShutdownObserved)));
-        assert!(state.alerts.iter().any(|a| matches!(
-            &a.kind,
-            AlertKind::LogPattern {
-                severity: Severity::Critical,
-                count: 1,
-                ..
-            },
-        )));
-    }
-}
+mod tests;

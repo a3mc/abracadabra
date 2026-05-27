@@ -14,6 +14,7 @@ use ratatui::Frame;
 
 use crate::model::state::State;
 use crate::tui::theme;
+use crate::tui::widget::commas;
 
 pub fn render(state: &State, frame: &mut Frame<'_>, area: Rect) {
     let meta = &state.file_meta;
@@ -101,18 +102,4 @@ fn duration_str(state: &State) -> String {
     };
     let d = hi - lo;
     format!("{}h{}m", d.whole_hours(), d.whole_minutes() % 60)
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

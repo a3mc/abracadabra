@@ -30,6 +30,7 @@ use ratatui::Frame;
 
 use crate::model::buckets::TimeBuckets;
 use crate::tui::theme;
+use crate::tui::widget::{commas, fit_to_width};
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -45,6 +46,41 @@ struct Metric {
     kind: Kind,
     color: Color,
     data: Vec<u64>,
+    /// Per-bucket value minus the p10 baseline — the series the
+    /// sparkline actually draws. Precomputed in `build_cards` so the
+    /// render path doesn't clone `data` and re-sort for the baseline
+    /// each frame. See PERF-05.
+    deviation: Vec<u64>,
+    /// `max(deviation)` clamped to at least 1 so `Sparkline::max` is
+    /// always positive (avoids a divide-by-zero in ratatui's scaler).
+    dev_peak: u64,
+}
+
+impl Metric {
+    fn new(label: &'static str, kind: Kind, color: Color, data: Vec<u64>) -> Self {
+        // p10 = the value at index `len/10` of an ascending-sorted copy.
+        // `select_nth_unstable` avoids the full sort the previous
+        // implementation paid for — O(n) average vs O(n log n) — and the
+        // allocated copy is the same size either way.
+        let baseline = if data.is_empty() {
+            0
+        } else {
+            let mut tmp = data.clone();
+            let idx = tmp.len() / 10;
+            tmp.select_nth_unstable(idx);
+            tmp[idx]
+        };
+        let deviation: Vec<u64> = data.iter().map(|v| v.saturating_sub(baseline)).collect();
+        let dev_peak = deviation.iter().copied().max().unwrap_or(1).max(1);
+        Self {
+            label,
+            kind,
+            color,
+            data,
+            deviation,
+            dev_peak,
+        }
+    }
 }
 
 /// Dual-series card variant: two sparklines stacked vertically inside a
@@ -133,13 +169,11 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
     let n_buckets = m.data.len();
     let active = m.data.iter().filter(|v| **v > 0).count();
 
-    // Baseline = p10. The trailing sparkline below subtracts this so
-    // spikes become visible.
-    let mut sorted = m.data.clone();
-    sorted.sort_unstable();
-    let baseline = sorted.get(sorted.len() / 10).copied().unwrap_or(0);
-    let deviation: Vec<u64> = m.data.iter().map(|v| v.saturating_sub(baseline)).collect();
-    let dev_peak = deviation.iter().copied().max().unwrap_or(1).max(1);
+    // Baseline = p10. The trailing sparkline below draws `deviation`
+    // (data minus baseline) so spikes are visible above a high floor.
+    // Both `deviation` and `dev_peak` are precomputed in `Metric::new`.
+    let deviation = m.deviation.as_slice();
+    let dev_peak = m.dev_peak;
 
     // One-line stats — absolute values live here since the trend
     // sparkline below is baseline-subtracted. `active X/N` exposes
@@ -182,8 +216,19 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
 
     frame.render_widget(Paragraph::new(stats_line), parts[0]);
 
+    // Resample to the full panel width so a short series doesn't leave
+    // trailing blank columns (ratatui's `Sparkline` plots one column per
+    // input point). `fit_to_width` clones into a temporary; bind it to a
+    // `let` so the borrow on the slice outlives the builder chain.
+    let spark_width = parts[1].width as usize;
+    let resampled = fit_to_width(deviation, spark_width);
+    let spark_data: &[u64] = if resampled.is_empty() {
+        deviation
+    } else {
+        &resampled
+    };
     let spark = Sparkline::default()
-        .data(&deviation)
+        .data(spark_data)
         .max(dev_peak)
         .style(Style::default().fg(m.color));
     frame.render_widget(spark, parts[1]);
@@ -222,54 +267,54 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
             bottom_color: theme::SPARK_ALT_PATH,
             bottom_data: slow_pct,
         }),
-        CardSpec::Single(Metric {
-            label: "vote skip",
-            kind: Kind::Count,
-            color: theme::SPARK_PROBLEM,
-            data: skip,
-        }),
-        CardSpec::Single(Metric {
-            label: "crashed leaders",
-            kind: Kind::Count,
-            color: theme::SPARK_PROBLEM,
-            data: crashed,
-        }),
-        CardSpec::Single(Metric {
-            label: "SafeToNotar",
-            kind: Kind::Count,
-            color: theme::SPARK_PROBLEM,
-            data: s2n,
-        }),
-        CardSpec::Single(Metric {
-            label: "SafeToSkip",
-            kind: Kind::Count,
-            color: theme::SPARK_PROBLEM,
-            data: s2s,
-        }),
-        CardSpec::Single(Metric {
-            label: "leader windows",
-            kind: Kind::Count,
-            color: theme::SPARK_HEALTH,
-            data: our_leader,
-        }),
-        CardSpec::Single(Metric {
-            label: "total finalize",
-            kind: Kind::Count,
-            color: theme::SPARK_HEALTH,
-            data: final_total,
-        }),
-        CardSpec::Single(Metric {
-            label: "lifecycle p95",
-            kind: Kind::Time,
-            color: theme::SPARK_TIME,
-            data: lat_ms,
-        }),
-        CardSpec::Single(Metric {
-            label: "vote-resume p95",
-            kind: Kind::Time,
-            color: theme::SPARK_TIME,
-            data: resume_ms,
-        }),
+        CardSpec::Single(Metric::new(
+            "vote skip",
+            Kind::Count,
+            theme::SPARK_PROBLEM,
+            skip,
+        )),
+        CardSpec::Single(Metric::new(
+            "crashed leaders",
+            Kind::Count,
+            theme::SPARK_PROBLEM,
+            crashed,
+        )),
+        CardSpec::Single(Metric::new(
+            "SafeToNotar",
+            Kind::Count,
+            theme::SPARK_PROBLEM,
+            s2n,
+        )),
+        CardSpec::Single(Metric::new(
+            "SafeToSkip",
+            Kind::Count,
+            theme::SPARK_PROBLEM,
+            s2s,
+        )),
+        CardSpec::Single(Metric::new(
+            "leader windows",
+            Kind::Count,
+            theme::SPARK_HEALTH,
+            our_leader,
+        )),
+        CardSpec::Single(Metric::new(
+            "total finalize",
+            Kind::Count,
+            theme::SPARK_HEALTH,
+            final_total,
+        )),
+        CardSpec::Single(Metric::new(
+            "lifecycle p95",
+            Kind::Time,
+            theme::SPARK_TIME,
+            lat_ms,
+        )),
+        CardSpec::Single(Metric::new(
+            "vote-resume p95",
+            Kind::Time,
+            theme::SPARK_TIME,
+            resume_ms,
+        )),
     ]
 }
 
@@ -348,6 +393,22 @@ fn render_dual_card(frame: &mut Frame<'_>, area: Rect, m: &DualMetric) {
 /// even a 3-row chart resolves 24 distinct boundary positions, so
 /// shares as small as ~4% surface as a visible band rather than
 /// being lost to cell-rounding.
+///
+/// # Invariants (caller must uphold)
+///
+/// - `fast[i] + slow[i] == 100` for non-empty buckets;
+/// - `fast[i] == 0 && slow[i] == 0` exclusively flags the "empty
+///   bucket" case (renders blank). Any other configuration with
+///   `fast + slow != 100` will misrepresent the data: the visual
+///   boundary is derived from `fast_val` alone, and the upper portion
+///   paints `slow_color` regardless of `slow_val`.
+///
+/// The sole caller (`render_dual_card`) wires the output of
+/// `TimeBuckets::fast_slow_pct` which guarantees both invariants by
+/// construction. The two-slice signature is preserved (rather than
+/// taking only `fast` and deriving `slow = 100 - fast` internally) so
+/// the empty-bucket sentinel `(0, 0)` remains distinguishable from
+/// `(0, 100)` ("all-slow"). See audit STRUCT-03.
 struct StackedBars<'a> {
     fast: &'a [u64],
     slow: &'a [u64],
@@ -376,7 +437,18 @@ impl Widget for StackedBars<'_> {
             let fast_val = self.fast[sample_i].min(100);
             let slow_val = self.slow[sample_i].min(100);
             if fast_val == 0 && slow_val == 0 {
-                // Empty bucket — leave the column blank.
+                // Empty bucket — explicitly blank every cell in the
+                // column so a previous frame's filled/straddle state
+                // doesn't persist through ratatui's diff path.
+                for row_idx in 0..rows {
+                    let x = area.x + col_idx as u16;
+                    let y = area.y + row_idx as u16;
+                    if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                        cell.set_symbol(" ");
+                        cell.set_fg(Color::Reset);
+                        cell.set_bg(Color::Reset);
+                    }
+                }
                 continue;
             }
 
@@ -404,15 +476,22 @@ impl Widget for StackedBars<'_> {
                     continue;
                 };
                 if row_top_sub <= boundary {
-                    // Entirely below boundary -> full green.
+                    // Entirely below boundary -> full green. Reset bg
+                    // explicitly so a previous frame's straddle-cell
+                    // (which set bg = slow_color) doesn't bleed through
+                    // ratatui's per-cell diff path.
                     cell.set_symbol("█");
                     cell.set_fg(self.fast_color);
+                    cell.set_bg(Color::Reset);
                 } else if row_bot_sub >= boundary {
-                    // Entirely above boundary -> full yellow.
+                    // Entirely above boundary -> full yellow. Reset bg
+                    // for the same reason as the green branch above.
                     cell.set_symbol("█");
                     cell.set_fg(self.slow_color);
+                    cell.set_bg(Color::Reset);
                 } else {
-                    // Straddles boundary -> partial fill.
+                    // Straddles boundary -> partial fill. fg = lower
+                    // portion = fast; bg = upper portion = slow.
                     let green_sub_in_cell = boundary - row_bot_sub; // 1..=7
                     let glyph = match green_sub_in_cell {
                         1 => "▁",
@@ -457,18 +536,4 @@ fn mean(xs: &[u64]) -> u64 {
         let sum: u64 = xs.iter().sum();
         sum / xs.len() as u64
     }
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

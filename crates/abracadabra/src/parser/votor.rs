@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::parser::EventKind;
+use crate::parser::{must_compile, validate_base58_hash, EventKind, HASH_CHARS, SLOT_DIGITS};
 
 /// Parse the body of an `agave_votor::event_handler` info-log line.
 ///
@@ -80,8 +80,24 @@ fn parse_block_with_parent(after_block: &str) -> Option<EventKind> {
 fn parse_voting_variant(event: &str) -> Option<EventKind> {
     let rest = event.strip_prefix("Voting ")?;
     if let Some(after) = rest.strip_prefix("notarize for ") {
-        let (slot_str, hash) = after.split_once(' ')?;
+        let (slot_str, after_slot) = after.split_once(' ')?;
         let slot = slot_str.parse().ok()?;
+        // Take the leading Base58 run as the hash; require everything after
+        // to be whitespace-only so trailing fields (e.g. " (forced)") cannot
+        // be silently swallowed into the hash string.
+        let hash_end = after_slot
+            .bytes()
+            .position(|b| !super::is_base58_byte(b))
+            .unwrap_or(after_slot.len());
+        let hash = validate_base58_hash(&after_slot[..hash_end])?;
+        // ASCII-only tail check; the hash itself is ASCII-bounded so
+        // Unicode whitespace at the tail would be inconsistent.
+        if !after_slot.as_bytes()[hash_end..]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t'))
+        {
+            return None;
+        }
         Some(EventKind::VotingNotarize {
             slot,
             hash: hash.to_owned(),
@@ -201,31 +217,38 @@ fn parse_refreshing(event: &str) -> Option<EventKind> {
 // ---- Shared helpers ----
 
 /// Parse `(SLOT, HASH)` into `(u64, String)`.
+///
+/// Used by the `strip_prefix` dispatch paths (`Block Notarized`, `Block
+/// notar-fallback`, `SafeToNotar`) which — unlike the regex paths — have
+/// no inline alphabet check. The hash is length- and alphabet-validated
+/// via `validate_base58_hash` to match the regex paths' `HASH_CHARS`
+/// bound; the trailing slice after `)` must be ASCII whitespace only,
+/// mirroring `VotingNotarize` (PARSE-02) so a future emitter that
+/// appends a trailing field cannot be silently swallowed.
 fn parse_tuple(s: &str) -> Option<(u64, String)> {
     let inner = s.strip_prefix('(')?;
     let close = inner.find(')')?;
     let pair = &inner[..close];
+    let tail = &inner[close + 1..];
+    if !tail.as_bytes().iter().all(|b| matches!(b, b' ' | b'\t')) {
+        return None;
+    }
     let (slot_str, hash) = pair.split_once(", ")?;
-    Some((slot_str.parse().ok()?, hash.to_owned()))
+    let slot = slot_str.parse().ok()?;
+    let hash = validate_base58_hash(hash)?.to_owned();
+    Some((slot, hash))
 }
 
 // ---- Static regex cache ----
 
-fn must_compile(pattern: &str) -> Regex {
-    // Static regex strings are compile-time programmer-validated; failure here
-    // indicates a bug in this file, not a runtime input issue.
-    #[allow(clippy::expect_used)]
-    Regex::new(pattern).expect("static regex must compile")
-}
-
-// Base58 alphabet (Bitcoin/Solana): excludes 0, O, I, l.
-const HASH_CHARS: &str = "[1-9A-HJ-NP-Za-km-z]+";
+// `HASH_CHARS` and `SLOT_DIGITS` live in `parser/mod.rs` so the
+// `strip_prefix` paths and the regex paths share one length policy.
 
 fn re_block_with_parent() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^\(([0-9]+), ({HASH_CHARS})\) parent \(([0-9]+), ({HASH_CHARS})\)$"
+            r"^\(({SLOT_DIGITS}), ({HASH_CHARS})\) parent \(({SLOT_DIGITS}), ({HASH_CHARS})\)$"
         ))
     })
 }
@@ -234,7 +257,7 @@ fn re_finalized() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^Finalized \(([0-9]+), ({HASH_CHARS})\) fast: (true|false)$"
+            r"^Finalized \(({SLOT_DIGITS}), ({HASH_CHARS})\) fast: (true|false)$"
         ))
     })
 }
@@ -243,7 +266,7 @@ fn re_produce_window() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^ProduceWindow LeaderWindowInfo \{{ start_slot: ([0-9]+), end_slot: ([0-9]+), parent_block: \(([0-9]+), ({HASH_CHARS})\)"
+            r"^ProduceWindow LeaderWindowInfo \{{ start_slot: ({SLOT_DIGITS}), end_slot: ({SLOT_DIGITS}), parent_block: \(({SLOT_DIGITS}), ({HASH_CHARS})\)"
         ))
     })
 }
@@ -251,7 +274,11 @@ fn re_produce_window() -> &'static Regex {
 fn re_standstill_ended() -> &'static Regex {
     // Input here has already had "Standstill initially detected at slot=" stripped.
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| must_compile(r"^([0-9]+) has ended at slot=([0-9]+)\."))
+    R.get_or_init(|| {
+        must_compile(&format!(
+            r"^({SLOT_DIGITS}) has ended at slot=({SLOT_DIGITS})\."
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -483,5 +510,185 @@ mod tests {
         assert!(parse_body("Voting notarize for 1028070 EEZ").is_none());
         // Truncated tuple.
         assert!(parse_body(&body("Block Notarized (123, ")).is_none());
+    }
+
+    // ---- PARSE-02: Voting notarize must not silently swallow trailing fields ----
+
+    #[test]
+    fn voting_notarize_trailing_junk_rejected() {
+        // If agave appends a trailing field (`(forced)`), we must NOT capture
+        // it into the hash string. Adopt strict rejection rather than partial
+        // accept so the regression surfaces immediately.
+        let s = body(
+            "Voting notarize for 1028070 EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn voting_notarize_trailing_whitespace_accepted() {
+        // Pure trailing whitespace is benign.
+        let s = body("Voting notarize for 1028070 EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv  ");
+        let ev = parse_body(&s).unwrap();
+        assert!(matches!(
+            ev,
+            EventKind::VotingNotarize { slot: 1028070, .. }
+        ));
+    }
+
+    #[test]
+    fn voting_notarize_non_base58_hash_rejected() {
+        // Hash containing `0`/`O`/`I`/`l` is not valid Base58.
+        let s = body("Voting notarize for 1028070 OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(parse_body(&s).is_none());
+    }
+
+    // ---- PARSE-01: tuple-payload hashes must be Base58-validated ----
+
+    #[test]
+    fn block_notarized_garbage_hash_rejected() {
+        // OIl0 contains four invalid Base58 chars; previously accepted.
+        let s = body("Block Notarized (123, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn safe_to_notar_garbage_hash_rejected() {
+        let s = body("SafeToNotar (1051172, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notar_fallback_garbage_hash_rejected() {
+        let s =
+            body("Block notar-fallback (1028070, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    // ---- PARSE-04: numeric-overflow handling ----
+
+    #[test]
+    fn slot_overflow_returns_none() {
+        // 2^64 = 18_446_744_073_709_551_616 — one past u64::MAX.
+        let s = body("First shred 18446744073709551616");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn slot_overflow_in_tuple_returns_none() {
+        let s = body(
+            "Block Notarized (18446744073709551616, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    // ---- PARSE-05: tuple-payload hash length must be bounded (32..=48) ----
+
+    #[test]
+    fn block_notarized_short_hash_rejected() {
+        // 4-char hash is base58-alphabet-valid but below the 32-char minimum.
+        let s = body("Block Notarized (1028070, EEZ7)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notarized_overlong_hash_rejected() {
+        // 49 chars exceeds the 48-char maximum.
+        let h = "A".repeat(49);
+        let s = body(&format!("Block Notarized (1028070, {h})"));
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notar_fallback_short_hash_rejected() {
+        let s = body("Block notar-fallback (1028070, EEZ7)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn safe_to_notar_short_hash_rejected() {
+        let s = body("SafeToNotar (1028070, EEZ7)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn voting_notarize_short_hash_rejected() {
+        let s = body("Voting notarize for 1028070 abcd");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn voting_notarize_overlong_hash_rejected() {
+        let h = "A".repeat(49);
+        let s = body(&format!("Voting notarize for 1028070 {h}"));
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notarized_hash_at_min_length_accepted() {
+        // 32 chars is exactly the lower bound; must accept.
+        let h = "1".repeat(32);
+        let s = body(&format!("Block Notarized (1028070, {h})"));
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::BlockNotarized { slot: 1028070, .. }
+        ));
+    }
+
+    #[test]
+    fn block_notarized_hash_at_max_length_accepted() {
+        // 48 chars is exactly the upper bound; must accept.
+        let h = "1".repeat(48);
+        let s = body(&format!("Block Notarized (1028070, {h})"));
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::BlockNotarized { slot: 1028070, .. }
+        ));
+    }
+
+    // ---- PARSE-06: tuple-payload events must reject trailing junk ----
+
+    #[test]
+    fn block_notarized_trailing_junk_rejected() {
+        let s = body(
+            "Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notar_fallback_trailing_junk_rejected() {
+        let s = body(
+            "Block notar-fallback (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn safe_to_notar_trailing_junk_rejected() {
+        let s =
+            body("SafeToNotar (1051172, DTBC1p4b31RH7hRZFZxg4pSxwrsyE4ycmZrTKcTc6ygz) (forced)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_notarized_trailing_whitespace_accepted() {
+        // Pure trailing whitespace is benign, matching PARSE-02's stance on VotingNotarize.
+        let s = body("Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)  ");
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::BlockNotarized { slot: 1028070, .. }
+        ));
+    }
+
+    // ---- PARSE-10: VotingNotarize tail must be ASCII whitespace only ----
+
+    #[test]
+    fn voting_notarize_nbsp_tail_rejected() {
+        // U+00A0 (NBSP) is Unicode whitespace but not ASCII; must reject.
+        let s = body(
+            "Voting notarize for 1028070 EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv\u{00A0}",
+        );
+        assert!(parse_body(&s).is_none());
     }
 }

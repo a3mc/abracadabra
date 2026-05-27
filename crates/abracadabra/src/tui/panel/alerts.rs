@@ -17,13 +17,14 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
 use crate::model::state::{LogIssueGroup, State};
 use crate::tui::app::App;
 use crate::tui::theme;
+use crate::tui::widget::{commas, sanitize_for_tui};
 
 /// Tab 6: full-screen alert dashboard with selectable detail pane.
 pub fn render_full(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
@@ -125,6 +126,15 @@ fn severity_counts(state: &State) -> (u64, u64, u64) {
 
 fn render_list(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let state = app.state;
+    // Render every alert as a ListItem and let ratatui's `List` widget
+    // drive the viewport offset via `ListState::select`. Without this
+    // the rendered list always starts at index 0, so the cursor moves
+    // off-screen as soon as `alert_scroll >= visible_rows`.
+    //
+    // The leading `>` marker rendered by `row_line` is the active visual
+    // cursor (status bar `j/k` updates `alert_scroll`); ratatui's own
+    // highlight_style is intentionally omitted so the existing cursor
+    // semantics remain the source of truth.
     let items: Vec<ListItem<'_>> = state
         .alerts
         .iter()
@@ -144,7 +154,11 @@ fn render_list(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             .title(title)
             .title_style(theme::title_style()),
     );
-    frame.render_widget(list, area);
+    let mut lstate = ListState::default();
+    lstate.select(Some(
+        app.alert_scroll.min(state.alerts.len().saturating_sub(1)),
+    ));
+    frame.render_stateful_widget(list, area, &mut lstate);
 }
 
 fn row_line(a: &Alert, selected: bool) -> Line<'_> {
@@ -161,9 +175,18 @@ fn row_line(a: &Alert, selected: bool) -> Line<'_> {
         Span::raw(" "),
         Span::styled(count_str, theme::value_style()),
         Span::raw("  "),
-        Span::styled(module_short, theme::accent_style()),
+        // Sanitise module + preview: both derive from log lines and may
+        // carry ASCII control bytes (ESC sequences) that crossterm
+        // would emit verbatim. See `tui::widget::sanitize_for_tui`.
+        Span::styled(
+            sanitize_for_tui(&module_short).into_owned(),
+            theme::accent_style(),
+        ),
         Span::raw("  "),
-        Span::styled(preview, theme::label_style()),
+        Span::styled(
+            sanitize_for_tui(&preview).into_owned(),
+            theme::label_style(),
+        ),
     ])
 }
 
@@ -197,7 +220,6 @@ fn alert_module_short(a: &Alert) -> String {
             .to_owned(),
         AlertKind::ClusterSlotsShutdownObserved => "shutdown".to_owned(),
         AlertKind::StandstillObserved { .. } => "standstill".to_owned(),
-        AlertKind::LeaderTimeoutCrashed { .. } => "leader-timeout".to_owned(),
         AlertKind::LocalLeaderSummary { .. } => "local-leader".to_owned(),
         AlertKind::IdentityChanged => "identity-change".to_owned(),
     }
@@ -254,7 +276,7 @@ fn render_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             severity, module, ..
         } => {
             if let Some(group) = state.log_issues_get(*severity, module) {
-                render_log_pattern_detail(alert, group, frame, inner);
+                render_log_pattern_detail(app, alert, group, frame, inner);
                 return;
             }
         }
@@ -262,7 +284,7 @@ fn render_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             slot_count,
             window_count,
         } => {
-            render_local_leader_detail(alert, *slot_count, *window_count, state, frame, inner);
+            render_local_leader_detail(app, alert, *slot_count, *window_count, frame, inner);
             return;
         }
         _ => {}
@@ -274,14 +296,14 @@ fn render_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 /// sparkline of `ProduceWindow` announcement timestamps so the user
 /// can see when their leader windows fell across the log.
 fn render_local_leader_detail(
+    app: &App<'_>,
     alert: &Alert,
     slot_count: u64,
     window_count: u64,
-    state: &State,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    let timestamps = &state.overall.produce_window_timestamps;
+    let timestamps = &app.state.overall.produce_window_timestamps;
     let (tag, tag_style) = severity_tag(alert.severity);
     let (first_at, last_at) = match (timestamps.first(), timestamps.last()) {
         (Some(f), Some(l)) => (*f, *l),
@@ -359,7 +381,11 @@ fn render_local_leader_detail(
     frame.render_widget(Paragraph::new(axis_caption), parts[1]);
 
     let bucket_count = parts[2].width.max(8) as usize;
-    let buckets = bucket_timestamps(timestamps, bucket_count);
+    // Route through the same `(alert_scroll, bucket_count)`-keyed cache
+    // the LogPattern path uses; the alert index uniquely discriminates
+    // this LocalLeaderSummary entry from any other alert, so a single
+    // cache slot is enough.
+    let buckets = cached_buckets(app, timestamps, bucket_count);
     let peak = buckets.iter().copied().max().unwrap_or(1).max(1);
     let spark = Sparkline::default()
         .data(&buckets[..])
@@ -378,6 +404,7 @@ fn render_local_leader_detail(
 }
 
 fn render_log_pattern_detail(
+    app: &App<'_>,
     alert: &Alert,
     group: &LogIssueGroup,
     frame: &mut Frame<'_>,
@@ -386,10 +413,13 @@ fn render_log_pattern_detail(
     let (tag, tag_style) = severity_tag(alert.severity);
     let span_secs = (group.last_at - group.first_at).whole_seconds().max(0);
     let span_str = humanize_dur(span_secs);
+    // Only meaningful when span_secs > 0. Otherwise the label switches
+    // to "(burst, <1s span)" below — see `rate_label` construction.
+    #[allow(clippy::cast_precision_loss)]
     let rate_per_min = if span_secs > 0 {
         group.count as f64 * 60.0 / span_secs as f64
     } else {
-        f64::from(u32::try_from(group.count.min(u64::from(u32::MAX))).unwrap_or(u32::MAX))
+        0.0
     };
 
     // Split: meta-info + body (top) | spacer | sparkline (bottom).
@@ -403,11 +433,25 @@ fn render_log_pattern_detail(
         ])
         .split(area);
 
+    let rate_label = if span_secs > 0 {
+        format!("    ({rate_per_min:.1}/min)")
+    } else {
+        // span_secs == 0: the "rate_per_min" projection collapses
+        // (all events in <1 s). Report the burst rather than a
+        // fabricated per-minute number.
+        "    (burst, <1s span)".to_owned()
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled(tag, tag_style),
             Span::raw("  "),
-            Span::styled(group.module.clone(), theme::accent_style()),
+            // Log-derived strings: module + sample_body originate from
+            // raw log lines. Strip control bytes before handing them
+            // to ratatui to prevent ESC-sequence injection.
+            Span::styled(
+                sanitize_for_tui(&group.module).into_owned(),
+                theme::accent_style(),
+            ),
         ]),
         Line::raw(""),
         Line::from(vec![
@@ -416,7 +460,7 @@ fn render_log_pattern_detail(
                 commas(group.count),
                 theme::value_style().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("    ({rate_per_min:.1}/min)"), theme::label_style()),
+            Span::styled(rate_label, theme::label_style()),
         ]),
         Line::from(vec![
             Span::styled("first   ", theme::label_style()),
@@ -433,7 +477,7 @@ fn render_log_pattern_detail(
         Line::raw(""),
         Line::from(vec![Span::styled("first sample", theme::label_style())]),
         Line::from(vec![Span::styled(
-            group.sample_body.clone(),
+            sanitize_for_tui(&group.sample_body).into_owned(),
             theme::value_style(),
         )]),
         Line::from(vec![Span::styled(
@@ -454,9 +498,12 @@ fn render_log_pattern_detail(
     ));
     frame.render_widget(Paragraph::new(axis_caption), parts[1]);
 
-    // Bucket timestamps across the available width and plot.
+    // Bucket timestamps across the available width and plot. Cached
+    // by (alert_index, bucket_count) on App so repeated frames over a
+    // high-volume LogPattern group don't iterate the full timestamp
+    // vector each redraw (~137k entries for the largest known case).
     let bucket_count = parts[2].width.max(8) as usize;
-    let buckets = bucket_timestamps(&group.timestamps, bucket_count);
+    let buckets = cached_buckets(app, &group.timestamps, bucket_count);
     let peak = buckets.iter().copied().max().unwrap_or(1).max(1);
     let spark_style = match alert.severity {
         Severity::Critical => Style::default().fg(theme::BAD),
@@ -484,7 +531,6 @@ fn render_generic_detail(alert: &Alert, frame: &mut Frame<'_>, area: Rect) {
     let kind_label = match &alert.kind {
         AlertKind::ClusterSlotsShutdownObserved => "cluster-slots service shutdown",
         AlertKind::StandstillObserved { .. } => "standstill observation",
-        AlertKind::LeaderTimeoutCrashed { .. } => "leader timeout-crashed observation",
         AlertKind::IdentityChanged => "operator identity rotation",
         _ => "single-event marker",
     };
@@ -502,7 +548,7 @@ fn render_generic_detail(alert: &Alert, frame: &mut Frame<'_>, area: Rect) {
         Line::raw(""),
         Line::from(vec![Span::styled("description", theme::label_style())]),
         Line::from(vec![Span::styled(
-            alert.description.clone(),
+            sanitize_for_tui(&alert.description).into_owned(),
             theme::value_style(),
         )]),
         Line::raw(""),
@@ -514,21 +560,61 @@ fn render_generic_detail(alert: &Alert, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-/// Bucket `timestamps` into `n` equal-width bins across [first..=last].
-/// Empty when timestamps are empty; falls back to single bin if span=0.
+/// Memoised wrapper around `bucket_timestamps` keyed on
+/// `(app.alert_scroll, bucket_count)`. Returns a clone of the cached
+/// vector on a hit; on a miss, recomputes and refreshes the cache.
+///
+/// Single-threaded TUI -> `RefCell` is sufficient. The cache is
+/// scrubbed implicitly by key mismatch when the user changes
+/// selection or the panel width changes.
+fn cached_buckets(
+    app: &App<'_>,
+    timestamps: &[time::OffsetDateTime],
+    bucket_count: usize,
+) -> Vec<u64> {
+    let key = (app.alert_scroll, bucket_count);
+    if let Some(cache) = app.alert_spark_cache.borrow().as_ref() {
+        if (cache.alert_index, cache.bucket_count) == key {
+            return cache.buckets.clone();
+        }
+    }
+    let buckets = bucket_timestamps(timestamps, bucket_count);
+    *app.alert_spark_cache.borrow_mut() = Some(crate::tui::app::AlertSparkCache {
+        alert_index: key.0,
+        bucket_count: key.1,
+        buckets: buckets.clone(),
+    });
+    buckets
+}
+
+/// Bucket `timestamps` into `n` equal-width bins across [min..=max].
+///
+/// Range extrema are computed via `iter().min()/max()` rather than
+/// `timestamps[0]` / `timestamps[last]` — the latter is correct only
+/// when the input is monotone in arrival order, which holds for
+/// single-file validator logs but breaks on concatenated/rotated logs.
+///
+/// Empty input → all-zero buckets. Tied-time input (`min == max`,
+/// e.g. all events at the same second) places every event in
+/// `buckets[0]` because the elapsed/total ratio is 0/1; this is a
+/// degenerate case where a sparkline carries no shape information.
 fn bucket_timestamps(timestamps: &[time::OffsetDateTime], n: usize) -> Vec<u64> {
     let n = n.max(1);
     if timestamps.is_empty() {
         return vec![0; n];
     }
-    let first = timestamps[0];
-    let last = timestamps[timestamps.len() - 1];
-    let total_ns = (last - first).whole_nanoseconds().max(1);
+    // Compute extrema independent of arrival order.
+    let mut iter = timestamps.iter().copied();
+    let Some(first) = iter.next() else {
+        return vec![0; n];
+    };
+    let (min_ts, max_ts) = iter.fold((first, first), |(lo, hi), ts| (lo.min(ts), hi.max(ts)));
+    let total_ns = (max_ts - min_ts).whole_nanoseconds().max(1);
     let mut buckets = vec![0u64; n];
     for ts in timestamps {
-        let elapsed_ns = (*ts - first).whole_nanoseconds().max(0);
-        // Map elapsed/total into [0, n). Saturating arithmetic keeps the
-        // hottest end-of-range timestamp in the last bucket.
+        let elapsed_ns = (*ts - min_ts).whole_nanoseconds().max(0);
+        // Map elapsed/total into [0, n). Saturating arithmetic keeps
+        // the hottest end-of-range timestamp in the last bucket.
         #[allow(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
@@ -572,16 +658,64 @@ fn short_ts(t: time::OffsetDateTime) -> String {
     format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
 }
 
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn bucket_timestamps_empty_input_returns_zeros() {
+        let out = bucket_timestamps(&[], 4);
+        assert_eq!(out, vec![0, 0, 0, 0]);
     }
-    out
+
+    #[test]
+    fn bucket_timestamps_zero_n_clamps_to_one() {
+        let ts = vec![datetime!(2026-05-23 16:00:00 UTC)];
+        let out = bucket_timestamps(&ts, 0);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn bucket_timestamps_tied_time_collapses_to_bucket_zero() {
+        // All events at the same instant -> elapsed/total = 0 -> idx 0.
+        let t = datetime!(2026-05-23 16:00:00 UTC);
+        let ts = vec![t; 5];
+        let out = bucket_timestamps(&ts, 4);
+        assert_eq!(out, vec![5, 0, 0, 0]);
+    }
+
+    #[test]
+    fn bucket_timestamps_handles_nonmonotone() {
+        // Out-of-order arrival: [10s, 0s, 20s]. min=0, max=20.
+        // Expected buckets at width=4 across [0..=20s]:
+        //   0s -> bucket 0
+        //   10s -> bucket 2
+        //   20s -> bucket 3 (last, clamped)
+        let t0 = datetime!(2026-05-23 16:00:00 UTC);
+        let t10 = datetime!(2026-05-23 16:00:10 UTC);
+        let t20 = datetime!(2026-05-23 16:00:20 UTC);
+        let ts = vec![t10, t0, t20];
+        let out = bucket_timestamps(&ts, 4);
+        // Counts at indices 0, 2, 3 — one each.
+        assert_eq!(out[0], 1);
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 1);
+        assert_eq!(out[3], 1);
+        assert_eq!(out.iter().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn bucket_timestamps_monotone_smoke() {
+        // Sanity: in-order input produces the same bucket distribution
+        // as the reordered input above.
+        let t0 = datetime!(2026-05-23 16:00:00 UTC);
+        let t10 = datetime!(2026-05-23 16:00:10 UTC);
+        let t20 = datetime!(2026-05-23 16:00:20 UTC);
+        let ts = vec![t0, t10, t20];
+        let out = bucket_timestamps(&ts, 4);
+        assert_eq!(out[0], 1);
+        assert_eq!(out[2], 1);
+        assert_eq!(out[3], 1);
+    }
 }

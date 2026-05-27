@@ -18,7 +18,7 @@ use crate::model::analysis;
 use crate::tui::app::App;
 use crate::tui::theme;
 use crate::tui::view::VoteResumeViewRow;
-use crate::tui::widget::{fit_to_width, hbar, kpi};
+use crate::tui::widget::{commas, fit_to_width, hbar, kpi};
 
 const DIST_BUCKETS_S: &[(f64, f64)] = &[
     (0.0, 0.5),
@@ -58,15 +58,11 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
-    let recs = analysis::vote_resumes_after_tcl(app.state);
-    let mut us_vals: Vec<i64> = recs.iter().map(|r| r.resume_us).collect();
-    us_vals.sort_unstable();
-    let total = recs.len() as u64;
-    let (normal, elevated, severe) = analysis::resume_severity_counts(&recs);
-    let p50 = analysis::percentile(&us_vals, 0.50).unwrap_or(0);
-    let p95 = analysis::percentile(&us_vals, 0.95).unwrap_or(0);
-    let p99 = analysis::percentile(&us_vals, 0.99).unwrap_or(0);
-    let max = us_vals.last().copied().unwrap_or(0);
+    // Read percentiles + severity counts from the cached snapshot
+    // instead of recomputing `vote_resumes_after_tcl` per frame.
+    let total = app.latency.resume_total;
+    let (normal, elevated, severe) = app.latency.resume_severity_counts;
+    let (p50, p95, p99, max) = app.latency.resume_pcts_us;
 
     let lines = vec![
         section_title("Severity bands"),
@@ -180,24 +176,25 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     // Naming: "leader-timeout event" = a `TimeoutCrashedLeader` log line.
     // "vote-resume time" = how long until we cast the next Voting notarize.
     // (NOT Solana shred recovery — that's a different mechanism.)
-    let recs = analysis::vote_resumes_after_tcl(app.state);
-    let mut us_vals: Vec<i64> = recs.iter().map(|r| r.resume_us).collect();
-    us_vals.sort_unstable();
-    let p50 = analysis::percentile(&us_vals, 0.50).unwrap_or(0);
-    let p95 = analysis::percentile(&us_vals, 0.95).unwrap_or(0);
-    let p99 = analysis::percentile(&us_vals, 0.99).unwrap_or(0);
-    let max = us_vals.last().copied().unwrap_or(0);
-    let total = recs.len() as u64;
-    let (normal, elevated, severe) = analysis::resume_severity_counts(&recs);
+    // Read from the cached snapshot (LatencySnapshot computed once in App::new).
+    let total = app.latency.resume_total;
+    let (normal, elevated, severe) = app.latency.resume_severity_counts;
+    let (p50, p95, p99, max) = app.latency.resume_pcts_us;
 
+    // Compute real elapsed hours. When the log carries no time range or
+    // collapses to a single instant (hi == lo), skip the rate projection
+    // and emit a dash placeholder instead of inflating with a clamped
+    // 1.0 denominator. See COR-02 audit.
     let hours = app
         .state
         .file_meta
         .time_range
-        .map_or(1.0, |(lo, hi)| (hi - lo).as_seconds_f64() / 3600.0)
-        .max(1.0);
+        .map(|(lo, hi)| (hi - lo).as_seconds_f64() / 3600.0);
     #[allow(clippy::cast_precision_loss)]
-    let rate_per_h = total as f64 / hours;
+    let rate_label = match hours {
+        Some(h) if h > 0.0 => format!("{:.1}", total as f64 / h),
+        _ => "—".to_owned(),
+    };
 
     let kpis = vec![
         kpi::Kpi::new(
@@ -209,7 +206,7 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         kpi::Kpi::new("p95", fmt_s(p95), theme::value_style()),
         kpi::Kpi::new("p99", fmt_s(p99), theme::value_style()),
         kpi::Kpi::new("max", fmt_s(max), theme::bad_style()),
-        kpi::Kpi::new("rate/h", format!("{rate_per_h:.1}"), theme::value_style()),
+        kpi::Kpi::new("rate/h", rate_label, theme::value_style()),
         kpi::Kpi::new("normal", pct_count(normal, total), theme::good_style()),
         kpi::Kpi::new("elevated", pct_count(elevated, total), theme::warn_style()),
         kpi::Kpi::new("severe", pct_count(severe, total), theme::bad_style()),
@@ -223,10 +220,13 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_distribution(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
-    let recs = analysis::vote_resumes_after_tcl(app.state);
+    // Walk the pre-sorted resume vector (cached). Linear scan over the
+    // bucket table is cheap; the previous per-frame scan re-built the
+    // resume vector from scratch.
     let mut counts = vec![0u64; DIST_BUCKETS_S.len()];
-    for r in &recs {
-        let s = r.resume_us as f64 / 1_000_000.0;
+    for us in &app.latency.resume_us_sorted {
+        #[allow(clippy::cast_precision_loss)]
+        let s = *us as f64 / 1_000_000.0;
         if let Some(idx) = DIST_BUCKETS_S
             .iter()
             .position(|(lo, hi)| s >= *lo && s < *hi)
@@ -399,6 +399,11 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn time_anchors(b: &crate::model::buckets::TimeBuckets) -> (String, String) {
+    // `BucketStats::start` is `Option<_>` only because `BucketStats`
+    // implements `Default` — every bucket built by `TimeBuckets::from_state`
+    // populates it with `Some(lo + offset)`. The fallback path here
+    // exists so a degenerate "no buckets" input doesn't surface a
+    // dangling `← ` arrow with nothing after it.
     let first = b.buckets.first().and_then(|x| x.start);
     let last = b
         .buckets
@@ -406,23 +411,29 @@ fn time_anchors(b: &crate::model::buckets::TimeBuckets) -> (String, String) {
         .and_then(|x| x.start)
         .map(|t| t + b.bucket_size);
     let fmt = |t: Option<time::OffsetDateTime>| -> String {
-        t.map_or_else(String::new, |ts| {
-            format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}",
-                ts.year(),
-                u8::from(ts.month()),
-                ts.day(),
-                ts.hour(),
-                ts.minute(),
-            )
-        })
+        t.map_or_else(
+            || "(no data)".to_owned(),
+            |ts| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}",
+                    ts.year(),
+                    u8::from(ts.month()),
+                    ts.day(),
+                    ts.hour(),
+                    ts.minute(),
+                )
+            },
+        )
     };
     (fmt(first), fmt(last))
 }
 
 fn render_list(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let total = app.resume_rows.len();
-    let visible = area.height.saturating_sub(3) as usize;
+    // Mirror `panel::slots::render_table`: `.max(1)` keeps at least one
+    // row visible even when the rect is so tight that subtracting the
+    // border + header reservation drops to 0.
+    let visible = (area.height.saturating_sub(3) as usize).max(1);
     let start = app.resume_scroll.min(total.saturating_sub(visible));
     let end = (start + visible).min(total);
     let window = &app.resume_rows[start..end];
@@ -502,18 +513,4 @@ fn humanize_dur(secs: i64) -> String {
     } else {
         format!("{secs}s")
     }
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use super::commas;
 use crate::tui::theme;
 
 #[derive(Debug, Clone)]
@@ -71,18 +72,4 @@ fn build_line<'a>(b: &Bucket<'a>, total: u64, label_w: usize, bar_w: usize) -> L
         Span::styled(format!(" {pct:>5.1}%"), theme::value_style()),
         Span::styled(format!(" ({})", commas(b.count)), theme::label_style()),
     ])
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

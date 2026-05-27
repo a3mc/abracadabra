@@ -14,11 +14,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
-use crate::model::analysis;
 use crate::model::slot::SlotStatus;
 use crate::tui::app::{App, SlotFilters};
 use crate::tui::theme;
 use crate::tui::view::SlotViewRow;
+use crate::tui::widget::commas;
 
 pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
@@ -53,7 +53,8 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let fin = fin_fast.saturating_add(fin_slow);
     let skip = ov.votes_skip;
     let pend = total.saturating_sub(fin).saturating_sub(skip);
-    let leader: u64 = state.slots.values().filter(|s| s.we_are_leader).count() as u64;
+    // Pre-counted once in `App::new` to avoid a full BTreeMap scan per frame.
+    let leader = app.leader_slot_count;
 
     let fin_pct = pct(fin, total);
     let fast_share = pct(fin_fast, fin);
@@ -65,13 +66,13 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         theme::VOTE_SKIP_BAD_PCT,
     );
 
-    let lats = analysis::lifecycle_latencies(state);
-    let mut us: Vec<i64> = lats.iter().map(|r| r.us).collect();
-    us.sort_unstable();
-    let p50 = analysis::percentile(&us, 0.50).unwrap_or(0) / 1000;
-    let p95 = analysis::percentile(&us, 0.95).unwrap_or(0) / 1000;
-    let p99 = analysis::percentile(&us, 0.99).unwrap_or(0) / 1000;
-    let max_ms = us.last().copied().unwrap_or(0) / 1000;
+    // Read pre-computed lifecycle percentiles instead of re-sorting
+    // ~179k entries per frame (see `App::latency` / `LatencySnapshot`).
+    let (p50_us, p95_us, p99_us, max_us) = app.latency.lifecycle_pcts_us;
+    let p50 = p50_us / 1000;
+    let p95 = p95_us / 1000;
+    let p99 = p99_us / 1000;
+    let max_ms = max_us / 1000;
     let max_style = if max_ms >= 1000 {
         theme::bad_style()
     } else {
@@ -158,7 +159,7 @@ fn render_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .constraints([
             Constraint::Length(5),  // latency content (1 title + 3 bands + 1 p95)
             Constraint::Fill(1),    // gap
-            Constraint::Length(10), // legend content (1 title + 9 entries)
+            Constraint::Length(12), // legend content (1 title + 11 entries)
             Constraint::Fill(1),    // gap
             Constraint::Length(2),  // validator content (1 title + 1 line)
             Constraint::Fill(1),    // bottom gap
@@ -171,10 +172,9 @@ fn render_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_latency_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
-    let lats = analysis::lifecycle_latencies(app.state);
-    let mut us: Vec<i64> = lats.iter().map(|r| r.us).collect();
-    us.sort_unstable();
-    let p95 = analysis::percentile(&us, 0.95).unwrap_or(0) / 1000;
+    // Read from the cached snapshot. p95 only.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let p95 = app.latency.lifecycle_pcts_us.1 / 1000;
     let p95_healthy = p95 <= theme::LIFECYCLE_WARN_MS as i64;
 
     // Per-stage bands shown on a single line each so both columns are
@@ -322,6 +322,29 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
                 theme::label_style(),
             ),
         ]),
+        // vote-pattern column reference. N+S and N+F+S are protocol-
+        // ambiguous (validator cast both Notarize and Skip on the same
+        // slot); rendered explicitly so the operator can spot them, and
+        // filterable via `m`.
+        Line::from(vec![
+            Span::styled("  vote    ", theme::label_style()),
+            Span::styled("N", theme::value_style()),
+            Span::styled(" notarize  ", theme::label_style()),
+            Span::styled("F", theme::value_style()),
+            Span::styled(" finalize  ", theme::label_style()),
+            Span::styled("S", theme::value_style()),
+            Span::styled(" skip", theme::label_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            mark(filters.mixed_votes),
+            Span::styled("m ", theme::accent_style()),
+            Span::styled("N+S / N+F+S", theme::bad_style()),
+            Span::styled(
+                "  mixed votes — Notarize AND Skip on same slot",
+                theme::label_style(),
+            ),
+        ]),
         // Footer: clear-all hint.
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
@@ -335,7 +358,8 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
 fn render_validator_info(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let state = app.state;
     let total = state.slots.len() as u64;
-    let leader: u64 = state.slots.values().filter(|s| s.we_are_leader).count() as u64;
+    // Pre-counted once in `App::new` (see `App::leader_slot_count`).
+    let leader = app.leader_slot_count;
     // A leader window = 4 consecutive slots (Solana
     // `NUM_CONSECUTIVE_LEADER_SLOTS`). We divide leader-slot count by 4
     // to derive the window count for display; the aggregator counts
@@ -481,7 +505,7 @@ fn render_table(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn filter_chips(f: SlotFilters) -> String {
-    let mut chips: Vec<&'static str> = Vec::with_capacity(7);
+    let mut chips: Vec<&'static str> = Vec::with_capacity(8);
     if f.tcl {
         chips.push("TCL");
     }
@@ -502,6 +526,9 @@ fn filter_chips(f: SlotFilters) -> String {
     }
     if f.skipped_only {
         chips.push("skipped");
+    }
+    if f.mixed_votes {
+        chips.push("mixed-votes");
     }
     if chips.is_empty() {
         String::new()
@@ -564,18 +591,4 @@ fn pct(num: u64, denom: u64) -> f64 {
     } else {
         num as f64 * 100.0 / denom as f64
     }
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

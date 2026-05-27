@@ -92,11 +92,18 @@ impl SlotRecord {
         }
     }
 
-    /// Microseconds elapsed from `start` to `end`, if both timestamps are set.
-    #[allow(clippy::cast_possible_truncation)]
+    /// Microseconds elapsed from `start` to `end`, if both timestamps are set
+    /// and `end >= start`. Returns `None` for inverted intervals (clock skew,
+    /// out-of-order events) so callers cannot accidentally feed negatives into
+    /// `percentile` / `Severity::from_us`.
+    #[allow(clippy::cast_possible_truncation)] // safe: log delta fits in i64 (i64::MAX µs ≈ 292kyr)
     pub fn delta_us(start: Option<OffsetDateTime>, end: Option<OffsetDateTime>) -> Option<i64> {
         let (a, b) = (start?, end?);
-        Some((b - a).whole_microseconds() as i64)
+        let us = (b - a).whole_microseconds();
+        if us < 0 {
+            return None;
+        }
+        Some(us as i64)
     }
 
     /// First-shred → finalized latency (microseconds).
@@ -166,5 +173,27 @@ mod tests {
     fn lifecycle_us_returns_none_when_unset() {
         let r = SlotRecord::new(42);
         assert!(r.lifecycle_us().is_none());
+    }
+
+    #[test]
+    fn delta_us_zero_for_equal_timestamps() {
+        let t = Some(datetime!(2026-05-23 16:00:07.000000000 UTC));
+        assert_eq!(SlotRecord::delta_us(t, t), Some(0));
+    }
+
+    #[test]
+    fn delta_us_none_when_end_before_start() {
+        // Inverted interval (e.g. clock skew) must not propagate as negative µs.
+        let start = Some(datetime!(2026-05-23 16:00:07.500000000 UTC));
+        let end = Some(datetime!(2026-05-23 16:00:07.000000000 UTC));
+        assert_eq!(SlotRecord::delta_us(start, end), None);
+    }
+
+    #[test]
+    fn delta_us_none_when_either_unset() {
+        let t = Some(datetime!(2026-05-23 16:00:07.000000000 UTC));
+        assert_eq!(SlotRecord::delta_us(None, t), None);
+        assert_eq!(SlotRecord::delta_us(t, None), None);
+        assert_eq!(SlotRecord::delta_us(None, None), None);
     }
 }

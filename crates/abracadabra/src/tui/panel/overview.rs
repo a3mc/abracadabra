@@ -15,9 +15,11 @@ use ratatui::Frame;
 use crate::model::alerts::Severity;
 use crate::model::analysis;
 use crate::model::state::State;
+use crate::tui::app::App;
 use crate::tui::theme;
+use crate::tui::widget::{commas, sanitize_for_tui};
 
-pub fn render(state: &State, bucket_secs: i64, frame: &mut Frame<'_>, area: Rect) {
+pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -30,12 +32,12 @@ pub fn render(state: &State, bucket_secs: i64, frame: &mut Frame<'_>, area: Rect
         ])
         .split(area);
 
-    render_file_meta(state, bucket_secs, frame, chunks[0]);
-    render_headline_health(state, frame, chunks[1]);
-    render_vote_cert_totals(state, frame, chunks[2]);
-    render_lifecycle_stats(state, frame, chunks[3]);
-    render_resume_stats(state, frame, chunks[4]);
-    render_alerts_summary(state, frame, chunks[5]);
+    render_file_meta(app.state, app.bucket_secs, frame, chunks[0]);
+    render_headline_health(app.state, frame, chunks[1]);
+    render_vote_cert_totals(app.state, frame, chunks[2]);
+    render_lifecycle_stats(app, frame, chunks[3]);
+    render_resume_stats(app, frame, chunks[4]);
+    render_alerts_summary(app.state, frame, chunks[5]);
 }
 
 // ---------- File / time metadata ----------
@@ -338,11 +340,13 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
 
 // ---------- Latency stage breakdown ----------
 
-fn render_lifecycle_stats(state: &State, frame: &mut Frame<'_>, area: Rect) {
-    let stages = analysis::LatencyStages::compute(state);
+fn render_lifecycle_stats(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    // Read pre-computed stages from the snapshot rather than rebuilding
+    // and re-sorting three vectors per frame.
+    let stages = &app.latency.stages;
     let (a50, a95, a99, _) = analysis::pcts(&stages.assembly);
     let (c50, c95, c99, _) = analysis::pcts(&stages.consensus);
-    let (l50, l95, l99, lmax) = analysis::pcts(&stages.lifecycle);
+    let (l50, l95, l99, lmax) = app.latency.lifecycle_pcts_us;
 
     // Render as a small Table so columns align deterministically.
     // Columns: stage(20) | p50(10) | p95(10) | p99(10) | samples(rest) | description
@@ -430,30 +434,33 @@ fn right_align_ms(us: i64, width: usize) -> String {
 
 // ---------- Recovery stats ----------
 
-fn render_resume_stats(state: &State, frame: &mut Frame<'_>, area: Rect) {
-    let recs = analysis::vote_resumes_after_tcl(state);
-    let mut us_vals: Vec<i64> = recs.iter().map(|r| r.resume_us).collect();
-    us_vals.sort_unstable();
-    let p50 = analysis::percentile(&us_vals, 0.50).unwrap_or(0);
-    let p95 = analysis::percentile(&us_vals, 0.95).unwrap_or(0);
-    let p99 = analysis::percentile(&us_vals, 0.99).unwrap_or(0);
-    let max = us_vals.last().copied().unwrap_or(0);
-    let total = recs.len() as u64;
-    let (normal, elevated, severe) = analysis::resume_severity_counts(&recs);
-    let hours = state
+fn render_resume_stats(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    // Read from the cached snapshot rather than re-running
+    // `vote_resumes_after_tcl` per frame.
+    let total = app.latency.resume_total;
+    let (normal, elevated, severe) = app.latency.resume_severity_counts;
+    let (p50, p95, p99, max) = app.latency.resume_pcts_us;
+    // True hours covered by the log. `None` (or a degenerate hi == lo)
+    // collapses to a non-positive value; we skip the rate projection
+    // entirely in that case rather than reporting a per-hour figure
+    // inflated by clamping the denominator to 1.0. See COR-02 audit.
+    let hours = app
+        .state
         .file_meta
         .time_range
-        .map_or(1.0, |(lo, hi)| (hi - lo).as_seconds_f64() / 3600.0)
-        .max(1.0);
+        .map(|(lo, hi)| (hi - lo).as_seconds_f64() / 3600.0);
     #[allow(clippy::cast_precision_loss)]
-    let rate_h = total as f64 / hours;
+    let rate_label = match hours {
+        Some(h) if h > 0.0 => format!("{:.1}/h", total as f64 / h),
+        _ => "—".to_owned(),
+    };
 
     let lines = vec![
         Line::from(vec![
             Span::styled("events ", theme::label_style()),
             Span::styled(commas(total), theme::value_style()),
             Span::styled("   rate ", theme::label_style()),
-            Span::styled(format!("{rate_h:.1}/h"), theme::value_style()),
+            Span::styled(rate_label, theme::value_style()),
             Span::styled(
                 "   TimeoutCrashedLeader -> next Voting notarize",
                 theme::label_style(),
@@ -515,7 +522,10 @@ fn render_alerts_summary(state: &State, frame: &mut Frame<'_>, area: Rect) {
             Line::from(vec![
                 Span::styled(tag, style),
                 Span::raw(" "),
-                Span::raw(a.description.clone()),
+                // Alert descriptions can include log-derived bodies
+                // (LogPattern groups embed the sample) — strip control
+                // bytes before they reach the terminal.
+                Span::raw(sanitize_for_tui(&a.description).into_owned()),
             ])
         })
         .collect();
@@ -581,18 +591,4 @@ fn pct_count(n: u64, total: u64) -> String {
         let pct = n as f64 * 100.0 / total as f64;
         format!("{} ({pct:.1}%)", commas(n))
     }
-}
-
-fn commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    let len = bytes.len();
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }

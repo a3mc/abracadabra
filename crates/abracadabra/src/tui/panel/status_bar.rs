@@ -72,6 +72,8 @@ fn render_left(
             Span::styled(" leader  ", theme::label_style()),
             Span::styled("f/x/s", theme::title_style()),
             Span::styled(" fast/slow/skip  ", theme::label_style()),
+            Span::styled("m", theme::title_style()),
+            Span::styled(" mixed-votes  ", theme::label_style()),
             Span::styled("c", theme::title_style()),
             Span::styled(" clear  ", theme::label_style()),
         ]);
@@ -79,7 +81,11 @@ fn render_left(
     if current_tab == 5 {
         spans.extend([
             Span::styled("y", theme::title_style()),
-            Span::styled(" yank to /tmp  ", theme::label_style()),
+            // Yank target: `$XDG_RUNTIME_DIR/abracadabra` (preferred) or
+            // `$HOME/.cache/abracadabra/yank` (fallback). The exact path
+            // appears in the `status_message` after a successful yank;
+            // the hint just signals the affordance.
+            Span::styled(" yank to file  ", theme::label_style()),
         ]);
     }
     spans.extend([

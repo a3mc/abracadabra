@@ -8,6 +8,17 @@ use time::OffsetDateTime;
 use crate::model::alerts::{Alert, Severity};
 use crate::model::slot::SlotRecord;
 
+/// Upper bound on the number of timestamps retained per `LogIssueGroup`.
+///
+/// Memory bound at 16 bytes per `OffsetDateTime` -> ~16 MB per group at
+/// the cap. Well above the worst observed real workload (~137k entries
+/// in a 21h reference log); the cap exists to defend against pathological
+/// input (e.g. a multi-GB log with one recurring unparsed WARN/ERROR
+/// pattern). When the cap is hit, additional timestamps are dropped from
+/// the sparkline-input list and counted in `LogIssueGroup.timestamps_dropped`;
+/// `LogIssueGroup.count` continues to reflect the true total.
+pub const MAX_GROUP_TIMESTAMPS: usize = 1_000_000;
+
 /// Bucket for WARN/ERROR lines from modules with no dedicated parser.
 /// Aggregated by `(severity, module)` in `OverallStats::log_issues`.
 #[derive(Debug, Clone)]
@@ -19,13 +30,19 @@ pub struct LogIssueGroup {
     pub last_at: OffsetDateTime,
     /// First body seen for the group; truncated upstream at the parser.
     pub sample_body: String,
-    /// All timestamps for the group, in arrival order. Retained so the
-    /// alerts panel can render a per-pattern time-distribution sparkline
-    /// ("does this pattern spam at one moment or fire evenly?"). 16
-    /// bytes per timestamp; for the largest known group (~137k cluster-
-    /// slots ERRORs in a 21h log) this is ~2.2 MB — acceptable for a
-    /// post-mortem analyzer.
+    /// Timestamps in arrival order, capped at `MAX_GROUP_TIMESTAMPS`.
+    /// Retained so the alerts panel can render a per-pattern time
+    /// distribution sparkline ("does this pattern spam at one moment or
+    /// fire evenly?"). 16 bytes per timestamp; at the cap the per-group
+    /// footprint is ~16 MB. Worst observed real workload is ~137k
+    /// entries in a 21h reference log; the cap defends against
+    /// pathological logs that would otherwise grow unbounded. Overflow
+    /// is tracked in `timestamps_dropped` — `count` always reflects the
+    /// true total.
     pub timestamps: Vec<OffsetDateTime>,
+    /// Number of timestamps not pushed because `timestamps.len()` was
+    /// already at `MAX_GROUP_TIMESTAMPS`. Zero on the documented dataset.
+    pub timestamps_dropped: u64,
 }
 
 /// File-level metadata captured during parse.
@@ -66,6 +83,11 @@ pub struct OverallStats {
     /// by the Alerts panel to render a sparkline of when this
     /// validator's leader windows fell across the log's time range.
     pub produce_window_timestamps: Vec<OffsetDateTime>,
+    /// `ProduceWindow` events rejected because `end - start` exceeded
+    /// `MAX_LEADER_WINDOW_SPAN`. Corruption-defence counter — a malformed
+    /// `end` could otherwise force the aggregator to materialise
+    /// `end - start + 1` `SlotRecord`s in the `slots` map.
+    pub malformed_produce_window: u64,
 
     // Standstill activity.
     pub standstill_events: u64,
@@ -91,6 +113,11 @@ pub struct OverallStats {
 }
 
 /// Top-level state. The aggregator owns one of these and mutates it.
+///
+/// Invariant on `alerts`: after `aggregator::analyze` returns, the vector
+/// is sorted by `(severity desc, at asc, kind discriminant asc)`. Until
+/// `analyze` runs, `alerts` is in stream-insertion order and that
+/// ordering must not be relied on by consumers.
 #[derive(Debug, Default)]
 pub struct State {
     pub file_meta: FileMeta,
