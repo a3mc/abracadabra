@@ -57,7 +57,7 @@ jobs:
             apt: musl-tools
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: assert tag matches Cargo.toml version
         shell: bash
@@ -139,7 +139,7 @@ jobs:
           fi
 
       - name: upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
