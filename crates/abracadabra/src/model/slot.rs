@@ -153,8 +153,12 @@ mod tests {
 
     #[test]
     fn status_skipped_wins_over_finalized() {
-        // Defensive: should never happen in practice, but if both timestamps
-        // are set we treat Skipped as authoritative.
+        // Both timestamps set is the expected observation when this node
+        // voted skip on a slot the cluster went on to finalize. Prefer
+        // Skipped in the status pill — local behavior is the more
+        // interesting signal for a per-validator analyzer, and cluster-level
+        // skip outcomes are not yet log-observable (Skip certs emit no
+        // info-level line; needs RPC or block-production data to recover).
         let mut r = SlotRecord::new(42);
         r.voted_skip_at = Some(datetime!(2026-05-23 16:00:07.123456789 UTC));
         r.finalized_at = Some(datetime!(2026-05-23 16:00:07.123456789 UTC));

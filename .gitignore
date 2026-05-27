@@ -5,6 +5,7 @@
 
 # Local-only state
 /log/
+/scripts/
 
 # Editor / OS
 .vscode/
