@@ -161,6 +161,15 @@ pub fn ingest(state: &mut State, event: Event) {
         EventKind::RefreshingVote => {
             state.overall.refreshing_votes = state.overall.refreshing_votes.saturating_add(1);
         }
+        EventKind::TriggeringParentReady { .. } => {
+            // Empirically (~3,800/hr in steady-state) this fires ~twice per
+            // leader window as the finalization chain catches up positions
+            // %4=1 and %4=2. Not a recovery signal in normal operation —
+            // we count it but do not surface per-slot.
+            // See docs/alpenglow/07-safety-machinery.md.
+            state.overall.parent_ready_recoveries =
+                state.overall.parent_ready_recoveries.saturating_add(1);
+        }
         EventKind::SetIdentity => {
             // Operator rotated validator identity — INFO timeline anchor.
             // Pushed inline (not via analyze) so the Alert.at carries

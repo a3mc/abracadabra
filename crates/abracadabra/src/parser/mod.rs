@@ -147,6 +147,21 @@ pub enum EventKind {
     SetIdentity,
     /// `Refreshing vote {vote:?}` — body details deferred.
     RefreshingVote,
+    /// `Triggering parent ready for slot N with parent M HASH`.
+    ///
+    /// Out-of-band emit from `event_handler::add_missing_parent_ready` (not via
+    /// `ParentReadyTracker`). Recovery path: a Finalized cert arrived for a
+    /// non-first-of-window slot while the validator had no ParentReady for the
+    /// first slot of that window — the function walks `bank.parent()` and
+    /// retroactively triggers ParentReady.
+    TriggeringParentReady {
+        /// The just-finalized block that triggered the recovery.
+        slot: u64,
+        /// The parent slot now retroactively marked ready.
+        parent_slot: u64,
+        /// Parent block id.
+        parent_hash: String,
+    },
 
     // -- agave_votor::root_utils --
     SettingRoot {

@@ -128,6 +128,12 @@ pub struct OverallStats {
     pub standstill_ended_events: u64,
     pub refreshing_votes: u64,
 
+    /// Number of `Triggering parent ready` lines observed — i.e. how many
+    /// times `event_handler::add_missing_parent_ready` fired the stuck-
+    /// cluster recovery path. Expected to be rare; a spike is a signal
+    /// that the validator is repeatedly catching up mid-window.
+    pub parent_ready_recoveries: u64,
+
     // Bank.
     pub bank_frozen_count: u64,
 
