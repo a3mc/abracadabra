@@ -146,11 +146,22 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         0.0
     };
     let total_slots = state.slots.len() as u64;
-    let skip_pct = if total_slots > 0 {
-        ov.votes_skip as f64 * 100.0 / total_slots as f64
+
+    // Bad-skip rate is the headline participation-failure metric.
+    // Numerator: skips we proved landed on canonical slots (direct
+    // Finalized observation OR ancestry-proven via parent chain).
+    // Denominator: total skip votes we cast. If indeterminate skips
+    // exist, the displayed rate is a LOWER BOUND — the legend marks
+    // this with `≥`.
+    let bad_skips = ov
+        .bad_skips_direct
+        .saturating_add(ov.bad_skips_ancestry);
+    let bad_skip_pct = if ov.votes_skip > 0 {
+        bad_skips as f64 * 100.0 / ov.votes_skip as f64
     } else {
         0.0
     };
+    let has_indeterminate = ov.indeterminate_skips > 0;
 
     // 4-slot leader window assumed (Solana standard).
     let leader_windows_total = total_slots / 4;
@@ -175,11 +186,18 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             "CRITICAL (<60%) — slow path dominant",
         )
     };
-    let skip_style = theme::band_lower_better(
-        skip_pct,
-        theme::VOTE_SKIP_WARN_PCT,
-        theme::VOTE_SKIP_BAD_PCT,
+    let bad_skip_style = theme::band_lower_better(
+        bad_skip_pct,
+        theme::BAD_SKIP_WARN_PCT,
+        theme::BAD_SKIP_BAD_PCT,
     );
+    let bad_skip_verdict = if bad_skip_pct < theme::BAD_SKIP_WARN_PCT {
+        "healthy"
+    } else if bad_skip_pct < theme::BAD_SKIP_BAD_PCT {
+        "DEGRADED"
+    } else {
+        "CRITICAL"
+    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -206,13 +224,26 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(fast_verdict, fast_style),
         ]),
         Line::from(vec![
-            Span::styled(format!("  {:<16}", "vote skip rate"), theme::label_style()),
-            Span::styled(format!("{skip_pct:>6.2}%"), skip_style),
+            Span::styled(format!("  {:<16}", "bad-skip rate"), theme::label_style()),
             Span::styled(
                 format!(
-                    "  ({} of {} slots)",
+                    "{}{bad_skip_pct:>5.2}%",
+                    if has_indeterminate { "≥" } else { " " }
+                ),
+                bad_skip_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(bad_skip_verdict, bad_skip_style),
+            Span::styled(
+                format!(
+                    "  ({} bad of {} skips{})",
+                    commas(bad_skips),
                     commas(ov.votes_skip),
-                    commas(total_slots)
+                    if has_indeterminate {
+                        format!(" · {} indeterm", commas(ov.indeterminate_skips))
+                    } else {
+                        String::new()
+                    },
                 ),
                 theme::label_style(),
             ),

@@ -242,13 +242,16 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
 
     let lines = vec![
         section_title("Column legend  (table columns + event tags · keys toggle filters)"),
-        // status — three states inline + tickable filter row for SKIP
+        // status — four states inline. BSKIP is the new bad-skip marker;
+        // plain SKIP is local-skip with indeterminate cluster outcome.
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
             Span::styled("FIN", theme::good_style()),
             Span::styled(" finalized   ", theme::label_style()),
+            Span::styled("BSKIP", theme::bad_style()),
+            Span::styled(" we voted skip on a canonical slot   ", theme::label_style()),
             Span::styled("SKIP", theme::warn_style()),
-            Span::styled(" skipped   ", theme::label_style()),
+            Span::styled(" we voted skip, cluster outcome unknown   ", theme::label_style()),
             Span::styled("PEND", theme::label_style()),
             Span::styled(" pending", theme::label_style()),
         ]),
@@ -257,7 +260,9 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             mark(filters.skipped_only),
             Span::styled("s ", theme::accent_style()),
             Span::styled("SKIP", theme::warn_style()),
-            Span::styled("  filter to skipped slots only", theme::label_style()),
+            Span::styled("+", theme::label_style()),
+            Span::styled("BSKIP", theme::bad_style()),
+            Span::styled("  filter to skip-voted slots (both buckets)", theme::label_style()),
         ]),
         // path — F is tickable via 'f' to filter fast-finalized only
         Line::from(vec![
@@ -308,7 +313,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("n ", theme::accent_style()),
             Span::styled("S2N", theme::warn_style()),
             Span::styled(
-                "  SafeToNotar  — cluster notarized despite local hesitate",
+                "  SafeToNotar — another block crossed safety threshold; we hedged with NotarizeFallback",
                 theme::label_style(),
             ),
         ]),
@@ -318,7 +323,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("p ", theme::accent_style()),
             Span::styled("S2S", theme::warn_style()),
             Span::styled(
-                "  SafeToSkip   — cluster decided slot safe to skip",
+                "  SafeToSkip — slot stake fragmented past threshold; we hedged with SkipFallback",
                 theme::label_style(),
             ),
         ]),
@@ -538,9 +543,16 @@ fn filter_chips(f: SlotFilters) -> String {
 }
 
 fn row_for(s: &SlotViewRow) -> Row<'_> {
+    // Color-banding for the status cell:
+    //   FastFinalized / SlowFinalized → green (healthy outcome)
+    //   Skipped + Bad (verified bad skip) → red (real failure)
+    //   Skipped + Indeterminate/NotSkipped → yellow (unverified;
+    //                                              could be right or bad)
+    //   Pending → gray (no terminal state yet)
     let status_style = match s.status {
-        SlotStatus::FastFinalized => theme::good_style(),
-        SlotStatus::SlowFinalized | SlotStatus::Skipped => theme::warn_style(),
+        SlotStatus::FastFinalized | SlotStatus::SlowFinalized => theme::good_style(),
+        SlotStatus::Skipped if s.skip_classification.is_bad() => theme::bad_style(),
+        SlotStatus::Skipped => theme::warn_style(),
         SlotStatus::Pending => theme::label_style(),
     };
     // Per-stage health bands. `None` (pending) -> gray so we don't

@@ -843,10 +843,12 @@ mod tests {
     /// ambiguous case `vote_pattern` now surfaces as `N+S` / `N+F+S`.
     #[test]
     fn mixed_votes_filter_matches_n_and_s_rows() {
+        use crate::model::slot::SkipClassification;
         use crate::tui::view::SlotViewRow;
         let mk = |n, s| SlotViewRow {
             slot: 0,
             status: SlotStatus::Pending,
+            skip_classification: SkipClassification::NotSkipped,
             fast: None,
             we_are_leader: false,
             assembly_ms: None,

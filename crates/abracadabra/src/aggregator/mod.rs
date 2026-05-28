@@ -4,9 +4,12 @@
 //! and the aggregator focused on bookkeeping. The TUI can read State without
 //! understanding the event grammar.
 
+use std::collections::HashSet;
+
 use time::OffsetDateTime;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
+use crate::model::slot::{BadSkipEvidence, SkipClassification};
 use crate::model::state::{LogIssueGroup, State, MAX_GROUP_TIMESTAMPS};
 use crate::parser::line::Level;
 use crate::parser::{Event, EventKind};
@@ -314,6 +317,76 @@ fn record_log_pattern<F: FnOnce() -> String>(
 
 const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_slots";
 
+/// Stage 1 bad-skip classifier (pure log; no RPC).
+///
+/// For each slot where we cast a Skip vote, prove `bad` from log alone via:
+///
+///   (a) **direct evidence** — we observed a `Finalized` event for this
+///       slot ourselves. The cluster reached a finalization cert here.
+///   (b) **ancestry evidence** — some descendant of this slot is
+///       `Finalized` AND the parent chain from that descendant reaches
+///       this slot. The cluster placed this slot on the rooted chain.
+///
+/// Otherwise the slot is `Indeterminate` — could be a right-skip
+/// (cluster also skipped) or an unverified bad-skip. Stage 2 (RPC
+/// enrichment, future work) would tighten this further by querying
+/// `getBlocks` for ground truth.
+///
+/// Empirical validation: on 5 logs spanning ~5 days, this classifier
+/// matched RPC ground truth 100% on the verifiable subset. See
+/// `audit/2026-05-27-tui-vs-alpenglow/TRIAGE.md` section D1.
+///
+/// Must be called once after `ingest` has processed the full stream.
+/// `analyze` invokes this; external callers should not call it again.
+pub fn classify_skips(state: &mut State) {
+    // Step 1: collect the set of slots we directly observed `Finalized` for.
+    let finalized: HashSet<u64> = state
+        .slots
+        .iter()
+        .filter_map(|(s, r)| r.finalized_at.is_some().then_some(*s))
+        .collect();
+
+    // Step 2: walk parent pointers backward from each finalized slot to
+    // collect the full ancestor set. Loop guard via the visited check
+    // (`insert` returns false if already in) prevents pathological
+    // cycles from a corrupted parent map.
+    let mut ancestors: HashSet<u64> = HashSet::new();
+    for &fin in &finalized {
+        let mut cur = fin;
+        while let Some((parent_slot, _)) = state.slots.get(&cur).and_then(|r| r.parent.as_ref()) {
+            let p = *parent_slot;
+            if !ancestors.insert(p) {
+                break;
+            }
+            cur = p;
+        }
+    }
+
+    // Step 3: classify each slot record. `NotSkipped` is the default.
+    let mut bad_direct: u64 = 0;
+    let mut bad_ancestry: u64 = 0;
+    let mut indeterminate: u64 = 0;
+    for (slot, rec) in state.slots.iter_mut() {
+        if rec.voted_skip_at.is_none() {
+            rec.skip_classification = SkipClassification::NotSkipped;
+            continue;
+        }
+        rec.skip_classification = if rec.finalized_at.is_some() {
+            bad_direct = bad_direct.saturating_add(1);
+            SkipClassification::Bad(BadSkipEvidence::DirectFinalize)
+        } else if ancestors.contains(slot) {
+            bad_ancestry = bad_ancestry.saturating_add(1);
+            SkipClassification::Bad(BadSkipEvidence::Ancestry)
+        } else {
+            indeterminate = indeterminate.saturating_add(1);
+            SkipClassification::Indeterminate
+        };
+    }
+    state.overall.bad_skips_direct = bad_direct;
+    state.overall.bad_skips_ancestry = bad_ancestry;
+    state.overall.indeterminate_skips = indeterminate;
+}
+
 /// Derived alerts computed after the stream has been fully ingested.
 ///
 /// Emits one `LogPattern` alert per `(severity, module)` group and a
@@ -335,6 +408,7 @@ pub fn analyze(state: &mut State) {
         )),
         "analyze() must run at most once per State",
     );
+    classify_skips(state);
     surface_log_pattern_alerts(state);
     surface_local_leader_summary(state);
     // Establish the post-analyze invariant on `state.alerts`: Critical

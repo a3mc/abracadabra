@@ -5,13 +5,14 @@
 //! recomputing latencies on every keystroke).
 
 use crate::model::analysis::{self, LatencyStages, VoteResumeRecord};
-use crate::model::slot::{SlotRecord, SlotStatus};
+use crate::model::slot::{SkipClassification, SlotRecord, SlotStatus};
 use crate::model::state::State;
 
 #[derive(Debug, Clone)]
 pub struct SlotViewRow {
     pub slot: u64,
     pub status: SlotStatus,
+    pub skip_classification: SkipClassification,
     pub fast: Option<bool>,
     pub we_are_leader: bool,
     /// `first_shred_at` → `block_emitted_at` (shred reception + replay).
@@ -37,6 +38,7 @@ impl SlotViewRow {
         Self {
             slot: r.slot,
             status: r.status(),
+            skip_classification: r.skip_classification,
             fast: r.fast_finalize,
             we_are_leader: r.we_are_leader,
             assembly_ms,
@@ -69,10 +71,26 @@ impl SlotViewRow {
         }
     }
 
+    /// Status pill string for the slot table.
+    ///
+    /// For skipped slots, the `SkipClassification` discriminator
+    /// determines the operator-visible label:
+    ///
+    ///   - `BSKIP` — we voted skip on a slot the cluster reached
+    ///     canonical agreement on (real participation failure).
+    ///   - `SKIP`  — we voted skip; cluster outcome indeterminate from
+    ///     log alone (could be a right skip OR an unverified bad skip).
+    ///
+    /// Until Stage 2 RPC enrichment lands, plain `SKIP` is the
+    /// indeterminate bucket — NOT a claim of correctness. The legend
+    /// must make that explicit.
     pub const fn status_str(&self) -> &'static str {
         match self.status {
             SlotStatus::FastFinalized | SlotStatus::SlowFinalized => "FIN",
-            SlotStatus::Skipped => "SKIP",
+            SlotStatus::Skipped => match self.skip_classification {
+                SkipClassification::Bad(_) => "BSKIP",
+                _ => "SKIP",
+            },
             SlotStatus::Pending => "PEND",
         }
     }
@@ -225,6 +243,7 @@ mod tests {
         let mk = |n, f, s| SlotViewRow {
             slot: 0,
             status: SlotStatus::Pending,
+            skip_classification: SkipClassification::NotSkipped,
             fast: None,
             we_are_leader: false,
             assembly_ms: None,

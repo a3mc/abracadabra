@@ -62,6 +62,23 @@ pub struct OverallStats {
     pub votes_finalize: u64,
     pub votes_skip: u64,
 
+    // Skip classification (populated by aggregator::classify_skips).
+    //
+    // `votes_skip` above counts every "Voting skip for SLOT" event we
+    // observed. These three counters partition that into bad-skip
+    // evidence categories — operator-facing failure indicator.
+    /// We voted skip on a slot we also observed `Finalized` for. The
+    /// most direct evidence of participation failure.
+    pub bad_skips_direct: u64,
+    /// We voted skip on a slot that is an ancestor of a finalized slot
+    /// (parent chain from a finalized descendant reaches this slot).
+    /// Equally definitive — the slot is on the rooted chain.
+    pub bad_skips_ancestry: u64,
+    /// We voted skip on a slot with no canonical-status evidence in the
+    /// log. Could be a right skip or an unverified bad skip — Stage 1
+    /// alone cannot say.
+    pub indeterminate_skips: u64,
+
     // Cluster cert outcomes (events we received).
     pub block_notarized_count: u64,
     pub block_notar_fallback_count: u64,

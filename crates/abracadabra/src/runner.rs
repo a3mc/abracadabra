@@ -169,9 +169,29 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         },
     );
     let total_slots = state.slots.len() as u64;
+    // Bad-skip rate is the operator-facing failure indicator. Numerator
+    // is skips we proved landed on canonical slots (Stage 1 classifier);
+    // denominator is total skips we cast. When indeterminate skips exist
+    // the displayed number is a lower bound — marked with `>=`.
+    let bad_skips = ov.bad_skips_direct.saturating_add(ov.bad_skips_ancestry);
+    let bad_skip_pct = pct(bad_skips, ov.votes_skip);
+    let bound_marker = if ov.indeterminate_skips > 0 { ">=" } else { "  " };
+    println!(
+        "  {:<18} {}{:>5.2}%   {} bad of {} skips{}",
+        "bad-skip rate",
+        bound_marker,
+        bad_skip_pct,
+        commas(bad_skips),
+        commas(ov.votes_skip),
+        if ov.indeterminate_skips > 0 {
+            format!(" ({} indeterminate)", commas(ov.indeterminate_skips))
+        } else {
+            String::new()
+        },
+    );
     let skip_pct = pct(ov.votes_skip, total_slots);
     println!(
-        "  {:<18} {:>6}   {} of {} slots",
+        "  {:<18} {:>6}   {} of {} slots (raw — see bad-skip rate above)",
         "vote skip rate",
         format!("{skip_pct:.2}%"),
         commas(ov.votes_skip),

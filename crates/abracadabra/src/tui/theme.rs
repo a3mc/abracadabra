@@ -77,8 +77,23 @@ pub const FIN_WARN_PCT: f64 = 80.0;
 /// Local vote-skip rate (this validator) as a share of observed slots.
 /// Sustained skip rates above 15% indicate this node is consistently
 /// not observing leader blocks in time.
+///
+/// NOTE: raw skip rate is no longer the headline KPI — see
+/// `BAD_SKIP_*` thresholds below for the operator-facing metric.
+/// This constant is retained for legacy panels until they migrate.
 pub const VOTE_SKIP_WARN_PCT: f64 = 5.0;
 pub const VOTE_SKIP_BAD_PCT: f64 = 15.0;
+
+/// **Bad-skip rate** — fraction of our skip votes that landed on
+/// canonical slots (proven via direct `Finalized` observation or
+/// chain ancestry from a finalized descendant).
+///
+/// Operator-facing failure indicator. Empirical baselines from our
+/// 5-day validation: 0.02% to 0.09% across rotated logs of a healthy
+/// validator. Anything below 0.5% is essentially noise; 0.5%-2% is
+/// elevated; above 2% is a real participation problem.
+pub const BAD_SKIP_WARN_PCT: f64 = 0.5;
+pub const BAD_SKIP_BAD_PCT: f64 = 2.0;
 
 /// Per-slot assembly time (first_shred → block_emitted) in ms. Baseline
 /// sits ≈ 450 ms in a healthy 21h log; 500 ms is the visible-spike

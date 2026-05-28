@@ -15,7 +15,56 @@ pub enum SlotStatus {
     /// Finalized via two-round 60% Notarize + 60% Finalize path.
     SlowFinalized,
     /// Local node cast a skip vote for this slot.
+    ///
+    /// Whether this skip landed on a canonical slot (a participation
+    /// failure) or on a slot the cluster also skipped (correct behavior)
+    /// is a separate axis tracked by `SkipClassification`.
     Skipped,
+}
+
+/// How we know a slot was canonical even though we voted skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadSkipEvidence {
+    /// We observed a `Finalized` event for this slot in our own log.
+    /// Definitive — the cluster reached a finalization cert here.
+    DirectFinalize,
+    /// Some descendant of this slot was finalized, and walking parent
+    /// pointers from that descendant reaches this slot. The cluster used
+    /// this slot as part of the rooted chain. Equally definitive.
+    Ancestry,
+}
+
+/// Per-slot skip classification — orthogonal to `SlotStatus`.
+///
+/// Stage 1 (log only) produces `NotSkipped`, `Bad(...)`, or
+/// `Indeterminate`. Stage 2 (RPC enrichment, not yet implemented) will
+/// additionally produce `Right` for skips confirmed non-canonical via
+/// `getBlocks`, and may upgrade `Indeterminate` to `Bad` or `Right`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipClassification {
+    /// This node did not cast a skip vote for this slot.
+    NotSkipped,
+    /// We voted skip on a slot the cluster reached canonical agreement
+    /// on. This is a real participation failure.
+    Bad(BadSkipEvidence),
+    /// We voted skip and no evidence from the log proves the slot's
+    /// canonical status either way. Could be a right skip (cluster
+    /// also skipped) or an unverified bad skip — log alone cannot say.
+    /// Resolvable via Stage 2 RPC enrichment when available.
+    Indeterminate,
+}
+
+impl SkipClassification {
+    /// True iff this is a confirmed bad skip via either evidence type.
+    pub const fn is_bad(&self) -> bool {
+        matches!(self, Self::Bad(_))
+    }
+}
+
+impl Default for SkipClassification {
+    fn default() -> Self {
+        Self::NotSkipped
+    }
 }
 
 /// All observed events for a single slot.
@@ -52,6 +101,11 @@ pub struct SlotRecord {
     /// True iff our validator was the leader for this slot's window
     /// (derived from ProduceWindow events).
     pub we_are_leader: bool,
+
+    /// Populated by `aggregator::classify_skips` after `ingest` finishes.
+    /// Default `NotSkipped` is the unclassified state — meaningful
+    /// values land only after the classifier pass runs.
+    pub skip_classification: SkipClassification,
 }
 
 impl SlotRecord {
@@ -76,6 +130,7 @@ impl SlotRecord {
             safe_to_skip_at: None,
             fast_finalize: None,
             we_are_leader: false,
+            skip_classification: SkipClassification::NotSkipped,
         }
     }
 
