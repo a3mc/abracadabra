@@ -44,9 +44,10 @@ pub enum CanonicalSkipEvidence {
 /// "Canonical skip" = we voted skip on a slot that became canonical.
 /// The slot is canonical; our skip vote landed on it incorrectly. The
 /// term is operator-facing; user docs and the TUI use the same wording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SkipClassification {
     /// This node did not cast a skip vote for this slot.
+    #[default]
     NotSkipped,
     /// We voted skip on a slot that became canonical (real participation
     /// failure). Evidence describes how we know the slot is canonical.
@@ -63,12 +64,6 @@ impl SkipClassification {
     /// type. This is the operator-facing "did we fail" indicator.
     pub const fn is_canonical_skip(&self) -> bool {
         matches!(self, Self::CanonicalSkip(_))
-    }
-}
-
-impl Default for SkipClassification {
-    fn default() -> Self {
-        Self::NotSkipped
     }
 }
 
