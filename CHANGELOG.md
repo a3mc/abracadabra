@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-28
+
+Version aligned with the alpenglow `ag-v0.3.2` tag this release was
+validated against.
+
+### Added
+
+- Stage 1 canonical-skip classifier (`aggregator::classify_skips`):
+  walks parent pointers from observed `Finalized` slots, assigns
+  every `voted_skip` slot to `DirectFinalize` / `Ancestry` /
+  `Indeterminate`. The headline operator-facing metric
+  `canonical-skip %` is derived from this classification.
+- `EventKind::TriggeringParentReady` parser variant for the
+  `event_handler::add_missing_parent_ready` log line; counter on
+  `OverallStats` (intentionally unsurfaced, reserved for future
+  per-window analysis).
+- Standstill range tracking: `OverallStats.standstill_ranges` built
+  from `StandstillExtending` / `StandstillEnded` events, including
+  EOS-orphan close. New `timeout_crashed_leaders_outside_standstill`
+  counter computed in `analyze` filters TCLs that fired inside a
+  standstill window (where the per-slot timeout is stretched and the
+  leader did not actually misbehave).
+- `SlotViewRow.consensus_inverted` flag rendered as `↶` in the
+  Slots-tab `consensus` column for rows where the cluster's
+  `Finalized` cert arrived before the local node's `Block` event
+  (cluster outran local replay). Plain `-` is now reserved for
+  genuinely missing data.
+- `theme::TRUE_FB_ELEVATED_PCT` threshold constant.
+- `ProduceWindow` corruption guards (oversized span `> 16`,
+  inverted range `end < start`), counted in
+  `OverallStats.malformed_produce_window`.
+- `MirrorSparkline` widget on the time-series tab for the paired
+  vote-skip / canonical-skip mirror chart (one rises from the
+  bottom, the other hangs from the top, shared x-axis).
+
+### Changed
+
+- Slot status labels: `SKIP` renamed to `VSKIP` (we Voted skip,
+  no canonical evidence). `CSKIP` unchanged. The `V` / `C` prefix
+  convention makes both labels self-describing — both refer to
+  *our* vote; the prefix indicates whether canonical evidence
+  exists.
+- Slots-tab filter hotkeys rotated:
+  `[v]` = VSKIP only, `[c]` = CSKIP only,
+  `[s]` = SLOW, `[x]` = clear all filters,
+  `[b]` freed. `SlotFilters::vskip_only` replaces `skipped_only`
+  with narrowed semantic; the skip-family pair (`vskip_only`,
+  `canonical_skip_only`) now uses OR semantics — pressing both
+  shows the union.
+- Slots-tab `consensus` column now distinguishes three states:
+  positive value in ms (normal), `↶` (cluster outran local
+  replay), `-` (missing data).
+- Slots-tab `Latency bands` reference panel adds a `consensus`
+  threshold row (≤ 300 ms · 300–600 ms · > 600 ms).
+- Slots-tab KPI strip: leader-slot share metric moved from the
+  buried right-panel footer onto `slot stats` line 2 next to the
+  lifecycle percentiles. `p95` value is now health-coloured at the
+  KPI site, replacing the previous footer row.
+- Slots-tab legend: static column-value reference (status, vote,
+  consensus glyph) moved to the bottom of the panel below the
+  `[x] clear all filters` separator. The filter section above is
+  now exclusively interactive toggles.
+- Slots-panel title shortened: drops the redundant total in
+  `slots (N total | cursor M / N)` → `slots (cursor M / N)`. The
+  filtered variant retains `M of N`.
+- `vote & cert totals` widget on Overview rewritten as three
+  horizontal columns (`votes` / `certs` / `finalized`) instead
+  of stacked text. Headings styled in `title_style`.
+- Overview headline-health `fast-finalize` row dropped the
+  `fast NN.NN% / slow NN.NN%` breakdown (the numbers now live
+  in the `vote & cert totals` `finalized` column). Verdict mark
+  and text retained.
+- Alerts-tab `detail` block + list block + Overview `alerts`
+  widget gain `Padding::new(...)` for breathing room from the
+  block border.
+- Alerts-tab `detail` widget adds explicit blank lines between
+  the `last` and `span` rows and between the `first sample`
+  label and the sample body.
+- Leader-timeouts trend chart uses a packing-search algorithm
+  to pick `(bar_width, bar_count)` that fills the panel width.
+  `bar_width` capped at 6 columns so very wide terminals do not
+  collapse the chart to a handful of thick bars.
+- Header `crashed leaders` metric on Overview adopts the
+  standstill-aware count when standstill ranges exist (raw count
+  appears on a continuation line); when no standstill ranges
+  exist, the single-line display is unchanged.
+- Canonical-skip lower-bound marker (`≥`) now applied on the
+  Slots-tab KPI strip when `indeterminate_skips > 0`, matching
+  the header, overview, windows, and `--text` runner surfaces.
+- `stake share` label removed. Renamed `leader-slot share`
+  (window-relative, not on-chain stake — the previous label
+  overstated what the tool measures).
+- `Severity::from_us` thresholds (1.5 s / 3.0 s) documented as
+  provisional pending empirical calibration across multi-day
+  log archives.
+- True-FB cutoff `0.5%` consolidated into
+  `theme::TRUE_FB_ELEVATED_PCT` and consumed at both render
+  sites (was a duplicated literal).
+- True-FB percentage formatted as `{:.2}%` (was `{:.3}%` — no
+  false precision on an integer-count ratio).
+
+### Fixed
+
+- Slots-tab canonical-skip percentage was missing the `≥`
+  lower-bound marker even when indeterminate skips existed.
+  Same number now reads consistently across all surfaces.
+- Seven previously-undocumented `OverallStats` fields received
+  reserved-for-future docstrings explicitly marking them as
+  intentionally unsurfaced (matching the existing
+  `parent_ready_recoveries` precedent): `malformed_produce_window`,
+  `standstill_extending_events`, `standstill_ended_events`,
+  `no_epoch_info_for_slot`, `updating_epoch_metadata`,
+  `evicting_epoch_metadata`, `invalid_cluster_slots_update`.
+
+### Internal
+
+- Test count: 187 → 201 across the workspace.
+- `aggregator/tests.rs` (989 LOC) split into 6 sub-modules under
+  `aggregator/tests/` (`ingest`, `standstill`, `classify_skips`,
+  `log_patterns`, `produce_window`, `analyze_alerts`).
+- `tui/app.rs` inline `mod tests` (309 LOC) extracted to
+  `tui/app_tests.rs` via `#[path]` declaration; production
+  module drops to 753 LOC, under the 800 strong-warn threshold.
+- `OverallStats` unique-slot count docstrings clarified —
+  `finalized_slot_count + skipped_slot_count + pending_slot_count`
+  is overlap, not partition (a canonical-skip slot is counted in
+  both `finalized_slot_count` and `skipped_slot_count`).
+- rustfmt + strict clippy fixes for the workspace:
+  `explicit_iter_loop`, `doc_overindented_list_items`,
+  `type_complexity`, `items_after_statements`, `derivable_impls`.
+
 ## [0.1.1] — 2026-05-27
 
 ### Added
