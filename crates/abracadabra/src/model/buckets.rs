@@ -15,6 +15,11 @@ pub struct BucketStats {
     pub finalized_fast: u64,
     pub finalized_slow: u64,
     pub votes_skip: u64,
+    /// Subset of `votes_skip` where the slot was proven canonical by
+    /// the Stage 1 classifier (direct Finalized observation or chain
+    /// ancestry from a finalized descendant). Drives the canonical-skip
+    /// series on the vote-skip time-series card.
+    pub canonical_skips: u64,
     pub crashed_leaders: u64,
     pub safe_to_notar: u64,
     pub safe_to_skip: u64,
@@ -90,6 +95,9 @@ impl TimeBuckets {
             }
             if record.voted_skip_at.is_some() {
                 b.votes_skip = b.votes_skip.saturating_add(1);
+                if record.skip_classification.is_canonical_skip() {
+                    b.canonical_skips = b.canonical_skips.saturating_add(1);
+                }
             }
             if record.timeout_crashed_leader_at.is_some() {
                 b.crashed_leaders = b.crashed_leaders.saturating_add(1);
@@ -153,6 +161,13 @@ impl TimeBuckets {
 
     pub fn skip_count(&self) -> Vec<u64> {
         self.buckets.iter().map(|b| b.votes_skip).collect()
+    }
+
+    /// Per-bucket count of vote-skips that landed on canonical slots
+    /// (Stage 1-proven). Subset of `skip_count`. Used as the second
+    /// series on the vote-skip time-series card.
+    pub fn canonical_skip_count(&self) -> Vec<u64> {
+        self.buckets.iter().map(|b| b.canonical_skips).collect()
     }
 
     pub fn crashed_leader_count(&self) -> Vec<u64> {

@@ -35,6 +35,7 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
         "Finalized" => parse_finalized(event),
         "SetIdentity" => Some(EventKind::SetIdentity),
         "Refreshing" => parse_refreshing(event),
+        "Triggering" => parse_triggering_parent_ready(event),
         _ => None,
     }
 }
@@ -214,6 +215,20 @@ fn parse_refreshing(event: &str) -> Option<EventKind> {
     }
 }
 
+// ---- Triggering parent ready ----
+
+fn parse_triggering_parent_ready(event: &str) -> Option<EventKind> {
+    let caps = re_triggering_parent_ready().captures(event)?;
+    let slot = caps.get(1)?.as_str().parse().ok()?;
+    let parent_slot = caps.get(2)?.as_str().parse().ok()?;
+    let parent_hash = caps.get(3)?.as_str().to_owned();
+    Some(EventKind::TriggeringParentReady {
+        slot,
+        parent_slot,
+        parent_hash,
+    })
+}
+
 // ---- Shared helpers ----
 
 /// Parse `(SLOT, HASH)` into `(u64, String)`.
@@ -277,6 +292,15 @@ fn re_standstill_ended() -> &'static Regex {
     R.get_or_init(|| {
         must_compile(&format!(
             r"^({SLOT_DIGITS}) has ended at slot=({SLOT_DIGITS})\."
+        ))
+    })
+}
+
+fn re_triggering_parent_ready() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        must_compile(&format!(
+            r"^Triggering parent ready for slot ({SLOT_DIGITS}) with parent ({SLOT_DIGITS}) ({HASH_CHARS})$"
         ))
     })
 }
@@ -496,6 +520,26 @@ mod tests {
     fn refreshing_vote() {
         let s = body("Refreshing vote Notarize(NotarizationVote { slot: 1234, block_id: Foo })");
         assert!(matches!(parse_body(&s).unwrap(), EventKind::RefreshingVote));
+    }
+
+    #[test]
+    fn triggering_parent_ready() {
+        let s = body(
+            "Triggering parent ready for slot 1028070 with parent 1028069 \
+             CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW",
+        );
+        match parse_body(&s).unwrap() {
+            EventKind::TriggeringParentReady {
+                slot,
+                parent_slot,
+                parent_hash,
+            } => {
+                assert_eq!(slot, 1_028_070);
+                assert_eq!(parent_slot, 1_028_069);
+                assert_eq!(parent_hash, "CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW");
+            }
+            other => panic!("expected TriggeringParentReady, got {other:?}"),
+        }
     }
 
     #[test]

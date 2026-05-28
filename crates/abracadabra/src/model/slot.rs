@@ -15,7 +15,61 @@ pub enum SlotStatus {
     /// Finalized via two-round 60% Notarize + 60% Finalize path.
     SlowFinalized,
     /// Local node cast a skip vote for this slot.
+    ///
+    /// Whether this skip landed on a canonical slot (a participation
+    /// failure) or on a slot the cluster also skipped (correct behavior)
+    /// is a separate axis tracked by `SkipClassification`.
     Skipped,
+}
+
+/// How we know a slot was canonical even though we voted skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalSkipEvidence {
+    /// We observed a `Finalized` event for this slot in our own log.
+    /// Definitive — the cluster reached a finalization cert here.
+    DirectFinalize,
+    /// Some descendant of this slot was finalized, and walking parent
+    /// pointers from that descendant reaches this slot. The cluster used
+    /// this slot as part of the rooted chain. Equally definitive.
+    Ancestry,
+}
+
+/// Per-slot skip classification — orthogonal to `SlotStatus`.
+///
+/// Stage 1 (log only) produces `NotSkipped`, `CanonicalSkip(...)`, or
+/// `Indeterminate`. Stage 2 (RPC enrichment, not yet implemented) will
+/// additionally produce `RightSkip` for skips confirmed non-canonical
+/// via `getBlocks`, and may upgrade `Indeterminate` accordingly.
+///
+/// "Canonical skip" = we voted skip on a slot that became canonical.
+/// The slot is canonical; our skip vote landed on it incorrectly. The
+/// term is operator-facing; user docs and the TUI use the same wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipClassification {
+    /// This node did not cast a skip vote for this slot.
+    NotSkipped,
+    /// We voted skip on a slot that became canonical (real participation
+    /// failure). Evidence describes how we know the slot is canonical.
+    CanonicalSkip(CanonicalSkipEvidence),
+    /// We voted skip and no evidence from the log proves the slot's
+    /// canonical status either way. Could be a right skip (cluster
+    /// also skipped) or an unverified canonical skip — log alone
+    /// cannot say. Resolvable via Stage 2 RPC enrichment.
+    Indeterminate,
+}
+
+impl SkipClassification {
+    /// True iff this is a confirmed canonical skip via either evidence
+    /// type. This is the operator-facing "did we fail" indicator.
+    pub const fn is_canonical_skip(&self) -> bool {
+        matches!(self, Self::CanonicalSkip(_))
+    }
+}
+
+impl Default for SkipClassification {
+    fn default() -> Self {
+        Self::NotSkipped
+    }
 }
 
 /// All observed events for a single slot.
@@ -52,6 +106,11 @@ pub struct SlotRecord {
     /// True iff our validator was the leader for this slot's window
     /// (derived from ProduceWindow events).
     pub we_are_leader: bool,
+
+    /// Populated by `aggregator::classify_skips` after `ingest` finishes.
+    /// Default `NotSkipped` is the unclassified state — meaningful
+    /// values land only after the classifier pass runs.
+    pub skip_classification: SkipClassification,
 }
 
 impl SlotRecord {
@@ -76,6 +135,7 @@ impl SlotRecord {
             safe_to_skip_at: None,
             fast_finalize: None,
             we_are_leader: false,
+            skip_classification: SkipClassification::NotSkipped,
         }
     }
 
@@ -153,8 +213,12 @@ mod tests {
 
     #[test]
     fn status_skipped_wins_over_finalized() {
-        // Defensive: should never happen in practice, but if both timestamps
-        // are set we treat Skipped as authoritative.
+        // Both timestamps set is the expected observation when this node
+        // voted skip on a slot the cluster went on to finalize. Prefer
+        // Skipped in the status pill — local behavior is the more
+        // interesting signal for a per-validator analyzer, and cluster-level
+        // skip outcomes are not yet log-observable (Skip certs emit no
+        // info-level line; needs RPC or block-production data to recover).
         let mut r = SlotRecord::new(42);
         r.voted_skip_at = Some(datetime!(2026-05-23 16:00:07.123456789 UTC));
         r.finalized_at = Some(datetime!(2026-05-23 16:00:07.123456789 UTC));

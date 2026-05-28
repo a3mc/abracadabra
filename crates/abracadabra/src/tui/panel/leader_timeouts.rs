@@ -11,7 +11,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::model::analysis;
@@ -37,8 +37,11 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .constraints([
             Constraint::Length(3),  // stats KPIs
             Constraint::Length(11), // distribution histogram
-            Constraint::Length(6),  // per-bucket trend
-            Constraint::Min(8),     // list + band reference (split horizontally)
+            Constraint::Length(8),  // per-bucket trend (was 6; 2 extra
+            // rows give the bar area 4 rows
+            // instead of 2 — visible spikes
+            // even on a baseline-flat series)
+            Constraint::Min(8), // list + band reference (split horizontally)
         ])
         .split(area);
 
@@ -64,72 +67,109 @@ fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let (normal, elevated, severe) = app.latency.resume_severity_counts;
     let (p50, p95, p99, max) = app.latency.resume_pcts_us;
 
+    // Style for glossary terms — bold white, distinct from both the
+    // dim label-grey of explanation text and the bold-cyan of section
+    // titles. The visual hierarchy is title > term > explanation.
+    let term_style = theme::value_style().add_modifier(Modifier::BOLD);
+
     let lines = vec![
         section_title("Severity bands"),
-        Line::raw(""),
+        // Single line per band: colored label + threshold + count
+        // + percentage + short interpretation. Wraps cleanly via the
+        // Paragraph's Wrap config on narrow terminals.
         Line::from(vec![
             Span::styled("  NORMAL   ", theme::good_style()),
-            Span::styled("< 1.5 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("< 1.5 s    ", theme::label_style()),
             Span::styled(commas(normal), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(normal, total)),
+                format!(
+                    " ({:.1}%)  — majority of events on healthy clusters",
+                    pct(normal, total)
+                ),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    healthy clusters: majority of events",
-            theme::label_style(),
-        )]),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("  ELEVATED ", theme::warn_style()),
-            Span::styled("1.5 – 3.0 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("1.5 – 3.0 s ", theme::label_style()),
             Span::styled(commas(elevated), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(elevated, total)),
+                format!(
+                    " ({:.1}%)  — slow recovery / next-leader delay",
+                    pct(elevated, total)
+                ),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    leader recovered slowly",
-            theme::label_style(),
-        )]),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("  SEVERE   ", theme::bad_style()),
-            Span::styled(">= 3.0 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("≥ 3.0 s    ", theme::label_style()),
             Span::styled(commas(severe), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(severe, total)),
+                format!(
+                    " ({:.1}%)  — multi-window outage or stretched-timeout standstill",
+                    pct(severe, total)
+                ),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    2+ consecutive leader failures",
-            theme::label_style(),
-        )]),
         Line::raw(""),
         section_title("Observed percentiles"),
         kv_time_highlight("  median", p50),
         kv_time("  p95   ", p95),
         kv_time("  p99   ", p99),
         kv_time("  max   ", max),
+        Line::raw(""),
+        // Glossary anchors at the bottom — read the incidents table
+        // on the left, then look down-right for column meanings.
+        // One-line-per-term keeps the section ~7 rows tall so it
+        // survives narrow / zoomed terminals without overflowing.
+        // The Paragraph's Wrap config reflows any line that exceeds
+        // the panel's actual width.
+        section_title("What this measures"),
+        Line::from(vec![
+            Span::styled("  leader timeout", term_style),
+            Span::styled(
+                "  TCL event — timer fires ~1.4 s into window if no shreds arrive.",
+                theme::label_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  resume time   ", term_style),
+            Span::styled(
+                "  wall-clock TCL → next Voting notarize (list sorted by this).",
+                theme::label_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  slot gap      ", term_style),
+            Span::styled(
+                "  slots elapsed from TCL until we cast next Voting notarize.",
+                theme::label_style(),
+            ),
+        ]),
     ];
 
+    // Render the outer block + title across the full panel area, then
+    // render the Paragraph into a padded inner rect: 1 row top
+    // padding, 3 cols left padding, 2 cols right padding. Stops the
+    // "Severity bands" title from butting against the top border and
+    // gives every line some breathing room on both sides so it
+    // matches the other widgets' visual rhythm.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" band reference ")
         .title_style(theme::title_style());
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let padded = Rect {
+        x: inner.x.saturating_add(3),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(5),
+        height: inner.height.saturating_sub(1),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
 }
 
 fn section_title(s: &str) -> Line<'_> {
@@ -274,6 +314,14 @@ fn render_distribution(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    // MAX_W caps bar thickness. Without it, very wide terminals
+    // (8K monitors, etc.) drive the packing search toward W=9+ to
+    // absorb empty trailing space — which renders chunky-looking bars
+    // and aggressively downsamples buckets. With MAX_W = 6, the bars
+    // stay visually consistent across panel widths; whatever trailing
+    // space remains at extreme widths is the honest cost of integer
+    // bar widths against a continuous panel size.
+    const MAX_W: usize = 6;
     let title = app.buckets.map_or_else(
         || " leader-timeout events over time (no data) ".to_owned(),
         |b| {
@@ -355,13 +403,42 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(stats), rows[0]);
 
     // BarChart with visual gap between bars. Each Bar gets text_value("")
-    // so no numeric label rides on top of the bar (those labels overlap the
-    // stats line at large values, which is the "covering the legend" issue).
-    // Downsample bucket count to panel_width / 3 so each bar has room for a
-    // 2-col width + 1-col gap.
+    // so no numeric label rides on top of the bar.
+    //
+    // Picking bar geometry is a 1-D packing problem. Each bar consumes
+    // `(bar_width + 1)` cols including the trailing gap (one trailing
+    // gap is unused at the right edge). Total used = `bars * (W+1) - 1`.
+    // We want the (W, bar_count) pair that fills the panel closest to
+    // its full width without overflowing, while preferring more
+    // buckets visible.
+    //
+    // Search W = 1..=MAX_W. For each W, the max bars that fit is
+    // `(panel_w + 1) / (W + 1)`. The actual bar count is the smaller
+    // of that and the data length. Score by used columns. MAX_W's
+    // rationale is documented at the top of the function.
     let panel_w = rows[1].width as usize;
-    let max_bars = (panel_w / 3).max(8);
-    let display = fit_to_width(&deviation, max_bars.min(deviation.len()));
+    let n = deviation.len();
+    let mut best_w = 1usize;
+    let mut best_count = 1usize;
+    let mut best_used = 0usize;
+    for w in 1..=MAX_W {
+        let denom = w + 1;
+        let max_count = (panel_w + 1) / denom;
+        if max_count == 0 {
+            break;
+        }
+        let count = n.min(max_count);
+        if count == 0 {
+            continue;
+        }
+        let used = count * denom - 1;
+        if used > best_used {
+            best_used = used;
+            best_w = w;
+            best_count = count;
+        }
+    }
+    let display = fit_to_width(&deviation, best_count);
     let bars: Vec<Bar<'_>> = display
         .iter()
         .map(|v| Bar::default().value(*v).text_value(String::new()))
@@ -369,7 +446,7 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let group = BarGroup::default().bars(&bars);
     let chart = BarChart::default()
         .data(group)
-        .bar_width(2)
+        .bar_width(u16::try_from(best_w).unwrap_or(2))
         .bar_gap(1)
         .max(dev_peak.max(1))
         .bar_style(Style::default().fg(theme::SPARK_PROBLEM));

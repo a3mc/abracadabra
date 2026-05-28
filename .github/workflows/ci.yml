@@ -1,9 +1,35 @@
 name: ci
 
+# Triggers (intentionally minimal — see CI policy notes):
+#
+#   workflow_dispatch  manual run from the Actions tab. Use this to
+#                     sanity-check main before tagging a release.
+#
+#   pull_request      verify every PR before merge. Path-filtered so a
+#                     docs-only PR (README, CHANGELOG, gitignore tweak)
+#                     does NOT spend a 5-min runner re-building Rust.
+#
+#   push tags v*      run the same checks against a release tag (incl.
+#                     pre-release tags like v0.2.0-rc1). This pairs
+#                     with release.yml which builds + publishes
+#                     artefacts on the same tag.
+#
+# No push trigger on `main`. Daily commits to main do not fire CI;
+# the developer either runs the same checks locally (`cargo xtask
+# lint-prod && cargo test --workspace`) or hits "Run workflow" in
+# the Actions tab before tagging.
+
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE-*'
+      - '.gitignore'
+      - 'docs/**'
+  push:
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always

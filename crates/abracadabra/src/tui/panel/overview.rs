@@ -7,9 +7,9 @@
 //! severity breakdown, alerts.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::model::alerts::Severity;
@@ -25,7 +25,7 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .constraints([
             Constraint::Length(6), // file & time metadata (4 lines + borders)
             Constraint::Length(5), // headline health (2-column, 3 rows + borders)
-            Constraint::Length(6), // vote / cert totals
+            Constraint::Length(8), // vote / cert totals (3 columns: heading + 3-4 metric rows + borders + top pad)
             Constraint::Length(7), // latency stages (Table: header + 3 rows + borders)
             Constraint::Length(5), // leader-timeout / vote-resume stats
             Constraint::Min(3),    // alerts summary
@@ -108,7 +108,7 @@ fn render_file_meta(state: &State, bucket_secs: i64, frame: &mut Frame<'_>, area
         ]));
     }
 
-    paragraph_in_block(frame, area, " overview ", lines);
+    paragraph_in_block(frame, area, " data source ", lines);
 }
 
 fn fmt_bucket(secs: i64) -> String {
@@ -146,11 +146,22 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         0.0
     };
     let total_slots = state.slots.len() as u64;
-    let skip_pct = if total_slots > 0 {
-        ov.votes_skip as f64 * 100.0 / total_slots as f64
+
+    // Canonical-skip percentage is the headline participation-failure
+    // metric. Numerator: skips we proved landed on canonical slots
+    // (direct Finalized observation OR ancestry-proven via parent
+    // chain). Denominator: total skip votes we cast. If indeterminate
+    // skips exist, the displayed value is a LOWER BOUND — marked with
+    // a leading `≥`.
+    let canon_skips = ov
+        .canonical_skips_direct
+        .saturating_add(ov.canonical_skips_ancestry);
+    let canon_skip_pct = if ov.votes_skip > 0 {
+        canon_skips as f64 * 100.0 / ov.votes_skip as f64
     } else {
         0.0
     };
+    let has_indeterminate = ov.indeterminate_skips > 0;
 
     // 4-slot leader window assumed (Solana standard).
     let leader_windows_total = total_slots / 4;
@@ -159,6 +170,21 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    // Standstill-aware crashed-leader %.
+    //
+    // During standstill the per-slot timeout is stretched (up to ~1h cap),
+    // so a `TimeoutCrashedLeader` event firing inside a standstill range
+    // is not evidence of leader misbehavior — the timeout would have fired
+    // for any leader under that condition. We surface the standstill-
+    // excluded number as the primary signal and the raw (incl. standstill)
+    // value on a continuation line, but only when at least one standstill
+    // range exists in the log.
+    let crashed_outside_pct = if leader_windows_total > 0 {
+        ov.timeout_crashed_leaders_outside_standstill as f64 * 100.0 / leader_windows_total as f64
+    } else {
+        0.0
+    };
+    let has_standstill = !ov.standstill_ranges.is_empty();
 
     let (fast_style, fast_mark, fast_verdict) = if fast_pct >= theme::FAST_FIN_GOOD_PCT {
         (theme::good_style(), "[✓]", "healthy (>=80%)")
@@ -175,11 +201,18 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             "CRITICAL (<60%) — slow path dominant",
         )
     };
-    let skip_style = theme::band_lower_better(
-        skip_pct,
-        theme::VOTE_SKIP_WARN_PCT,
-        theme::VOTE_SKIP_BAD_PCT,
+    let canon_skip_style = theme::band_lower_better(
+        canon_skip_pct,
+        theme::CANONICAL_SKIP_WARN_PCT,
+        theme::CANONICAL_SKIP_BAD_PCT,
     );
+    let canon_skip_verdict = if canon_skip_pct < theme::CANONICAL_SKIP_WARN_PCT {
+        "healthy"
+    } else if canon_skip_pct < theme::CANONICAL_SKIP_BAD_PCT {
+        "DEGRADED"
+    } else {
+        "CRITICAL"
+    };
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -193,43 +226,90 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
 
-    let left_lines = vec![
+    // Finalize row — verdict only. The raw fast/slow split with
+    // percentages lives in the `vote & cert totals` widget below
+    // (`finalized` column); showing it again here would duplicate
+    // data. Keep the band-coloured `[✓]`/`[✗]` mark + verdict text
+    // so this row still functions as an operator-glance health
+    // indicator alongside the canonical-skip and crashed-leaders
+    // rows.
+    let mut left_lines = vec![
         Line::from(vec![
             Span::styled(format!("  {:<16}", "fast-finalize"), theme::label_style()),
-            Span::styled(
-                format!("{fast_pct:>6.2}%"),
-                theme::value_style().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
             Span::styled(fast_mark, fast_style),
             Span::raw(" "),
             Span::styled(fast_verdict, fast_style),
         ]),
         Line::from(vec![
-            Span::styled(format!("  {:<16}", "vote skip rate"), theme::label_style()),
-            Span::styled(format!("{skip_pct:>6.2}%"), skip_style),
+            Span::styled(format!("  {:<16}", "canonical-skip"), theme::label_style()),
             Span::styled(
                 format!(
-                    "  ({} of {} slots)",
+                    "{}{canon_skip_pct:>5.2}%",
+                    if has_indeterminate { "≥" } else { " " }
+                ),
+                canon_skip_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(canon_skip_verdict, canon_skip_style),
+            Span::styled(
+                format!(
+                    "  ({} canonical of {} vote-skips{})",
+                    commas(canon_skips),
                     commas(ov.votes_skip),
-                    commas(total_slots)
+                    if has_indeterminate {
+                        format!(" · {} indeterm", commas(ov.indeterminate_skips))
+                    } else {
+                        String::new()
+                    },
                 ),
                 theme::label_style(),
             ),
         ]),
         Line::from(vec![
             Span::styled(format!("  {:<16}", "crashed leaders"), theme::label_style()),
-            Span::styled(format!("{crashed_pct:>6.2}%"), theme::value_style()),
             Span::styled(
                 format!(
-                    "  ({} of {} windows)",
-                    commas(ov.timeout_crashed_leaders),
+                    "{:>6.2}%",
+                    if has_standstill {
+                        crashed_outside_pct
+                    } else {
+                        crashed_pct
+                    }
+                ),
+                theme::value_style(),
+            ),
+            Span::styled(
+                format!(
+                    "  ({} of {} windows{})",
+                    commas(if has_standstill {
+                        ov.timeout_crashed_leaders_outside_standstill
+                    } else {
+                        ov.timeout_crashed_leaders
+                    }),
                     commas(leader_windows_total),
+                    if has_standstill {
+                        ", excl. standstill"
+                    } else {
+                        ""
+                    },
                 ),
                 theme::label_style(),
             ),
         ]),
     ];
+    if has_standstill {
+        left_lines.push(Line::from(vec![
+            Span::styled(format!("  {:<16}", ""), theme::label_style()),
+            Span::styled(format!("{crashed_pct:>6.2}%"), theme::label_style()),
+            Span::styled(
+                format!(
+                    "  ({} incl. standstill)",
+                    commas(ov.timeout_crashed_leaders),
+                ),
+                theme::label_style(),
+            ),
+        ]));
+    }
 
     let right_lines = vec![
         Line::from(vec![
@@ -250,14 +330,14 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             "standstills",
             commas(ov.standstill_events),
             ov.standstill_events == 0,
-            "no liveness issues",
+            "no liveness issues (full log)",
             "STANDSTILL OBSERVED",
         ),
         verdict_line(
             "refresh votes",
             commas(ov.refreshing_votes),
             ov.refreshing_votes == 0,
-            "no standstill recoveries",
+            "no standstill recoveries (full log)",
             "resume activity",
         ),
     ];
@@ -276,6 +356,12 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    let slow_pct = 100.0 - fast_pct;
+    // True fallback = NotarFallback cert that fired without a matching
+    // Notarize cert. Cluster reached the fallback path because it
+    // couldn't form a 60% Notarize cert directly (fragmentation).
+    // Most NotarFallback events are automatic companions to Notarize
+    // (every 60% Notarize cert auto-emits NotarFallback too).
     let true_fb = ov
         .block_notar_fallback_count
         .saturating_sub(ov.block_notarized_count);
@@ -284,58 +370,104 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    let (fb_verdict, fb_style) = if fb_pct < theme::TRUE_FB_ELEVATED_PCT {
+        ("rare/healthy", theme::good_style())
+    } else {
+        ("ELEVATED", theme::warn_style())
+    };
 
-    let lines = vec![
+    // Outer block with title + horizontal split into three columns
+    // (votes / certs / finalized). Each column owns its Paragraph so
+    // labels and values stay aligned within the column independent
+    // of the others.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" vote & cert totals  (full log) ".to_owned())
+        .title_style(theme::title_style())
+        .padding(Padding::new(2, 1, 1, 0));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(inner);
+
+    // Helpers for consistent label/value alignment within each column.
+    // Column heading uses `title_style` (cyan + bold) so it matches
+    // the panel title bar and other section headings throughout the
+    // TUI — these are visually "second-level titles" for the
+    // sub-sections inside a single panel.
+    let heading = |text: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            text.to_owned(),
+            theme::title_style().add_modifier(Modifier::BOLD),
+        ))
+    };
+    // Labels start at column 0 inside the column so they align under
+    // the bold heading (also at column 0). Outer-block Padding
+    // already gives a 2-col gap from the panel border for every line.
+    let row = |label: &str, value: u64| -> Line<'static> {
         Line::from(vec![
-            Span::styled("Local votes    ", theme::label_style()),
-            Span::styled("Notarize ", theme::label_style()),
-            Span::styled(commas(ov.votes_notarize), theme::value_style()),
-            Span::styled("   Finalize ", theme::label_style()),
-            Span::styled(commas(ov.votes_finalize), theme::value_style()),
-            Span::styled("   Skip ", theme::label_style()),
-            Span::styled(commas(ov.votes_skip), theme::value_style()),
-        ]),
+            Span::styled(format!("{label:<16}"), theme::label_style()),
+            Span::styled(format!("{:>9}", commas(value)), theme::value_style()),
+        ])
+    };
+    let row_with_suffix =
+        |label: &str, value: u64, suffix: String, style: Style| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(format!("{label:<16}"), theme::label_style()),
+                Span::styled(format!("{:>9}", commas(value)), theme::value_style()),
+                Span::raw("  "),
+                Span::styled(suffix, style),
+            ])
+        };
+
+    // ---- Column 1: votes ----
+    let votes_lines = vec![
+        heading("votes"),
+        row("Notarize", ov.votes_notarize),
+        row("Finalize", ov.votes_finalize),
+        row("Skip", ov.votes_skip),
+    ];
+    frame.render_widget(Paragraph::new(votes_lines), cols[0]);
+
+    // ---- Column 2: certs ----
+    let certs_lines = vec![
+        heading("certs"),
+        row("Notarized", ov.block_notarized_count),
+        row("NotarFallback", ov.block_notar_fallback_count),
         Line::from(vec![
-            Span::styled("Cluster certs  ", theme::label_style()),
-            Span::styled("Block Notarized ", theme::label_style()),
-            Span::styled(commas(ov.block_notarized_count), theme::value_style()),
-            Span::styled("   Block notar-fb ", theme::label_style()),
-            Span::styled(commas(ov.block_notar_fallback_count), theme::value_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("Finalized      ", theme::label_style()),
-            Span::styled(commas(total_final), theme::value_style()),
-            Span::styled(
-                format!(
-                    "   fast {} / slow {} = {:.2}% fast",
-                    commas(ov.finalized_fast),
-                    commas(ov.finalized_slow),
-                    fast_pct,
-                ),
-                theme::label_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("True fallbacks ", theme::label_style()),
+            Span::styled("true FB ", theme::label_style()),
             Span::styled(commas(true_fb), theme::value_style()),
-            Span::styled(
-                format!(
-                    "   {fb_pct:.3}% — {}",
-                    if fb_pct < 0.5 {
-                        "rare/healthy"
-                    } else {
-                        "ELEVATED"
-                    },
-                ),
-                if fb_pct < 0.5 {
-                    theme::good_style()
-                } else {
-                    theme::warn_style()
-                },
-            ),
+            Span::styled(format!("  {fb_pct:.2}%"), theme::label_style()),
+            Span::raw("  "),
+            Span::styled(fb_verdict, fb_style),
         ]),
     ];
-    paragraph_in_block(frame, area, " vote & cert totals  (full log) ", lines);
+    frame.render_widget(Paragraph::new(certs_lines), cols[1]);
+
+    // ---- Column 3: finalized ----
+    let finalized_lines = vec![
+        heading("finalized"),
+        row("total", total_final),
+        row_with_suffix(
+            "fast",
+            ov.finalized_fast,
+            format!("{fast_pct:.2}%"),
+            theme::good_style(),
+        ),
+        row_with_suffix(
+            "slow",
+            ov.finalized_slow,
+            format!("{slow_pct:.2}%"),
+            Style::default().fg(theme::SPARK_ALT_PATH),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(finalized_lines), cols[2]);
 }
 
 // ---------- Latency stage breakdown ----------
@@ -505,36 +637,46 @@ fn render_resume_stats(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 // ---------- Alerts summary ----------
 
 fn render_alerts_summary(state: &State, frame: &mut Frame<'_>, area: Rect) {
-    if state.alerts.is_empty() {
-        let line = Line::from(vec![Span::styled("(no alerts)", theme::good_style())]);
-        paragraph_in_block(frame, area, " alerts ", vec![line]);
-        return;
-    }
-    let lines: Vec<Line<'_>> = state
-        .alerts
-        .iter()
-        .map(|a| {
-            let (tag, style) = match a.severity {
-                Severity::Info => ("[INFO]", theme::label_style()),
-                Severity::Warn => ("[WARN]", theme::warn_style()),
-                Severity::Critical => ("[CRIT]", theme::bad_style()),
-            };
-            Line::from(vec![
-                Span::styled(tag, style),
-                Span::raw(" "),
-                // Alert descriptions can include log-derived bodies
-                // (LogPattern groups embed the sample) — strip control
-                // bytes before they reach the terminal.
-                Span::raw(sanitize_for_tui(&a.description).into_owned()),
-            ])
-        })
-        .collect();
-    paragraph_in_block(
-        frame,
-        area,
-        &format!(" alerts ({}) ", state.alerts.len()),
-        lines,
-    );
+    // This widget uses its own block (not `paragraph_in_block`) so
+    // the `Padding::new(2, 1, 1, 0)` treatment is scoped here only —
+    // other overview widgets keep their current zero-padding layout.
+    let title = if state.alerts.is_empty() {
+        " alerts ".to_owned()
+    } else {
+        format!(" alerts ({}) ", state.alerts.len())
+    };
+    let lines: Vec<Line<'_>> = if state.alerts.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            "(no alerts)",
+            theme::good_style(),
+        )])]
+    } else {
+        state
+            .alerts
+            .iter()
+            .map(|a| {
+                let (tag, style) = match a.severity {
+                    Severity::Info => ("[INFO]", theme::label_style()),
+                    Severity::Warn => ("[WARN]", theme::warn_style()),
+                    Severity::Critical => ("[CRIT]", theme::bad_style()),
+                };
+                Line::from(vec![
+                    Span::styled(tag, style),
+                    Span::raw(" "),
+                    // Alert descriptions can include log-derived bodies
+                    // (LogPattern groups embed the sample) — strip
+                    // control bytes before they reach the terminal.
+                    Span::raw(sanitize_for_tui(&a.description).into_owned()),
+                ])
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(theme::title_style())
+        .padding(Padding::new(2, 1, 1, 0));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // ---------- shared helpers ----------

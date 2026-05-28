@@ -5,19 +5,31 @@
 //! recomputing latencies on every keystroke).
 
 use crate::model::analysis::{self, LatencyStages, VoteResumeRecord};
-use crate::model::slot::{SlotRecord, SlotStatus};
+use crate::model::slot::{SkipClassification, SlotRecord, SlotStatus};
 use crate::model::state::State;
 
 #[derive(Debug, Clone)]
 pub struct SlotViewRow {
     pub slot: u64,
     pub status: SlotStatus,
+    pub skip_classification: SkipClassification,
     pub fast: Option<bool>,
     pub we_are_leader: bool,
     /// `first_shred_at` → `block_emitted_at` (shred reception + replay).
     pub assembly_ms: Option<f64>,
     /// `block_emitted_at` → `finalized_at` (pure consensus rounds).
+    /// `None` when either timestamp is missing OR when finalized_at
+    /// precedes block_emitted_at (cluster outran our local replay) —
+    /// the latter case is also flagged in `consensus_inverted` so the
+    /// renderer can distinguish "data missing" from "early cert".
     pub consensus_ms: Option<f64>,
+    /// True when both `block_emitted_at` and `finalized_at` are Some
+    /// AND `finalized_at < block_emitted_at` — i.e. the finalization
+    /// cert arrived via gossip before our local replay completed.
+    /// Honest, observable, rare-ish ordering. The TUI renders this
+    /// with a distinct glyph (`↶`) instead of the plain `-` used for
+    /// missing-data rows.
+    pub consensus_inverted: bool,
     /// `first_shred_at` → `finalized_at` (full lifecycle = assembly + consensus).
     pub lifecycle_ms: Option<f64>,
     pub voted_notarize: bool,
@@ -33,14 +45,24 @@ impl SlotViewRow {
         let to_ms = |us: i64| us as f64 / 1000.0;
         let assembly_ms = SlotRecord::delta_us(r.first_shred_at, r.block_emitted_at).map(to_ms);
         let consensus_ms = SlotRecord::delta_us(r.block_emitted_at, r.finalized_at).map(to_ms);
+        // Detect the early-cert ordering separately from
+        // missing-data: both anchors are present AND the cert beats
+        // local replay. `delta_us` returns `None` in this case, so we
+        // re-check the underlying timestamps to surface the cause.
+        let consensus_inverted = matches!(
+            (r.block_emitted_at, r.finalized_at),
+            (Some(b), Some(f)) if f < b
+        );
         let lifecycle_ms = SlotRecord::delta_us(r.first_shred_at, r.finalized_at).map(to_ms);
         Self {
             slot: r.slot,
             status: r.status(),
+            skip_classification: r.skip_classification,
             fast: r.fast_finalize,
             we_are_leader: r.we_are_leader,
             assembly_ms,
             consensus_ms,
+            consensus_inverted,
             lifecycle_ms,
             voted_notarize: r.voted_notarize_at.is_some(),
             voted_finalize: r.voted_finalize_at.is_some(),
@@ -51,13 +73,17 @@ impl SlotViewRow {
         }
     }
 
-    /// Vote-pattern string for the Slots table. Surfaces every present
-    /// vote — Notarize, Finalize, Skip — concatenated with `+`. The
-    /// `(N, _, S)` and `(N, F, S)` combinations are protocol-ambiguous
-    /// (validator cast both a Notarize and a Skip on the same slot);
-    /// the renderer keeps both flags visible rather than dropping Skip
-    /// so the operator can spot the case. See the `mixed_votes` filter
-    /// on `SlotFilters` for the matching tab-3 filter binding.
+    /// Vote-pattern string for the Slots table.
+    ///
+    /// In normal Alpenglow operation a slot has exactly one of:
+    /// `N`, `N+F`, `S`, or `-` (no vote). The `N+S` / `N+F+S` arms are
+    /// kept as defensive last-resort matchers — they're protocol-
+    /// impossible in current Alpenglow (`try_notar` / `try_skip_window`
+    /// both gate on `vote_history.voted(slot)`; an attempted second
+    /// vote would panic at `vote_history.add_vote`). If one of those
+    /// strings ever surfaces in the TUI, it's a real protocol
+    /// invariant break and the validator likely already panicked
+    /// before our log captured it.
     pub const fn vote_pattern(&self) -> &'static str {
         match (self.voted_notarize, self.voted_finalize, self.voted_skip) {
             (true, true, true) => "N+F+S",
@@ -69,18 +95,47 @@ impl SlotViewRow {
         }
     }
 
+    /// Status pill string for the slot table.
+    ///
+    /// For skipped slots, the `SkipClassification` discriminator
+    /// determines the operator-visible label:
+    ///
+    ///   - `CSKIP` — we voted skip on a slot that became Canonical
+    ///     (real participation failure).
+    ///   - `VSKIP` — Vote/Validator skip: we voted skip; cluster
+    ///     outcome indeterminate from log alone (could be a right
+    ///     skip OR an unverified canonical skip).
+    ///
+    /// The `V`/`C` prefix convention disambiguates the column at
+    /// a glance: both labels describe *our* vote, with the prefix
+    /// indicating whether canonical evidence exists. Until Stage 2
+    /// RPC enrichment lands, plain `VSKIP` is the indeterminate
+    /// bucket — NOT a claim of correctness.
     pub const fn status_str(&self) -> &'static str {
         match self.status {
             SlotStatus::FastFinalized | SlotStatus::SlowFinalized => "FIN",
-            SlotStatus::Skipped => "SKIP",
+            SlotStatus::Skipped => match self.skip_classification {
+                SkipClassification::CanonicalSkip(_) => "CSKIP",
+                _ => "VSKIP",
+            },
             SlotStatus::Pending => "PEND",
         }
     }
 
+    /// Path column — the CLUSTER's finalization path, not ours.
+    ///
+    ///   F  cluster fast-finalized (80% Notarize cert)
+    ///   S  cluster slow-finalized (60% Notarize + 60% Finalize)
+    ///   ` ` no Finalized event observed for this slot
+    ///
+    /// For CSKIP rows this column still reflects the cluster outcome —
+    /// "we voted skip on a slot the cluster easily fast-finalized" is
+    /// a different diagnostic from "we voted skip on a slot the
+    /// cluster also struggled with."
     pub const fn fast_str(&self) -> &'static str {
         match (self.status, self.fast) {
             (SlotStatus::FastFinalized, _) | (_, Some(true)) => "F",
-            (SlotStatus::SlowFinalized, _) | (_, Some(false)) => "s",
+            (SlotStatus::SlowFinalized, _) | (_, Some(false)) => "S",
             _ => " ",
         }
     }
@@ -225,10 +280,12 @@ mod tests {
         let mk = |n, f, s| SlotViewRow {
             slot: 0,
             status: SlotStatus::Pending,
+            skip_classification: SkipClassification::NotSkipped,
             fast: None,
             we_are_leader: false,
             assembly_ms: None,
             consensus_ms: None,
+            consensus_inverted: false,
             lifecycle_ms: None,
             voted_notarize: n,
             voted_finalize: f,
@@ -261,5 +318,34 @@ mod tests {
         assert_eq!(snap.resume_severity_counts, (0, 0, 0));
         assert_eq!(snap.lifecycle_pcts_us, (0, 0, 0, 0));
         assert_eq!(snap.resume_pcts_us, (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn consensus_inverted_true_when_finalize_precedes_emit() {
+        // Cluster finalize cert arrived (via gossip) before our local
+        // replay finished `block_emitted_at`. `delta_us` returns None,
+        // so the renderer must distinguish this from missing-data via
+        // `consensus_inverted == true`.
+        let mut r = SlotRecord::new(42);
+        r.block_emitted_at = Some(datetime!(2026-05-23 16:00:00.500 UTC));
+        r.finalized_at = Some(datetime!(2026-05-23 16:00:00.200 UTC));
+        let row = SlotViewRow::from_record(&r);
+        assert!(row.consensus_inverted, "f < b must flag inversion");
+        assert!(
+            row.consensus_ms.is_none(),
+            "inverted ordering yields None, not a negative ms"
+        );
+    }
+
+    #[test]
+    fn consensus_inverted_false_on_normal_ordering() {
+        // Sanity counter-case: with normal ordering (`b <= f`),
+        // `consensus_inverted` stays false and `consensus_ms` is Some.
+        let mut r = SlotRecord::new(43);
+        r.block_emitted_at = Some(datetime!(2026-05-23 16:00:00.200 UTC));
+        r.finalized_at = Some(datetime!(2026-05-23 16:00:00.500 UTC));
+        let row = SlotViewRow::from_record(&r);
+        assert!(!row.consensus_inverted);
+        assert!(row.consensus_ms.is_some());
     }
 }

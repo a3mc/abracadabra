@@ -14,6 +14,7 @@ use crate::model::alerts::Severity;
 use crate::model::analysis;
 use crate::model::state::State;
 use crate::parser::{self, Parsed};
+use crate::tui::theme;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -169,10 +170,37 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         },
     );
     let total_slots = state.slots.len() as u64;
+    // Canonical-skip percentage is the operator-facing failure
+    // indicator. Numerator is vote-skips we proved landed on canonical
+    // slots (Stage 1 classifier); denominator is total vote-skips we
+    // cast. When indeterminate skips exist the displayed number is a
+    // lower bound — marked with `>=`.
+    let canon_skips = ov
+        .canonical_skips_direct
+        .saturating_add(ov.canonical_skips_ancestry);
+    let canon_skip_pct = pct(canon_skips, ov.votes_skip);
+    let bound_marker = if ov.indeterminate_skips > 0 {
+        ">="
+    } else {
+        "  "
+    };
+    println!(
+        "  {:<18} {}{:>5.2}%   {} canonical of {} vote-skips{}",
+        "canonical-skip",
+        bound_marker,
+        canon_skip_pct,
+        commas(canon_skips),
+        commas(ov.votes_skip),
+        if ov.indeterminate_skips > 0 {
+            format!(" ({} indeterminate)", commas(ov.indeterminate_skips))
+        } else {
+            String::new()
+        },
+    );
     let skip_pct = pct(ov.votes_skip, total_slots);
     println!(
-        "  {:<18} {:>6}   {} of {} slots",
-        "vote skip rate",
+        "  {:<18} {:>6}   {} of {} slots (raw — see canonical-skip above)",
+        "vote-skip",
         format!("{skip_pct:.2}%"),
         commas(ov.votes_skip),
         commas(total_slots),
@@ -209,13 +237,13 @@ pub fn print_summary(state: &State, stats: &RunStats) {
     // -- Leadership
     if ov.produce_windows > 0 {
         let leader_slots = state.slots.values().filter(|s| s.we_are_leader).count() as u64;
-        let stake_share = pct(leader_slots, total_slots);
+        let leader_slot_share = pct(leader_slots, total_slots);
         println!("\n-- Leadership --");
         println!(
-            "  our leader windows {:>6}   {} slots | ~{:.2}% stake share",
+            "  our leader windows {:>6}   {} slots | {:.2}% leader-slot share",
             commas(ov.produce_windows),
             commas(leader_slots),
-            stake_share,
+            leader_slot_share,
         );
     }
 
@@ -258,12 +286,12 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         commas(ov.block_notarized_count),
     );
     println!(
-        "  {:<22} {:>10}   +{} TRUE fallbacks ({:.3}% — {})",
+        "  {:<22} {:>10}   +{} TRUE fallbacks ({:.2}% — {})",
         "Block notar-fallback",
         commas(ov.block_notar_fallback_count),
         commas(true_fb),
         true_fb_pct,
-        if true_fb_pct < 0.5 {
+        if true_fb_pct < theme::TRUE_FB_ELEVATED_PCT {
             "rare/healthy"
         } else {
             "elevated"

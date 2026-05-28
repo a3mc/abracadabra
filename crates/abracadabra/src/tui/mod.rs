@@ -26,7 +26,11 @@
 
 mod app;
 mod panel;
-mod theme;
+// `theme` exposes operator-facing threshold constants
+// (`CANONICAL_SKIP_*_PCT`, `TRUE_FB_ELEVATED_PCT`, latency bands) that
+// `runner::print_summary` also consumes to keep the text and TUI
+// verdicts in lockstep.
+pub(crate) mod theme;
 mod view;
 mod widget;
 

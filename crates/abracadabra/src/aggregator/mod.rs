@@ -4,9 +4,12 @@
 //! and the aggregator focused on bookkeeping. The TUI can read State without
 //! understanding the event grammar.
 
+use std::collections::HashSet;
+
 use time::OffsetDateTime;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
+use crate::model::slot::{CanonicalSkipEvidence, SkipClassification};
 use crate::model::state::{LogIssueGroup, State, MAX_GROUP_TIMESTAMPS};
 use crate::parser::line::Level;
 use crate::parser::{Event, EventKind};
@@ -147,16 +150,38 @@ pub fn ingest(state: &mut State, event: Event) {
                 format!("Standstill firing at finalized slot {slot}"),
             ));
         }
-        EventKind::StandstillExtending { .. } => {
+        EventKind::StandstillExtending { slot } => {
             state.overall.standstill_extending_events =
                 state.overall.standstill_extending_events.saturating_add(1);
+            // First Extending in a stuck period anchors the entry slot.
+            // Repeated extends inside the same period do not re-anchor.
+            if state.overall.open_standstill_entry.is_none() {
+                state.overall.open_standstill_entry = Some(slot);
+            }
         }
-        EventKind::StandstillEnded { .. } => {
+        EventKind::StandstillEnded {
+            entry_slot,
+            exit_slot,
+        } => {
             state.overall.standstill_ended_events =
                 state.overall.standstill_ended_events.saturating_add(1);
+            state
+                .overall
+                .standstill_ranges
+                .push((entry_slot, exit_slot));
+            state.overall.open_standstill_entry = None;
         }
         EventKind::RefreshingVote => {
             state.overall.refreshing_votes = state.overall.refreshing_votes.saturating_add(1);
+        }
+        EventKind::TriggeringParentReady { .. } => {
+            // Empirically (~3,800/hr in steady-state) this fires ~twice per
+            // leader window as the finalization chain catches up positions
+            // %4=1 and %4=2. Not a recovery signal in normal operation —
+            // we count it but do not surface per-slot.
+            // See docs/alpenglow/07-safety-machinery.md.
+            state.overall.parent_ready_recoveries =
+                state.overall.parent_ready_recoveries.saturating_add(1);
         }
         EventKind::SetIdentity => {
             // Operator rotated validator identity — INFO timeline anchor.
@@ -314,6 +339,133 @@ fn record_log_pattern<F: FnOnce() -> String>(
 
 const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_slots";
 
+/// Stage 1 canonical-skip classifier (pure log; no RPC).
+///
+/// For each slot where we cast a Skip vote, prove the slot was
+/// canonical from log alone via:
+///
+///   (a) **direct evidence** — we observed a `Finalized` event for this
+///       slot ourselves. The cluster reached a finalization cert here.
+///   (b) **ancestry evidence** — some descendant of this slot is
+///       `Finalized` AND the parent chain from that descendant reaches
+///       this slot. The cluster placed this slot on the rooted chain.
+///
+/// Otherwise the slot is `Indeterminate` — could be a right-skip
+/// (cluster also skipped) or an unverified canonical skip. Stage 2
+/// (RPC enrichment, future work) would tighten this further by
+/// querying `getBlocks` for ground truth.
+///
+/// Empirical validation: on 5 logs spanning ~5 days, this classifier
+/// matched RPC ground truth 100% on the verifiable subset. See
+/// `audit/2026-05-27-tui-vs-alpenglow/TRIAGE.md` section D1.
+///
+/// Must be called once after `ingest` has processed the full stream.
+/// `analyze` invokes this; external callers should not call it again.
+pub fn classify_skips(state: &mut State) {
+    // Step 1: collect the set of slots we directly observed `Finalized` for.
+    let finalized: HashSet<u64> = state
+        .slots
+        .iter()
+        .filter_map(|(s, r)| r.finalized_at.is_some().then_some(*s))
+        .collect();
+
+    // Step 2: walk parent pointers backward from each finalized slot to
+    // collect the full ancestor set. Loop guard via the visited check
+    // (`insert` returns false if already in) prevents pathological
+    // cycles from a corrupted parent map.
+    let mut ancestors: HashSet<u64> = HashSet::new();
+    for &fin in &finalized {
+        let mut cur = fin;
+        while let Some((parent_slot, _)) = state.slots.get(&cur).and_then(|r| r.parent.as_ref()) {
+            let p = *parent_slot;
+            if !ancestors.insert(p) {
+                break;
+            }
+            cur = p;
+        }
+    }
+
+    // Step 3: classify each slot record AND collect unique-slot counts
+    // for the headline KPIs (since per-event counters in `OverallStats`
+    // double-count canonical-skip slots which appear in both the
+    // `votes_skip` and `finalized_*` buckets).
+    let mut canon_direct: u64 = 0;
+    let mut canon_ancestry: u64 = 0;
+    let mut indeterminate: u64 = 0;
+    let mut finalized_slot_count: u64 = 0;
+    let mut skipped_slot_count: u64 = 0;
+    let mut pending_slot_count: u64 = 0;
+    for (slot, rec) in &mut state.slots {
+        if rec.voted_skip_at.is_none() {
+            rec.skip_classification = SkipClassification::NotSkipped;
+        } else {
+            skipped_slot_count = skipped_slot_count.saturating_add(1);
+            rec.skip_classification = if rec.finalized_at.is_some() {
+                canon_direct = canon_direct.saturating_add(1);
+                SkipClassification::CanonicalSkip(CanonicalSkipEvidence::DirectFinalize)
+            } else if ancestors.contains(slot) {
+                canon_ancestry = canon_ancestry.saturating_add(1);
+                SkipClassification::CanonicalSkip(CanonicalSkipEvidence::Ancestry)
+            } else {
+                indeterminate = indeterminate.saturating_add(1);
+                SkipClassification::Indeterminate
+            };
+        }
+        if rec.finalized_at.is_some() {
+            finalized_slot_count = finalized_slot_count.saturating_add(1);
+        }
+        if rec.finalized_at.is_none() && rec.voted_skip_at.is_none() {
+            pending_slot_count = pending_slot_count.saturating_add(1);
+        }
+    }
+    state.overall.canonical_skips_direct = canon_direct;
+    state.overall.canonical_skips_ancestry = canon_ancestry;
+    state.overall.indeterminate_skips = indeterminate;
+    state.overall.finalized_slot_count = finalized_slot_count;
+    state.overall.skipped_slot_count = skipped_slot_count;
+    state.overall.pending_slot_count = pending_slot_count;
+}
+
+/// Close off an unmatched `StandstillExtending` left open at end-of-stream
+/// by pushing `(entry, max_slot_seen)` into `standstill_ranges`. The log
+/// may have been cut mid-standstill, or the validator may still be in one
+/// at capture time; either way the range needs an upper bound.
+fn close_open_standstill(state: &mut State) {
+    let Some(entry) = state.overall.open_standstill_entry.take() else {
+        return;
+    };
+    let exit = state.slots.keys().copied().max().unwrap_or(entry);
+    state.overall.standstill_ranges.push((entry, exit));
+}
+
+/// Populate `timeout_crashed_leaders_outside_standstill` by iterating
+/// `SlotRecord`s and counting `timeout_crashed_leader_at`-bearing slots
+/// whose slot number is not inside any standstill range.
+///
+/// Ranges expected to be small (single digits in typical logs), so a
+/// linear scan per TCL slot is fine.
+fn compute_tcl_outside_standstill(state: &mut State) {
+    let ranges = &state.overall.standstill_ranges;
+    if ranges.is_empty() {
+        state.overall.timeout_crashed_leaders_outside_standstill =
+            state.overall.timeout_crashed_leaders;
+        return;
+    }
+    let mut count: u64 = 0;
+    for (slot, rec) in &state.slots {
+        if rec.timeout_crashed_leader_at.is_none() {
+            continue;
+        }
+        let in_standstill = ranges
+            .iter()
+            .any(|(entry, exit)| *slot >= *entry && *slot <= *exit);
+        if !in_standstill {
+            count = count.saturating_add(1);
+        }
+    }
+    state.overall.timeout_crashed_leaders_outside_standstill = count;
+}
+
 /// Derived alerts computed after the stream has been fully ingested.
 ///
 /// Emits one `LogPattern` alert per `(severity, module)` group and a
@@ -335,6 +487,9 @@ pub fn analyze(state: &mut State) {
         )),
         "analyze() must run at most once per State",
     );
+    classify_skips(state);
+    close_open_standstill(state);
+    compute_tcl_outside_standstill(state);
     surface_log_pattern_alerts(state);
     surface_local_leader_summary(state);
     // Establish the post-analyze invariant on `state.alerts`: Critical

@@ -131,9 +131,11 @@ fn format_alert_for_yank(state: &State, alert: &Alert) -> String {
     out
 }
 
-/// One-bit filter dimensions for the Slots tab. Multiple flags AND
+/// One-bit filter dimensions for the Slots tab. Most flags AND
 /// together (e.g. `tcl + leader` -> only rows that are both
-/// `crashed_leader` AND `we_are_leader`).
+/// `crashed_leader` AND `we_are_leader`). The skip-family pair
+/// (`vskip_only`, `canonical_skip_only`) is the exception — they OR
+/// together so `[v]+[c]` shows both buckets at once.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SlotFilters {
     pub tcl: bool,
@@ -142,12 +144,12 @@ pub struct SlotFilters {
     pub leader: bool,
     pub fast_only: bool,
     pub slow_only: bool,
-    pub skipped_only: bool,
-    /// Rows where both `voted_notarize` and `voted_skip` are set. Surfaces
-    /// the protocol-ambiguous case where the validator cast a Notarize
-    /// vote and later a Skip vote on the same slot (vote_pattern rendered
-    /// as `"N+S"` or `"N+F+S"`).
-    pub mixed_votes: bool,
+    /// Rows where the slot is VSKIP (vote-skip with no canonical
+    /// evidence — the indeterminate bucket). Toggled with `[v]`.
+    pub vskip_only: bool,
+    /// Rows where the slot is CSKIP (vote-skip on a canonical slot).
+    /// Toggled with `[c]`. Headline operator-facing failure filter.
+    pub canonical_skip_only: bool,
 }
 
 impl SlotFilters {
@@ -158,8 +160,8 @@ impl SlotFilters {
             || self.leader
             || self.fast_only
             || self.slow_only
-            || self.skipped_only
-            || self.mixed_votes
+            || self.vskip_only
+            || self.canonical_skip_only
     }
 
     pub const fn matches(self, r: &SlotViewRow) -> bool {
@@ -181,11 +183,17 @@ impl SlotFilters {
         if self.slow_only && !matches!(r.status, SlotStatus::SlowFinalized) {
             return false;
         }
-        if self.skipped_only && !matches!(r.status, SlotStatus::Skipped) {
-            return false;
-        }
-        if self.mixed_votes && !(r.voted_notarize && r.voted_skip) {
-            return false;
+        // Skip-family OR semantics: when either flag is on, the row
+        // must match at least one of the requested buckets. Both off
+        // means no skip filter (no constraint added).
+        if self.vskip_only || self.canonical_skip_only {
+            let is_cskip = r.skip_classification.is_canonical_skip();
+            let is_vskip = matches!(r.status, SlotStatus::Skipped) && !is_cskip;
+            let want_v = self.vskip_only && is_vskip;
+            let want_c = self.canonical_skip_only && is_cskip;
+            if !(want_v || want_c) {
+                return false;
+            }
         }
         true
     }
@@ -202,8 +210,8 @@ pub enum FilterKind {
     Leader,
     FastOnly,
     SlowOnly,
-    SkippedOnly,
-    MixedVotes,
+    VskipOnly,
+    CanonicalSkipOnly,
 }
 
 const TAB_NAMES: [&str; 6] = [
@@ -445,11 +453,11 @@ impl<'s> App<'s> {
             FilterKind::Leader => self.slot_filters.leader = !self.slot_filters.leader,
             FilterKind::FastOnly => self.slot_filters.fast_only = !self.slot_filters.fast_only,
             FilterKind::SlowOnly => self.slot_filters.slow_only = !self.slot_filters.slow_only,
-            FilterKind::SkippedOnly => {
-                self.slot_filters.skipped_only = !self.slot_filters.skipped_only;
+            FilterKind::VskipOnly => {
+                self.slot_filters.vskip_only = !self.slot_filters.vskip_only;
             }
-            FilterKind::MixedVotes => {
-                self.slot_filters.mixed_votes = !self.slot_filters.mixed_votes;
+            FilterKind::CanonicalSkipOnly => {
+                self.slot_filters.canonical_skip_only = !self.slot_filters.canonical_skip_only;
             }
         }
         self.recompute_slot_indices();
@@ -631,10 +639,16 @@ fn event_loop(
                     KeyCode::Char('p') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::S2s);
                     }
-                    // `s` is the natural mnemonic for the SKIP status
-                    // filter. Free now that S2S moved to `p`.
-                    KeyCode::Char('s') if app.current_tab == 3 => {
-                        app.toggle_filter(FilterKind::SkippedOnly);
+                    // `v` for VSKIP (we Voted skip, no canonical evidence).
+                    // `c` for CSKIP (Canonical-skip). The two skip filters
+                    // OR together in `SlotFilters::matches` so pressing
+                    // both shows the union — equivalent to the old `[s]`
+                    // "both buckets" toggle.
+                    KeyCode::Char('v') if app.current_tab == 3 => {
+                        app.toggle_filter(FilterKind::VskipOnly);
+                    }
+                    KeyCode::Char('c') if app.current_tab == 3 => {
+                        app.toggle_filter(FilterKind::CanonicalSkipOnly);
                     }
                     KeyCode::Char('l') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::Leader);
@@ -642,21 +656,15 @@ fn event_loop(
                     KeyCode::Char('f') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::FastOnly);
                     }
-                    // `x` for slow-finalized — no natural mnemonic, but
-                    // visually pairs with `f` for fast (f/x toggles the
-                    // two finalization paths).
-                    KeyCode::Char('x') if app.current_tab == 3 => {
+                    // `s` for SLOW (was previously the combined VSKIP+CSKIP
+                    // toggle; that combined behaviour is now expressed by
+                    // pressing both `v` and `c`).
+                    KeyCode::Char('s') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::SlowOnly);
                     }
-                    // `m` for mixed-vote rows (N+S / N+F+S). Filters to
-                    // the protocol-ambiguous slots where the validator
-                    // cast both Notarize and Skip on the same slot —
-                    // worth surfacing because vote_pattern renders these
-                    // distinctly and the model permits the combination.
-                    KeyCode::Char('m') if app.current_tab == 3 => {
-                        app.toggle_filter(FilterKind::MixedVotes);
-                    }
-                    KeyCode::Char('c') if app.current_tab == 3 => {
+                    // `x` clears all filters — moved here from `c` to free
+                    // `c` for CSKIP. `x` reads as "cancel / clear".
+                    KeyCode::Char('x') if app.current_tab == 3 => {
                         app.clear_filters();
                     }
                     _ => {}
@@ -736,169 +744,10 @@ fn render_tabs(app: &App<'_>, frame: &mut Frame<'_>, area: ratatui::layout::Rect
 // visualisations live on tab 2, distributions on the Recoveries tab.
 // See `panel::overview::render`.
 
+// Tests live in a sibling file so this module stays under the
+// ~800 LOC strong-warn threshold. The `#[path]` keeps the module
+// identity as `crate::tui::app::tests`; `super` inside `app_tests.rs`
+// still refers to `crate::tui::app`.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-
-    /// SEC-01 regression: even when a malicious symlink pre-exists at
-    /// the target path, `try_write_yank` must not follow it. The fix
-    /// uses `create_new(true)` + `O_NOFOLLOW`, so a pre-placed symlink
-    /// causes the open to fail (with `AlreadyExists`) and the loop
-    /// retries on a fresh counter.
-    #[test]
-    fn yank_to_existing_symlink_does_not_overwrite_target() {
-        // Set up an isolated yank dir under a tempdir.
-        let tmp =
-            std::env::temp_dir().join(format!("abracadabra-yank-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Place an attacker's symlink at the path the yank would
-        // first try. Filename pattern is
-        // `abracadabra-yank-<pid>-<n>.txt` (REL-01 fix); pre-position
-        // the attack at <pid>-1.
-        let pid = std::process::id();
-        let victim = tmp.join("victim.txt");
-        std::fs::write(&victim, b"original-victim-content").unwrap();
-        let attack_link = tmp.join(format!("abracadabra-yank-{pid}-1.txt"));
-        symlink(&victim, &attack_link).unwrap();
-
-        // Construct a minimal App and drive the yank.
-        let state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
-        let mut app = App::new(&state, None, 60);
-        let result = app.try_write_yank(&tmp, "yank-body-payload");
-
-        // Outcome: yank succeeds, but writes to a DIFFERENT path
-        // (counter bumped past 1). The victim's content is untouched.
-        let written = result.expect("yank should succeed by bumping counter");
-        assert_ne!(written, attack_link);
-        // Victim untouched.
-        let victim_after = std::fs::read_to_string(&victim).unwrap();
-        assert_eq!(victim_after, "original-victim-content");
-        // The yank's actual content lives at `written`.
-        let yank_body = std::fs::read_to_string(&written).unwrap();
-        assert_eq!(yank_body, "yank-body-payload");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// STRUCT-01 regression: scroll keys on tabs without a scrollable
-    /// list (Overview, Time series, Windows) must NOT clobber a
-    /// cursor on a scrollable tab. The old `scroll_target` default
-    /// arm wrote to `slot_scroll`, so `g`/`G`/`Home`/`End` on tab 0
-    /// would reset `slot_scroll` to 0.
-    #[test]
-    fn scroll_on_non_list_tab_does_not_mutate_other_cursors() {
-        let state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
-        let mut app = App::new(&state, None, 60);
-        // Pretend the user has navigated 42 rows down the Slots table.
-        app.slot_scroll = 42;
-        // Switch to Overview (tab 0) and press G — must be a no-op for
-        // every cursor, including slot_scroll.
-        app.current_tab = 0;
-        app.jump_bottom();
-        app.jump_top();
-        app.step_scroll(1);
-        app.step_scroll(-1);
-        assert_eq!(
-            app.slot_scroll, 42,
-            "slot_scroll clobbered by tab-0 scroll keys"
-        );
-        // Same check on Time series (tab 1) and Windows (tab 2).
-        app.current_tab = 1;
-        app.jump_bottom();
-        app.step_scroll(20);
-        assert_eq!(
-            app.slot_scroll, 42,
-            "slot_scroll clobbered by tab-1 scroll keys"
-        );
-        app.current_tab = 2;
-        app.jump_top();
-        assert_eq!(
-            app.slot_scroll, 42,
-            "slot_scroll clobbered by tab-2 scroll keys"
-        );
-    }
-
-    /// PERF-03 regression: leader-slot count is precomputed once in
-    /// `App::new`. Asserts the field matches a direct count from
-    /// `slot_rows` so the two read-sites on the Slots tab return the
-    /// same value the old per-frame scans did.
-    #[test]
-    fn leader_slot_count_matches_slot_rows_filter() {
-        let mut state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
-        state.slot_mut(1).we_are_leader = true;
-        state.slot_mut(2).we_are_leader = false;
-        state.slot_mut(3).we_are_leader = true;
-        state.slot_mut(4).we_are_leader = true;
-        let app = App::new(&state, None, 60);
-        let direct = app.slot_rows.iter().filter(|r| r.we_are_leader).count() as u64;
-        assert_eq!(app.leader_slot_count, direct);
-        assert_eq!(app.leader_slot_count, 3);
-    }
-
-    /// COR-03 follow-up: the `mixed_votes` filter selects rows that
-    /// cast both Notarize and Skip on the same slot — the protocol-
-    /// ambiguous case `vote_pattern` now surfaces as `N+S` / `N+F+S`.
-    #[test]
-    fn mixed_votes_filter_matches_n_and_s_rows() {
-        use crate::tui::view::SlotViewRow;
-        let mk = |n, s| SlotViewRow {
-            slot: 0,
-            status: SlotStatus::Pending,
-            fast: None,
-            we_are_leader: false,
-            assembly_ms: None,
-            consensus_ms: None,
-            lifecycle_ms: None,
-            voted_notarize: n,
-            voted_finalize: false,
-            voted_skip: s,
-            safe_to_notar: false,
-            safe_to_skip: false,
-            crashed_leader: false,
-        };
-        let filters = SlotFilters {
-            mixed_votes: true,
-            ..SlotFilters::default()
-        };
-        // Pure-N or pure-S rows must NOT match.
-        assert!(!filters.matches(&mk(true, false)));
-        assert!(!filters.matches(&mk(false, true)));
-        assert!(!filters.matches(&mk(false, false)));
-        // Both Notarize and Skip set -> matches.
-        assert!(filters.matches(&mk(true, true)));
-        // any_active picks up the new dimension.
-        assert!(filters.any_active());
-    }
-
-    /// COR-02 regression guard for the math: deriving the per-hour
-    /// rate must use the real elapsed hours, not a clamped 1.0
-    /// denominator. With 60 events in 20 minutes, the true rate is
-    /// 180/h — the old `hours.max(1.0)` would have reported 60/h.
-    #[test]
-    fn rate_per_hour_does_not_clamp_short_log() {
-        let twenty_min_hours = 20.0_f64 / 60.0;
-        let events = 60.0_f64;
-        let rate = events / twenty_min_hours;
-        assert!((rate - 180.0).abs() < 1e-9, "expected 180/h, got {rate}");
-    }
-
-    /// REL-01 regression: panic hook installation must be idempotent
-    /// — calling `install_panic_hook` twice in the same process must
-    /// not stack the restore logic recursively. Verified by checking
-    /// that the `OnceLock` short-circuits the second call.
-    #[test]
-    fn panic_hook_install_is_idempotent() {
-        // We can't directly observe hook chain depth without panicking
-        // (which would mess up the test runner's output). Instead,
-        // assert that two back-to-back installs leave the process
-        // alive and that subsequent calls are no-ops.
-        install_panic_hook();
-        install_panic_hook();
-        install_panic_hook();
-        // If we got here without infinite recursion or stack overflow,
-        // the OnceLock guard is doing its job.
-    }
-}
+#[path = "app_tests.rs"]
+mod tests;

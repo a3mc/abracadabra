@@ -77,8 +77,40 @@ pub const FIN_WARN_PCT: f64 = 80.0;
 /// Local vote-skip rate (this validator) as a share of observed slots.
 /// Sustained skip rates above 15% indicate this node is consistently
 /// not observing leader blocks in time.
+///
+/// NOTE: raw skip rate is no longer the headline KPI — see
+/// `BAD_SKIP_*` thresholds below for the operator-facing metric.
+/// This constant is retained for legacy panels until they migrate.
 pub const VOTE_SKIP_WARN_PCT: f64 = 5.0;
 pub const VOTE_SKIP_BAD_PCT: f64 = 15.0;
+
+/// **Canonical-skip percentage** — fraction of our skip votes that
+/// landed on canonical slots (proven via direct `Finalized` observation
+/// or chain ancestry from a finalized descendant).
+///
+/// Operator-facing failure indicator. Empirical baselines from our
+/// 5-day validation: 0.02% to 0.09% across rotated logs of a healthy
+/// validator. Anything below 0.5% is essentially noise; 0.5%-2% is
+/// elevated; above 2% is a real participation problem.
+pub const CANONICAL_SKIP_WARN_PCT: f64 = 0.5;
+pub const CANONICAL_SKIP_BAD_PCT: f64 = 2.0;
+
+/// **True-fallback percentage** — share of `BlockNotarFallback` cluster
+/// events that did NOT have a matching `BlockNotarized` for the same
+/// slot. See `docs/alpenglow/03-protocol-overview.md`: every successful
+/// 60% Notarize cert auto-emits a NotarFallback companion, so most
+/// NotarFallback events are benign. A "true FB" — fallback without
+/// matching Notarize — means the cluster could not reach the 60%
+/// Notarize threshold and fell back to the wider-quorum path. That is
+/// the operator-relevant fragmentation signal.
+///
+/// `0.5%` cutoff chosen by symmetry with `CANONICAL_SKIP_WARN_PCT`:
+/// both measure rare cluster-side adverse events on the same
+/// per-slot-event denominator scale, so the "anything below ~0.5% is
+/// noise" framing carries over until empirical data says otherwise.
+/// Re-calibrate alongside the canonical-skip thresholds when a
+/// multi-day, multi-validator corpus is available.
+pub const TRUE_FB_ELEVATED_PCT: f64 = 0.5;
 
 /// Per-slot assembly time (first_shred → block_emitted) in ms. Baseline
 /// sits ≈ 450 ms in a healthy 21h log; 500 ms is the visible-spike

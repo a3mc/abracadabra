@@ -32,6 +32,11 @@ use crate::model::buckets::TimeBuckets;
 use crate::tui::theme;
 use crate::tui::widget::{commas, fit_to_width};
 
+/// Input tuple for a paired secondary series on a `CardSpec`:
+/// `(label, color, per-bucket values)`. Aliased to keep the
+/// `with_secondary` signature readable (clippy::type_complexity).
+type SecondarySeriesInput = (&'static str, Color, Vec<u64>);
+
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     /// Per-bucket count (events). Stats line shows total / peak / avg.
@@ -39,6 +44,27 @@ enum Kind {
     /// Per-bucket time value in milliseconds. Stats line shows min /
     /// avg / max.
     Time,
+}
+
+/// Per-bucket secondary series rendered as a second sparkline below
+/// the main one. Used by the vote-skip card to surface the
+/// canonical-skip subset on the same time axis — the operator can
+/// see WHERE in the log the bad skips clustered, not just the
+/// aggregate count.
+///
+/// Carries its own `data` (raw per-bucket counts), `deviation` (data
+/// minus its own p10 baseline) and `dev_peak` so the second sparkline
+/// scales independently of the primary series. The primary's peak
+/// can be 188/bucket while canonical is 1-2/bucket; sharing a scale
+/// would flatten the secondary to invisibility.
+struct SecondarySeries {
+    label: &'static str,
+    color: Color,
+    /// Sum across all buckets — shown in the stats line as
+    /// `<label> <total>`.
+    total: u64,
+    deviation: Vec<u64>,
+    dev_peak: u64,
 }
 
 struct Metric {
@@ -54,24 +80,34 @@ struct Metric {
     /// `max(deviation)` clamped to at least 1 so `Sparkline::max` is
     /// always positive (avoids a divide-by-zero in ratatui's scaler).
     dev_peak: u64,
+    /// Optional second sparkline (e.g. canonical-skip below total
+    /// vote-skip). When present, the chart area is split 50/50.
+    secondary: Option<SecondarySeries>,
 }
 
 impl Metric {
     fn new(label: &'static str, kind: Kind, color: Color, data: Vec<u64>) -> Self {
-        // p10 = the value at index `len/10` of an ascending-sorted copy.
-        // `select_nth_unstable` avoids the full sort the previous
-        // implementation paid for — O(n) average vs O(n log n) — and the
-        // allocated copy is the same size either way.
-        let baseline = if data.is_empty() {
-            0
-        } else {
-            let mut tmp = data.clone();
-            let idx = tmp.len() / 10;
-            tmp.select_nth_unstable(idx);
-            tmp[idx]
-        };
-        let deviation: Vec<u64> = data.iter().map(|v| v.saturating_sub(baseline)).collect();
-        let dev_peak = deviation.iter().copied().max().unwrap_or(1).max(1);
+        Self::with_secondary(label, kind, color, data, None)
+    }
+
+    fn with_secondary(
+        label: &'static str,
+        kind: Kind,
+        color: Color,
+        data: Vec<u64>,
+        secondary: Option<SecondarySeriesInput>,
+    ) -> Self {
+        let (deviation, dev_peak) = baseline_subtract(&data);
+        let secondary = secondary.map(|(sec_label, sec_color, sec_data)| {
+            let (sec_dev, sec_peak) = baseline_subtract(&sec_data);
+            SecondarySeries {
+                label: sec_label,
+                color: sec_color,
+                total: sec_data.iter().sum(),
+                deviation: sec_dev,
+                dev_peak: sec_peak,
+            }
+        });
         Self {
             label,
             kind,
@@ -79,8 +115,28 @@ impl Metric {
             data,
             deviation,
             dev_peak,
+            secondary,
         }
     }
+}
+
+/// Subtract the p10 baseline so trailing-sparklines surface spikes
+/// above a high floor. `select_nth_unstable` is O(n) average, vs the
+/// full O(n log n) sort the previous implementation paid for. Returns
+/// `(deviation, dev_peak)` where `dev_peak` is clamped to ≥1 to keep
+/// ratatui's Sparkline scaler safe.
+fn baseline_subtract(data: &[u64]) -> (Vec<u64>, u64) {
+    let baseline = if data.is_empty() {
+        0
+    } else {
+        let mut tmp = data.to_vec();
+        let idx = tmp.len() / 10;
+        tmp.select_nth_unstable(idx);
+        tmp[idx]
+    };
+    let deviation: Vec<u64> = data.iter().map(|v| v.saturating_sub(baseline)).collect();
+    let dev_peak = deviation.iter().copied().max().unwrap_or(1).max(1);
+    (deviation, dev_peak)
 }
 
 /// Dual-series card variant: two sparklines stacked vertically inside a
@@ -192,18 +248,33 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
                 theme::label_style(),
             ),
         ]),
-        Kind::Count => Line::from(vec![
-            Span::styled("total ", theme::label_style()),
-            Span::styled(commas(total), theme::value_style()),
-            Span::styled("  peak ", theme::label_style()),
-            Span::styled(format_value(max, m.kind), theme::value_style()),
-            Span::styled("/bkt  avg ", theme::label_style()),
-            Span::styled(format_value(avg, m.kind), theme::value_style()),
-            Span::styled(
-                format!("/bkt  ·  active {active}/{n_buckets} bkts"),
-                theme::label_style(),
-            ),
-        ]),
+        Kind::Count => {
+            let mut spans = vec![
+                Span::styled("total ", theme::label_style()),
+                Span::styled(commas(total), theme::value_style()),
+            ];
+            if let Some(sec) = &m.secondary {
+                spans.push(Span::styled(
+                    format!("  {} ", sec.label),
+                    theme::label_style(),
+                ));
+                spans.push(Span::styled(
+                    commas(sec.total),
+                    Style::default().fg(sec.color).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.extend([
+                Span::styled("  peak ", theme::label_style()),
+                Span::styled(format_value(max, m.kind), theme::value_style()),
+                Span::styled("/bkt  avg ", theme::label_style()),
+                Span::styled(format_value(avg, m.kind), theme::value_style()),
+                Span::styled(
+                    format!("/bkt  ·  active {active}/{n_buckets} bkts"),
+                    theme::label_style(),
+                ),
+            ]);
+            Line::from(spans)
+        }
     };
 
     let parts = Layout::default()
@@ -216,27 +287,44 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
 
     frame.render_widget(Paragraph::new(stats_line), parts[0]);
 
-    // Resample to the full panel width so a short series doesn't leave
-    // trailing blank columns (ratatui's `Sparkline` plots one column per
-    // input point). `fit_to_width` clones into a temporary; bind it to a
-    // `let` so the borrow on the slice outlives the builder chain.
-    let spark_width = parts[1].width as usize;
-    let resampled = fit_to_width(deviation, spark_width);
-    let spark_data: &[u64] = if resampled.is_empty() {
-        deviation
+    if let Some(sec) = &m.secondary {
+        // Mirror chart: secondary (canonical, red) hangs from the top,
+        // primary (vote-skip, yellow) rises from the bottom — like a
+        // population pyramid. They share the same x-axis, so the
+        // operator can read across to see when the canonical events
+        // clustered relative to overall vote-skip activity. Each side
+        // scales to its own peak so the small canonical line isn't
+        // flattened by the large vote-skip magnitude.
+        let mirror = MirrorSparkline {
+            top_data: &sec.deviation,
+            top_peak: sec.dev_peak,
+            top_color: sec.color,
+            bottom_data: deviation,
+            bottom_peak: dev_peak,
+            bottom_color: m.color,
+        };
+        frame.render_widget(mirror, parts[1]);
     } else {
-        &resampled
-    };
-    let spark = Sparkline::default()
-        .data(spark_data)
-        .max(dev_peak)
-        .style(Style::default().fg(m.color));
-    frame.render_widget(spark, parts[1]);
+        // Single-series path: resample to width, baseline-subtracted
+        // sparkline using ratatui's built-in widget.
+        let resampled = fit_to_width(deviation, parts[1].width as usize);
+        let spark_data: &[u64] = if resampled.is_empty() {
+            deviation
+        } else {
+            &resampled
+        };
+        let spark = Sparkline::default()
+            .data(spark_data)
+            .max(dev_peak)
+            .style(Style::default().fg(m.color));
+        frame.render_widget(spark, parts[1]);
+    }
 }
 
 fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
     let (fast_pct, slow_pct) = b.fast_slow_pct();
     let skip = b.skip_count();
+    let canon_skip = b.canonical_skip_count();
     let crashed = b.crashed_leader_count();
     let s2n = b.safe_to_notar_count();
     let s2s = b.safe_to_skip_count();
@@ -267,18 +355,24 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
             bottom_color: theme::SPARK_ALT_PATH,
             bottom_data: slow_pct,
         }),
-        CardSpec::Single(Metric::new(
-            "vote skip",
+        // Two stacked sparklines in one card: top = total vote-skip
+        // (yellow), bottom = canonical-skip subset (red). Both share
+        // the same x-axis but scale independently — total can be
+        // 100+/bucket while canonical is 0-2/bucket, so a shared
+        // y-scale would flatten the secondary to invisibility.
+        // Operator sees WHEN the canonical events fell, not just the
+        // aggregate count.
+        CardSpec::Single(Metric::with_secondary(
+            "vote-skip",
             Kind::Count,
             theme::SPARK_PROBLEM,
             skip,
+            Some(("canonical", theme::BAD, canon_skip)),
         )),
-        CardSpec::Single(Metric::new(
-            "crashed leaders",
-            Kind::Count,
-            theme::SPARK_PROBLEM,
-            crashed,
-        )),
+        // SafeToNotar and SafeToSkip sit next to each other on the
+        // same row of the 2-column card grid — they're sibling
+        // safety-threshold events from the consensus pool and read
+        // together. `crashed leaders` is bumped one slot down.
         CardSpec::Single(Metric::new(
             "SafeToNotar",
             Kind::Count,
@@ -290,6 +384,12 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
             Kind::Count,
             theme::SPARK_PROBLEM,
             s2s,
+        )),
+        CardSpec::Single(Metric::new(
+            "crashed leaders",
+            Kind::Count,
+            theme::SPARK_PROBLEM,
+            crashed,
         )),
         CardSpec::Single(Metric::new(
             "leader windows",
@@ -404,6 +504,144 @@ fn render_dual_card(frame: &mut Frame<'_>, area: Rect, m: &DualMetric) {
 ///   paints `slow_color` regardless of `slow_val`.
 ///
 /// The sole caller (`render_dual_card`) wires the output of
+/// Mirror / back-to-back sparkline: two count series share a vertical
+/// space. The top series (`top_data`) hangs DOWN from the top edge of
+/// the area; the bottom series (`bottom_data`) rises UP from the
+/// bottom edge. Each side scales to its own peak so a small-magnitude
+/// series (e.g. canonical-skip, peak 1-2/bucket) is not flattened by
+/// a large one (vote-skip, peak 200/bucket).
+///
+/// Layout:
+///
+/// ```text
+///   ▔▔▔▔▔ ← top series fills downward (hanging bars)
+///   ▔  ▔
+///   ─────  ← center line (always blank)
+///   ▁  ▁▁
+///   ▁▁▁▁▁ ← bottom series fills upward (rising bars)
+/// ```
+///
+/// Sub-cell precision on the bottom side via the standard `▁▂▃▄▅▆▇█`
+/// character set. The top side uses `█` for filled cells and the
+/// bottom-anchored character set with `bg = top_color` (a "punch-out"
+/// effect) for the boundary cell, yielding the same 1/8 resolution.
+struct MirrorSparkline<'a> {
+    top_data: &'a [u64],
+    top_peak: u64,
+    top_color: Color,
+    bottom_data: &'a [u64],
+    bottom_peak: u64,
+    bottom_color: Color,
+}
+
+impl Widget for MirrorSparkline<'_> {
+    #[allow(clippy::cast_possible_truncation)]
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Bottom-anchored eighths character set — same as ratatui's
+        // `Sparkline`. Used directly for the bottom-up side and via
+        // the bg/fg trick for the top-down side.
+        const BARS: [&str; 9] = ["", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let h = area.height as usize;
+        // Split the area in half. With odd height the bottom side gets
+        // the extra row (vote-skip is usually the larger magnitude and
+        // benefits from the extra resolution).
+        let top_h = h / 2;
+        let bottom_h = h - top_h;
+        let width = area.width as usize;
+
+        // Resample each series to the chart width so trailing blanks
+        // don't appear when bucket count < width.
+        let top_resampled = fit_to_width(self.top_data, width);
+        let top_data: &[u64] = if top_resampled.is_empty() {
+            self.top_data
+        } else {
+            &top_resampled
+        };
+        let bottom_resampled = fit_to_width(self.bottom_data, width);
+        let bottom_data: &[u64] = if bottom_resampled.is_empty() {
+            self.bottom_data
+        } else {
+            &bottom_resampled
+        };
+
+        let top_peak = self.top_peak.max(1);
+        let bottom_peak = self.bottom_peak.max(1);
+
+        for col in 0..(width as u16).min(area.width) {
+            let col_idx = col as usize;
+            let x = area.x + col;
+            let top_val = top_data.get(col_idx).copied().unwrap_or(0);
+            let bot_val = bottom_data.get(col_idx).copied().unwrap_or(0);
+
+            // ---- Top side: hanging bars from the top edge ----
+            if top_h > 0 && top_val > 0 {
+                let sub = (u128::from(top_val) * (top_h as u128 * 8)) / u128::from(top_peak);
+                let sub = sub.min((top_h * 8) as u128) as usize;
+                let full = sub / 8;
+                let rem = sub % 8;
+
+                // Full cells filled from the top edge downward
+                for r in 0..full {
+                    let y = area.y + r as u16;
+                    if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                        cell.set_symbol(BARS[8]).set_fg(self.top_color);
+                    }
+                }
+                // Boundary cell: there are no top-anchored eighths
+                // characters past 1/8 and 4/8, so we use a
+                // bottom-anchored char (BARS[empty]) and flip its
+                // rendering with REVERSED. With the modifier, the
+                // terminal swaps fg/bg when drawing the glyph: the
+                // glyph (covering the bottom `empty` sub-cells) paints
+                // in the cell's default bg (transparent), and the
+                // non-glyph area (the top `rem` sub-cells) paints in
+                // `top_color`. Without REVERSED the glyph would render
+                // in terminal-default-fg (usually gray), producing
+                // visible stripes at the bottom of the bar.
+                if rem > 0 && full < top_h {
+                    let empty = 8 - rem;
+                    let y = area.y + full as u16;
+                    if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                        cell.set_symbol(BARS[empty]).set_style(
+                            Style::default()
+                                .fg(self.top_color)
+                                .add_modifier(Modifier::REVERSED),
+                        );
+                    }
+                }
+            }
+
+            // ---- Bottom side: rising bars from the bottom edge ----
+            if bottom_h > 0 && bot_val > 0 {
+                let sub = (u128::from(bot_val) * (bottom_h as u128 * 8)) / u128::from(bottom_peak);
+                let sub = sub.min((bottom_h * 8) as u128) as usize;
+                let full = sub / 8;
+                let rem = sub % 8;
+
+                // Full cells filled from the bottom edge upward
+                for r in 0..full {
+                    let y = area.y + (h as u16) - 1 - r as u16;
+                    if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                        cell.set_symbol(BARS[8]).set_fg(self.bottom_color);
+                    }
+                }
+                // Boundary cell uses the natural bottom-up eighths
+                // character at fg = bottom_color.
+                if rem > 0 && full < bottom_h {
+                    let y = area.y + (h as u16) - 1 - full as u16;
+                    if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                        cell.set_symbol(BARS[rem]).set_fg(self.bottom_color);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `TimeBuckets::fast_slow_pct` which guarantees both invariants by
 /// construction. The two-slice signature is preserved (rather than
 /// taking only `fast` and deriving `slow = 100 - fast` internally) so
