@@ -874,4 +874,183 @@ mod tests {
         // If we got here without infinite recursion or stack overflow,
         // the OnceLock guard is doing its job.
     }
+
+    // -- SlotFilters tests -----------------------------------------------
+    //
+    // The skip-family pair (`vskip_only`, `canonical_skip_only`) uses
+    // OR semantics: both off = no constraint, one on = its bucket,
+    // both on = union. The other six flags AND together.
+
+    use crate::model::slot::{CanonicalSkipEvidence, SkipClassification};
+
+    /// Three row shapes covering the skip-family discriminator.
+    fn row(status: SlotStatus, skip: SkipClassification) -> SlotViewRow {
+        SlotViewRow {
+            slot: 0,
+            status,
+            skip_classification: skip,
+            fast: None,
+            we_are_leader: false,
+            assembly_ms: None,
+            consensus_ms: None,
+            consensus_inverted: false,
+            lifecycle_ms: None,
+            voted_notarize: false,
+            voted_finalize: false,
+            voted_skip: false,
+            safe_to_notar: false,
+            safe_to_skip: false,
+            crashed_leader: false,
+        }
+    }
+
+    fn vskip_row() -> SlotViewRow {
+        row(SlotStatus::Skipped, SkipClassification::Indeterminate)
+    }
+
+    fn cskip_row() -> SlotViewRow {
+        row(
+            SlotStatus::Skipped,
+            SkipClassification::CanonicalSkip(CanonicalSkipEvidence::DirectFinalize),
+        )
+    }
+
+    fn fin_row() -> SlotViewRow {
+        row(SlotStatus::FastFinalized, SkipClassification::NotSkipped)
+    }
+
+    #[test]
+    fn slot_filters_matches_skip_family_or_semantics() {
+        // 4 filter states × 3 row shapes = 12 cases.
+        let off = SlotFilters::default();
+        let v_only = SlotFilters {
+            vskip_only: true,
+            ..SlotFilters::default()
+        };
+        let c_only = SlotFilters {
+            canonical_skip_only: true,
+            ..SlotFilters::default()
+        };
+        let both = SlotFilters {
+            vskip_only: true,
+            canonical_skip_only: true,
+            ..SlotFilters::default()
+        };
+
+        let v = vskip_row();
+        let c = cskip_row();
+        let f = fin_row();
+
+        // Both off → no constraint from skip family. Every row passes.
+        assert!(off.matches(&v));
+        assert!(off.matches(&c));
+        assert!(off.matches(&f));
+
+        // VSKIP only.
+        assert!(v_only.matches(&v));
+        assert!(!v_only.matches(&c));
+        assert!(!v_only.matches(&f));
+
+        // CSKIP only.
+        assert!(!c_only.matches(&v));
+        assert!(c_only.matches(&c));
+        assert!(!c_only.matches(&f));
+
+        // Both on → union of VSKIP ∪ CSKIP.
+        assert!(both.matches(&v));
+        assert!(both.matches(&c));
+        assert!(!both.matches(&f));
+    }
+
+    #[test]
+    fn slot_filters_matches_and_semantics_for_other_flags() {
+        // Sanity: the six non-skip-family flags AND together against
+        // their respective row bits.
+        let mut r = fin_row();
+        r.crashed_leader = true;
+        r.we_are_leader = true;
+
+        let leader_and_tcl = SlotFilters {
+            tcl: true,
+            leader: true,
+            ..SlotFilters::default()
+        };
+        assert!(leader_and_tcl.matches(&r));
+
+        // Drop one bit → row must be excluded.
+        r.crashed_leader = false;
+        assert!(!leader_and_tcl.matches(&r));
+    }
+
+    #[test]
+    fn slot_filters_fast_and_slow_only_isolate_status() {
+        let fast_only = SlotFilters {
+            fast_only: true,
+            ..SlotFilters::default()
+        };
+        let slow_only = SlotFilters {
+            slow_only: true,
+            ..SlotFilters::default()
+        };
+        let fast = row(SlotStatus::FastFinalized, SkipClassification::NotSkipped);
+        let slow = row(SlotStatus::SlowFinalized, SkipClassification::NotSkipped);
+        assert!(fast_only.matches(&fast));
+        assert!(!fast_only.matches(&slow));
+        assert!(!slow_only.matches(&fast));
+        assert!(slow_only.matches(&slow));
+    }
+
+    #[test]
+    fn toggle_filter_flips_each_dimension_and_recomputes_indices() {
+        // Build an App with one row of each shape so the recompute
+        // surface is exercised end-to-end.
+        let mut state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
+        // Slot 1: VSKIP (skip vote, no finalize, indeterminate).
+        state.slot_mut(1).voted_skip_at =
+            Some(time::macros::datetime!(2026-05-23 16:00:00 UTC));
+        // Slot 2: CSKIP (skip vote + finalize → CanonicalSkip after analyze).
+        state.slot_mut(2).voted_skip_at =
+            Some(time::macros::datetime!(2026-05-23 16:00:01 UTC));
+        state.slot_mut(2).finalized_at =
+            Some(time::macros::datetime!(2026-05-23 16:00:02 UTC));
+        state.slot_mut(2).fast_finalize = Some(true);
+        // Slot 3: plain finalized.
+        state.slot_mut(3).finalized_at =
+            Some(time::macros::datetime!(2026-05-23 16:00:03 UTC));
+        state.slot_mut(3).fast_finalize = Some(true);
+
+        // Run classifier so CSKIP row carries the discriminator.
+        crate::aggregator::analyze(&mut state);
+
+        let mut app = App::new(&state, None, 60);
+        let total_rows = app.slot_rows.len();
+        assert_eq!(total_rows, 3);
+        // Default: every row passes.
+        assert_eq!(app.slot_indices.len(), total_rows);
+
+        // Toggle CanonicalSkipOnly on → only the CSKIP row remains.
+        app.toggle_filter(FilterKind::CanonicalSkipOnly);
+        assert!(app.slot_filters.canonical_skip_only);
+        assert_eq!(app.slot_indices.len(), 1);
+        let only = &app.slot_rows[app.slot_indices[0]];
+        assert!(only.skip_classification.is_canonical_skip());
+
+        // Toggle VskipOnly on as well → union VSKIP ∪ CSKIP (2 rows).
+        app.toggle_filter(FilterKind::VskipOnly);
+        assert!(app.slot_filters.vskip_only);
+        assert_eq!(app.slot_indices.len(), 2);
+
+        // Toggle CanonicalSkipOnly off → only VSKIP row remains.
+        app.toggle_filter(FilterKind::CanonicalSkipOnly);
+        assert!(!app.slot_filters.canonical_skip_only);
+        assert_eq!(app.slot_indices.len(), 1);
+        let only = &app.slot_rows[app.slot_indices[0]];
+        assert_eq!(only.status, SlotStatus::Skipped);
+        assert!(!only.skip_classification.is_canonical_skip());
+
+        // Clear → back to all rows.
+        app.clear_filters();
+        assert!(!app.slot_filters.any_active());
+        assert_eq!(app.slot_indices.len(), total_rows);
+    }
 }

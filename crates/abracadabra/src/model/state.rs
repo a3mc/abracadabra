@@ -86,9 +86,20 @@ pub struct OverallStats {
     // `votes_skip` (event) AND `finalized_fast/slow` (event). The
     // subtraction formula `total - fin - skip` therefore underflows
     // on canonical-skip slots and saturates PEND to a misleading zero.
+    //
+    // NOTE: the three counts below do NOT partition `state.slots`.
+    // A canonical-skip slot has BOTH `finalized_at = Some` AND
+    // `voted_skip_at = Some`, so it is counted in `finalized_slot_count`
+    // AND `skipped_slot_count`. As a result `finalized_slot_count +
+    // skipped_slot_count + pending_slot_count` can exceed `slots.len()`,
+    // and `FIN% + skip% + PEND%` in the Slots-tab KPI strip can sum to
+    // >100%. The values are individually correct under the per-field
+    // definitions; the relationship is overlap, not partition.
     /// Slots with `finalized_at` set (unique).
     pub finalized_slot_count: u64,
-    /// Slots with `voted_skip_at` set (unique).
+    /// Slots with `voted_skip_at` set (unique). Note this overlaps
+    /// `finalized_slot_count` on canonical-skip slots — see the NOTE
+    /// above.
     pub skipped_slot_count: u64,
     /// Slots with neither `finalized_at` nor `voted_skip_at` — the
     /// honest pending count. May still carry partial signal (we
@@ -148,6 +159,15 @@ pub struct OverallStats {
     /// times `event_handler::add_missing_parent_ready` fired the stuck-
     /// cluster recovery path. Expected to be rare; a spike is a signal
     /// that the validator is repeatedly catching up mid-window.
+    ///
+    /// Counter is incremented on every `TriggeringParentReady` ingest but
+    /// is intentionally NOT surfaced in any TUI panel or summary yet —
+    /// reserved for future per-window / per-leader analysis once the
+    /// baseline rate (~3,800/hr steady-state) is better characterised.
+    /// Do not remove: cost is one `u64` per `OverallStats`, write is a
+    /// single `saturating_add` in the ingest hot path, and the
+    /// raw count is required to detect the "repeatedly catching up"
+    /// regime described above.
     pub parent_ready_recoveries: u64,
 
     // Bank.

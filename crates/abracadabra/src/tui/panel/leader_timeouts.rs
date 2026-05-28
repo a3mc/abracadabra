@@ -305,6 +305,14 @@ fn render_distribution(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    // MAX_W caps bar thickness. Without it, very wide terminals
+    // (8K monitors, etc.) drive the packing search toward W=9+ to
+    // absorb empty trailing space — which renders chunky-looking bars
+    // and aggressively downsamples buckets. With MAX_W = 6, the bars
+    // stay visually consistent across panel widths; whatever trailing
+    // space remains at extreme widths is the honest cost of integer
+    // bar widths against a continuous panel size.
+    const MAX_W: usize = 6;
     let title = app.buckets.map_or_else(
         || " leader-timeout events over time (no data) ".to_owned(),
         |b| {
@@ -397,16 +405,8 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     //
     // Search W = 1..=MAX_W. For each W, the max bars that fit is
     // `(panel_w + 1) / (W + 1)`. The actual bar count is the smaller
-    // of that and the data length. Score by used columns.
-    //
-    // MAX_W caps bar thickness. Without it, very wide terminals
-    // (8K monitors, etc.) drive the algorithm toward W=9+ to absorb
-    // empty trailing space — which renders chunky-looking bars and
-    // aggressively downsamples buckets. With MAX_W = 6, the bars
-    // stay visually consistent across panel widths; whatever trailing
-    // space remains at extreme widths is the honest cost of integer
-    // bar widths against a continuous panel size.
-    const MAX_W: usize = 6;
+    // of that and the data length. Score by used columns. MAX_W's
+    // rationale is documented at the top of the function.
     let panel_w = rows[1].width as usize;
     let n = deviation.len();
     let mut best_w = 1usize;

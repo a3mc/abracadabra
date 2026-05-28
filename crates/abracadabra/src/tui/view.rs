@@ -319,4 +319,33 @@ mod tests {
         assert_eq!(snap.lifecycle_pcts_us, (0, 0, 0, 0));
         assert_eq!(snap.resume_pcts_us, (0, 0, 0, 0));
     }
+
+    #[test]
+    fn consensus_inverted_true_when_finalize_precedes_emit() {
+        // Cluster finalize cert arrived (via gossip) before our local
+        // replay finished `block_emitted_at`. `delta_us` returns None,
+        // so the renderer must distinguish this from missing-data via
+        // `consensus_inverted == true`.
+        let mut r = SlotRecord::new(42);
+        r.block_emitted_at = Some(datetime!(2026-05-23 16:00:00.500 UTC));
+        r.finalized_at = Some(datetime!(2026-05-23 16:00:00.200 UTC));
+        let row = SlotViewRow::from_record(&r);
+        assert!(row.consensus_inverted, "f < b must flag inversion");
+        assert!(
+            row.consensus_ms.is_none(),
+            "inverted ordering yields None, not a negative ms"
+        );
+    }
+
+    #[test]
+    fn consensus_inverted_false_on_normal_ordering() {
+        // Sanity counter-case: with normal ordering (`b <= f`),
+        // `consensus_inverted` stays false and `consensus_ms` is Some.
+        let mut r = SlotRecord::new(43);
+        r.block_emitted_at = Some(datetime!(2026-05-23 16:00:00.200 UTC));
+        r.finalized_at = Some(datetime!(2026-05-23 16:00:00.500 UTC));
+        let row = SlotViewRow::from_record(&r);
+        assert!(!row.consensus_inverted);
+        assert!(row.consensus_ms.is_some());
+    }
 }

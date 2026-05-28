@@ -237,6 +237,30 @@ fn safe_to_skip_marks_slot_and_counter() {
 }
 
 #[test]
+fn triggering_parent_ready_increments_counter() {
+    // Every `Triggering parent ready` ingest bumps the recovery-path
+    // counter on `OverallStats`. Counter is intentionally not
+    // surfaced in the TUI yet (reserved for future analysis) — this
+    // test guards the ingest write-site against silent regression.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:14.187459305Z INFO  agave_votor::event_handler] \
+         ALNSCyaSLbRDwmFcGoBV1irHDKPgRxZjfNTex9HPvkWu: \
+         Triggering parent ready for slot 1028070 with parent 1028069 \
+         CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:15.187459305Z INFO  agave_votor::event_handler] \
+         ALNSCyaSLbRDwmFcGoBV1irHDKPgRxZjfNTex9HPvkWu: \
+         Triggering parent ready for slot 1028074 with parent 1028073 \
+         CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW",
+    );
+    assert_eq!(state.overall.parent_ready_recoveries, 2);
+}
+
+#[test]
 fn standstill_range_built_and_tcl_excluded() {
     // Two TCLs: one inside a closed standstill range, one outside.
     // After `analyze`, only the outside one should be counted in
@@ -311,6 +335,67 @@ fn no_standstill_means_excluded_equals_total() {
     assert!(state.overall.standstill_ranges.is_empty());
     assert_eq!(state.overall.timeout_crashed_leaders, 2);
     assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 2);
+}
+
+#[test]
+fn tcl_at_standstill_range_boundary_is_included_in_range() {
+    // Range endpoints are inclusive on both sides — a TCL exactly at
+    // `entry` or `exit` lands INSIDE the range and is therefore
+    // excluded from `timeout_crashed_leaders_outside_standstill`.
+    let mut state = State::default();
+    // TCL at the exact entry slot.
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:00.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 2000",
+    );
+    // TCL at the exact exit slot.
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:01.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 2100",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:02.000000000Z INFO  agave_votor::event_handler] \
+         PK: Extending timeouts starting at slot 2000",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:03.000000000Z INFO  agave_votor::event_handler] \
+         PK: Standstill initially detected at slot=2000 has ended at \
+         slot=2100. Ending timeout extension",
+    );
+    analyze(&mut state);
+    assert_eq!(state.overall.standstill_ranges, vec![(2000, 2100)]);
+    assert_eq!(state.overall.timeout_crashed_leaders, 2);
+    // Both TCLs are at boundary → both inside (inclusive) → none outside.
+    assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 0);
+}
+
+#[test]
+fn standstill_ended_without_extending_still_records_range() {
+    // A bare `StandstillEnded` (no preceding `StandstillExtending`,
+    // e.g. log cut mid-window or restart between the two emits) still
+    // pushes the payload range and is harmless.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:00.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 5050",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:01.000000000Z INFO  agave_votor::event_handler] \
+         PK: Standstill initially detected at slot=5000 has ended at \
+         slot=5100. Ending timeout extension",
+    );
+    analyze(&mut state);
+    assert_eq!(state.overall.standstill_ranges, vec![(5000, 5100)]);
+    assert!(state.overall.open_standstill_entry.is_none());
+    // TCL at 5050 falls inside the range → excluded.
+    assert_eq!(state.overall.timeout_crashed_leaders, 1);
+    assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 0);
 }
 
 #[test]
