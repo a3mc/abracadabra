@@ -386,13 +386,50 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(stats), rows[0]);
 
     // BarChart with visual gap between bars. Each Bar gets text_value("")
-    // so no numeric label rides on top of the bar (those labels overlap the
-    // stats line at large values, which is the "covering the legend" issue).
-    // Downsample bucket count to panel_width / 3 so each bar has room for a
-    // 2-col width + 1-col gap.
+    // so no numeric label rides on top of the bar.
+    //
+    // Picking bar geometry is a 1-D packing problem. Each bar consumes
+    // `(bar_width + 1)` cols including the trailing gap (one trailing
+    // gap is unused at the right edge). Total used = `bars * (W+1) - 1`.
+    // We want the (W, bar_count) pair that fills the panel closest to
+    // its full width without overflowing, while preferring more
+    // buckets visible.
+    //
+    // Search W = 1..=MAX_W. For each W, the max bars that fit is
+    // `(panel_w + 1) / (W + 1)`. The actual bar count is the smaller
+    // of that and the data length. Score by used columns.
+    //
+    // MAX_W caps bar thickness. Without it, very wide terminals
+    // (8K monitors, etc.) drive the algorithm toward W=9+ to absorb
+    // empty trailing space — which renders chunky-looking bars and
+    // aggressively downsamples buckets. With MAX_W = 6, the bars
+    // stay visually consistent across panel widths; whatever trailing
+    // space remains at extreme widths is the honest cost of integer
+    // bar widths against a continuous panel size.
+    const MAX_W: usize = 6;
     let panel_w = rows[1].width as usize;
-    let max_bars = (panel_w / 3).max(8);
-    let display = fit_to_width(&deviation, max_bars.min(deviation.len()));
+    let n = deviation.len();
+    let mut best_w = 1usize;
+    let mut best_count = 1usize;
+    let mut best_used = 0usize;
+    for w in 1..=MAX_W {
+        let denom = w + 1;
+        let max_count = (panel_w + 1) / denom;
+        if max_count == 0 {
+            break;
+        }
+        let count = n.min(max_count);
+        if count == 0 {
+            continue;
+        }
+        let used = count * denom - 1;
+        if used > best_used {
+            best_used = used;
+            best_w = w;
+            best_count = count;
+        }
+    }
+    let display = fit_to_width(&deviation, best_count);
     let bars: Vec<Bar<'_>> = display
         .iter()
         .map(|v| Bar::default().value(*v).text_value(String::new()))
@@ -400,7 +437,7 @@ fn render_trend(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let group = BarGroup::default().bars(&bars);
     let chart = BarChart::default()
         .data(group)
-        .bar_width(2)
+        .bar_width(u16::try_from(best_w).unwrap_or(2))
         .bar_gap(1)
         .max(dev_peak.max(1))
         .bar_style(Style::default().fg(theme::SPARK_PROBLEM));
