@@ -97,6 +97,15 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     } else {
         theme::warn_style()
     };
+    // p95 (lifecycle) health: good if ≤ LIFECYCLE_WARN_MS (matches the
+    // band shown in the right-panel reference). Replaces the buried
+    // `p95 (lifecycle) X ms [✓]` line that used to live in the Latency
+    // bands section — same threshold, same colour mapping.
+    let p95_style = if p95 <= theme::LIFECYCLE_WARN_MS as i64 {
+        theme::good_style()
+    } else {
+        theme::warn_style()
+    };
 
     let pipe = || Span::styled("  |  ", theme::label_style());
 
@@ -106,14 +115,13 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     // (distinct from Solana's block-production "skip" — operator
     // mental model differs). `canonical-skip` is the subset that
     // proved wrong (we voted skip on a slot that became canonical).
+    // Line 1 carries the dataset + outcome split. `leader N` and
+    // `our slot share %` both moved to line 2 (next to the lifecycle
+    // percentiles) so this row stays compact and line 2 has the full
+    // leadership context grouped.
     let line1 = Line::from(vec![
         Span::styled("slots ", theme::label_style()),
         Span::styled(commas(total), theme::value_style()),
-        pipe(),
-        Span::styled("leader ", theme::label_style()),
-        Span::styled(commas(leader), theme::value_style()),
-        // The (X.XX%) suffix that used to live here is now expressed as
-        // `our slot share` on line 2 with an explicit label — see B6.
         pipe(),
         Span::styled("FIN ", theme::label_style()),
         Span::styled(format!("{fin_pct:.1}%"), fin_style),
@@ -140,23 +148,29 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         ),
     ]);
 
-    // Line 2 — lifecycle latency percentiles. p50 in accent so the
-    // headline reads first; tails neutral; max coloured by health band.
-    // Trailing `our slot share` = leader_slots / total_slots over the
-    // log window (window-relative, not stake — see TRIAGE B6).
+    // Line 2 — lifecycle latency percentiles + leadership context.
+    // p50 in accent so the headline reads first; tails neutral; max
+    // coloured by health band. Trailing `leader N` + `our slot share`
+    // grouped together (relocated 2026-05-28 from line 1 to keep line
+    // 1 compact and give the leadership info its own visible cluster).
+    // `our slot share` = leader_slots / total_slots over the log
+    // window (window-relative, not stake — see TRIAGE B6).
     let line2 = Line::from(vec![
         Span::styled("lifecycle ", theme::label_style()),
         Span::styled("p50 ", theme::label_style()),
         Span::styled(format!("{p50} ms"), theme::accent_style()),
         pipe(),
         Span::styled("p95 ", theme::label_style()),
-        Span::styled(format!("{p95} ms"), theme::value_style()),
+        Span::styled(format!("{p95} ms"), p95_style),
         pipe(),
         Span::styled("p99 ", theme::label_style()),
         Span::styled(format!("{p99} ms"), theme::value_style()),
         pipe(),
         Span::styled("max ", theme::label_style()),
         Span::styled(format!("{max_ms} ms"), max_style),
+        pipe(),
+        Span::styled("leader ", theme::label_style()),
+        Span::styled(commas(leader), theme::value_style()),
         pipe(),
         Span::styled("our slot share ", theme::label_style()),
         Span::styled(format!("{:.2}%", pct(leader, total)), theme::value_style()),
@@ -189,32 +203,35 @@ fn render_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     // here; moved into the `slot stats` line 2 (see B6 fix 2026-05-28)
     // so it has actual visibility. This panel now hosts only the
     // latency bands and the legend, with breathing room between.
+    //
+    // Legend uses `Min(12)` (not `Length(12)`) so it grows to absorb
+    // wrap-induced extra lines on narrow terminals — several legend
+    // entries (status, S2N, S2S) have descriptions wider than the
+    // available column and wrap onto a second visual line. With a
+    // fixed `Length(12)` those wraps would push the footer entries
+    // (`vote`, `[c] clear`) off the bottom edge.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // latency content (1 title + 3 bands + 1 p95)
-            Constraint::Fill(1),    // gap
-            Constraint::Length(12), // legend content (1 title + 11 entries)
-            Constraint::Fill(1),    // bottom gap
+            Constraint::Length(1), // top pad — breathing room above "Latency bands:"
+            Constraint::Length(4), // latency content (1 title + 1 spacer + 2 bands)
+            Constraint::Length(1), // gap
+            Constraint::Min(12),   // legend — grows to fit wrap (title + spacer + 12 entries)
         ])
         .split(inner);
 
-    render_latency_reference(app, frame, chunks[0]);
-    render_legend(app.slot_filters, frame, chunks[2]);
+    render_latency_reference(app, frame, chunks[1]);
+    render_legend(app.slot_filters, frame, chunks[3]);
 }
 
-fn render_latency_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
-    // Read from the cached snapshot. p95 only.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let p95 = app.latency.lifecycle_pcts_us.1 / 1000;
-    let p95_healthy = p95 <= theme::LIFECYCLE_WARN_MS as i64;
-
-    // Per-stage bands shown on a single line each so both columns are
-    // visible side-by-side. Threshold values are styled with the
-    // corresponding good/warn/bad colour so the colour↔number mapping
-    // is unambiguous.
+fn render_latency_reference(_app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    // Per-stage threshold bands. The current-value `p95 (lifecycle)`
+    // row that used to live here is now colour-banded in the `slot
+    // stats` KPI line above (`p95 NNN ms` styled by health), so this
+    // section is purely the reference table.
     let lines = vec![
-        section_title("Latency bands  (table colour, by stage)"),
+        section_title("Latency bands:"),
+        Line::from(""),
         Line::from(vec![
             Span::styled("  assembly  ", theme::label_style()),
             Span::styled("≤ 500", theme::good_style()),
@@ -232,26 +249,6 @@ fn render_latency_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("  ·  ", theme::label_style()),
             Span::styled("> 1000", theme::bad_style()),
             Span::styled(" ms", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("  p95 (lifecycle)  ", theme::label_style()),
-            Span::styled(
-                format!("{p95} ms"),
-                if p95_healthy {
-                    theme::good_style()
-                } else {
-                    theme::warn_style()
-                },
-            ),
-            Span::raw(" "),
-            Span::styled(
-                if p95_healthy { "[✓]" } else { "[✗]" },
-                if p95_healthy {
-                    theme::good_style()
-                } else {
-                    theme::warn_style()
-                },
-            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -273,21 +270,26 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
     };
 
     let lines = vec![
-        section_title("Column legend  (table columns + event tags · keys toggle filters)"),
-        // status — four states inline. CSKIP marks a slot where we
-        // voted skip but the slot became canonical (we missed it);
-        // plain SKIP is vote-skip with indeterminate cluster outcome.
+        section_title("Filters available:"),
+        Line::from(""),
+        // ---- status — split across two lines so the four tag
+        // descriptions don't pack into one ~128-char inline string that
+        // wraps unpredictably on narrow panels.
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
             Span::styled("FIN", theme::good_style()),
             Span::styled(" finalized   ", theme::label_style()),
             Span::styled("CSKIP", theme::bad_style()),
-            Span::styled(" we voted skip on a canonical slot   ", theme::label_style()),
+            Span::styled(" we voted skip on canonical", theme::label_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
             Span::styled("SKIP", theme::warn_style()),
-            Span::styled(" we voted skip, cluster outcome unknown   ", theme::label_style()),
+            Span::styled(" we voted skip, outcome unknown   ", theme::label_style()),
             Span::styled("PEND", theme::label_style()),
             Span::styled(" pending", theme::label_style()),
         ]),
+        // status filters
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
             mark(filters.skipped_only),
@@ -304,7 +306,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("CSKIP", theme::bad_style()),
             Span::styled("  only canonical skips (proven via log)", theme::label_style()),
         ]),
-        // path — column shows the CLUSTER's finalization path, not
+        // ---- path — column shows the CLUSTER's finalization path, not
         // ours. Important distinction for CSKIP rows: F there means
         // "we missed a slot the cluster fast-finalized" (worse for us).
         Line::from(vec![
@@ -313,7 +315,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("f ", theme::accent_style()),
             Span::styled("F", theme::good_style()),
             Span::styled(
-                "  cluster fast-finalized (80% Notarize)",
+                "  cluster fast-finalized (80% Notar)",
                 theme::label_style(),
             ),
         ]),
@@ -323,39 +325,28 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("x ", theme::accent_style()),
             Span::styled("S", theme::accent_style()),
             Span::styled(
-                "  cluster slow-finalized (60% Notarize + 60% Finalize)",
+                "  cluster slow-finalized (60% Notar + 60% Final)",
                 theme::label_style(),
             ),
         ]),
-        // ldr — tickable via 'l' to filter our leader slots only
+        // ---- ldr — tickable via 'l' to filter our leader slots only
         Line::from(vec![
             Span::styled("  ldr     ", theme::label_style()),
             mark(filters.leader),
             Span::styled("l ", theme::accent_style()),
             Span::styled("[*]", theme::title_style()),
-            Span::styled(
-                " this validator was leader for the slot",
-                theme::label_style(),
-            ),
+            Span::styled("  this validator was leader", theme::label_style()),
         ]),
-        // events — TCL/S2N/S2S tickable via t/n/s
+        // ---- events — TCL/S2S/S2N tickable via t/p/n. S2S above S2N:
+        // shorter description first; if either wraps, the longer S2N
+        // pushes only against the utility footer below.
         Line::from(vec![
             Span::styled("  events  ", theme::label_style()),
             mark(filters.tcl),
             Span::styled("t ", theme::accent_style()),
             Span::styled("TCL", theme::warn_style()),
             Span::styled(
-                "  TimeoutCrashedLeader — leader missed block window",
-                theme::label_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(TAG_INDENT, theme::label_style()),
-            mark(filters.s2n),
-            Span::styled("n ", theme::accent_style()),
-            Span::styled("S2N", theme::warn_style()),
-            Span::styled(
-                "  SafeToNotar — another block crossed safety threshold; we hedged with NotarizeFallback",
+                "  TimeoutCrashedLeader — leader missed window",
                 theme::label_style(),
             ),
         ]),
@@ -365,11 +356,30 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("p ", theme::accent_style()),
             Span::styled("S2S", theme::warn_style()),
             Span::styled(
-                "  SafeToSkip — slot stake fragmented past threshold; we hedged with SkipFallback",
+                "  SafeToSkip — stake fragmented; hedged SkipFallback",
                 theme::label_style(),
             ),
         ]),
-        // vote-pattern column reference.
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            mark(filters.s2n),
+            Span::styled("n ", theme::accent_style()),
+            Span::styled("S2N", theme::warn_style()),
+            Span::styled(
+                "  SafeToNotar — sibling block past safety; hedged NotarizeFallback",
+                theme::label_style(),
+            ),
+        ]),
+        // ---- footer: clear-all utility, then the static vote-column
+        // reference at the absolute bottom (per 2026-05-28 layout pass).
+        // Blank spacer separates the static reference from the
+        // interactive filter rows above.
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            Span::styled("[c] ", theme::accent_style()),
+            Span::styled("clear all filters", theme::label_style()),
+        ]),
+        Line::from(""),
         Line::from(vec![
             Span::styled("  vote    ", theme::label_style()),
             Span::styled("N", theme::value_style()),
@@ -379,19 +389,16 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("S", theme::value_style()),
             Span::styled(" skip", theme::label_style()),
         ]),
-        // Footer: clear-all hint.
-        Line::from(vec![
-            Span::styled(TAG_INDENT, theme::label_style()),
-            Span::styled("[c] ", theme::accent_style()),
-            Span::styled("clear all filters", theme::label_style()),
-        ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn section_title(s: &str) -> Line<'_> {
+    // 2-space leading indent so the bold heading aligns with the
+    // `  status  ` / `  path    ` etc. data rows below, instead of
+    // jamming flush against the panel border.
     Line::from(Span::styled(
-        s.to_owned(),
+        format!("  {s}"),
         theme::title_style().add_modifier(Modifier::BOLD),
     ))
 }
