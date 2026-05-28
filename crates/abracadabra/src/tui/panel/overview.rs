@@ -7,7 +7,7 @@
 //! severity breakdown, alerts.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
@@ -108,7 +108,7 @@ fn render_file_meta(state: &State, bucket_secs: i64, frame: &mut Frame<'_>, area
         ]));
     }
 
-    paragraph_in_block(frame, area, " overview ", lines);
+    paragraph_in_block(frame, area, " data source ", lines);
 }
 
 fn fmt_bucket(secs: i64) -> String {
@@ -147,17 +147,17 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     };
     let total_slots = state.slots.len() as u64;
 
-    // Bad-skip rate is the headline participation-failure metric.
-    // Numerator: skips we proved landed on canonical slots (direct
-    // Finalized observation OR ancestry-proven via parent chain).
-    // Denominator: total skip votes we cast. If indeterminate skips
-    // exist, the displayed rate is a LOWER BOUND — the legend marks
-    // this with `≥`.
-    let bad_skips = ov
-        .bad_skips_direct
-        .saturating_add(ov.bad_skips_ancestry);
-    let bad_skip_pct = if ov.votes_skip > 0 {
-        bad_skips as f64 * 100.0 / ov.votes_skip as f64
+    // Canonical-skip percentage is the headline participation-failure
+    // metric. Numerator: skips we proved landed on canonical slots
+    // (direct Finalized observation OR ancestry-proven via parent
+    // chain). Denominator: total skip votes we cast. If indeterminate
+    // skips exist, the displayed value is a LOWER BOUND — marked with
+    // a leading `≥`.
+    let canon_skips = ov
+        .canonical_skips_direct
+        .saturating_add(ov.canonical_skips_ancestry);
+    let canon_skip_pct = if ov.votes_skip > 0 {
+        canon_skips as f64 * 100.0 / ov.votes_skip as f64
     } else {
         0.0
     };
@@ -186,14 +186,14 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             "CRITICAL (<60%) — slow path dominant",
         )
     };
-    let bad_skip_style = theme::band_lower_better(
-        bad_skip_pct,
-        theme::BAD_SKIP_WARN_PCT,
-        theme::BAD_SKIP_BAD_PCT,
+    let canon_skip_style = theme::band_lower_better(
+        canon_skip_pct,
+        theme::CANONICAL_SKIP_WARN_PCT,
+        theme::CANONICAL_SKIP_BAD_PCT,
     );
-    let bad_skip_verdict = if bad_skip_pct < theme::BAD_SKIP_WARN_PCT {
+    let canon_skip_verdict = if canon_skip_pct < theme::CANONICAL_SKIP_WARN_PCT {
         "healthy"
-    } else if bad_skip_pct < theme::BAD_SKIP_BAD_PCT {
+    } else if canon_skip_pct < theme::CANONICAL_SKIP_BAD_PCT {
         "DEGRADED"
     } else {
         "CRITICAL"
@@ -211,6 +211,15 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
 
+    // Finalize row shows BOTH fast and slow shares so the operator
+    // sees the whole finalization picture in one line — the slow
+    // share is implicit (100 - fast) but spelling it out matches the
+    // detail in `vote & cert totals` below.
+    let slow_pct = if total_final > 0 {
+        ov.finalized_slow as f64 * 100.0 / total_final as f64
+    } else {
+        0.0
+    };
     let left_lines = vec![
         Line::from(vec![
             Span::styled(format!("  {:<16}", "fast-finalize"), theme::label_style()),
@@ -218,26 +227,31 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
                 format!("{fast_pct:>6.2}%"),
                 theme::value_style().add_modifier(Modifier::BOLD),
             ),
+            Span::styled(" / slow ", theme::label_style()),
+            Span::styled(
+                format!("{slow_pct:.2}%"),
+                Style::default().fg(theme::SPARK_ALT_PATH),
+            ),
             Span::raw("  "),
             Span::styled(fast_mark, fast_style),
             Span::raw(" "),
             Span::styled(fast_verdict, fast_style),
         ]),
         Line::from(vec![
-            Span::styled(format!("  {:<16}", "bad-skip rate"), theme::label_style()),
+            Span::styled(format!("  {:<16}", "canonical-skip"), theme::label_style()),
             Span::styled(
                 format!(
-                    "{}{bad_skip_pct:>5.2}%",
+                    "{}{canon_skip_pct:>5.2}%",
                     if has_indeterminate { "≥" } else { " " }
                 ),
-                bad_skip_style.add_modifier(Modifier::BOLD),
+                canon_skip_style.add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(bad_skip_verdict, bad_skip_style),
+            Span::styled(canon_skip_verdict, canon_skip_style),
             Span::styled(
                 format!(
-                    "  ({} bad of {} skips{})",
-                    commas(bad_skips),
+                    "  ({} canonical of {} vote-skips{})",
+                    commas(canon_skips),
                     commas(ov.votes_skip),
                     if has_indeterminate {
                         format!(" · {} indeterm", commas(ov.indeterminate_skips))
@@ -281,14 +295,14 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             "standstills",
             commas(ov.standstill_events),
             ov.standstill_events == 0,
-            "no liveness issues",
+            "no liveness issues (full log)",
             "STANDSTILL OBSERVED",
         ),
         verdict_line(
             "refresh votes",
             commas(ov.refreshing_votes),
             ov.refreshing_votes == 0,
-            "no standstill recoveries",
+            "no standstill recoveries (full log)",
             "resume activity",
         ),
     ];

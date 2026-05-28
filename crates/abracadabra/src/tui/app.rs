@@ -143,11 +143,11 @@ pub struct SlotFilters {
     pub fast_only: bool,
     pub slow_only: bool,
     pub skipped_only: bool,
-    /// Rows where both `voted_notarize` and `voted_skip` are set. Surfaces
-    /// the protocol-ambiguous case where the validator cast a Notarize
-    /// vote and later a Skip vote on the same slot (vote_pattern rendered
-    /// as `"N+S"` or `"N+F+S"`).
-    pub mixed_votes: bool,
+    /// Rows where the slot is CSKIP (vote-skip on a canonical slot).
+    /// This is the headline operator-facing failure filter — narrower
+    /// than `skipped_only`, which keeps all vote-skip rows including
+    /// the indeterminate bucket.
+    pub canonical_skip_only: bool,
 }
 
 impl SlotFilters {
@@ -159,7 +159,7 @@ impl SlotFilters {
             || self.fast_only
             || self.slow_only
             || self.skipped_only
-            || self.mixed_votes
+            || self.canonical_skip_only
     }
 
     pub const fn matches(self, r: &SlotViewRow) -> bool {
@@ -184,7 +184,7 @@ impl SlotFilters {
         if self.skipped_only && !matches!(r.status, SlotStatus::Skipped) {
             return false;
         }
-        if self.mixed_votes && !(r.voted_notarize && r.voted_skip) {
+        if self.canonical_skip_only && !r.skip_classification.is_canonical_skip() {
             return false;
         }
         true
@@ -203,7 +203,7 @@ pub enum FilterKind {
     FastOnly,
     SlowOnly,
     SkippedOnly,
-    MixedVotes,
+    CanonicalSkipOnly,
 }
 
 const TAB_NAMES: [&str; 6] = [
@@ -448,8 +448,8 @@ impl<'s> App<'s> {
             FilterKind::SkippedOnly => {
                 self.slot_filters.skipped_only = !self.slot_filters.skipped_only;
             }
-            FilterKind::MixedVotes => {
-                self.slot_filters.mixed_votes = !self.slot_filters.mixed_votes;
+            FilterKind::CanonicalSkipOnly => {
+                self.slot_filters.canonical_skip_only = !self.slot_filters.canonical_skip_only;
             }
         }
         self.recompute_slot_indices();
@@ -636,6 +636,13 @@ fn event_loop(
                     KeyCode::Char('s') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::SkippedOnly);
                     }
+                    // `b` for the canonical-skip filter — narrower subset
+                    // of skip-voted slots (only CSKIP, not the indeterminate
+                    // bucket). Mnemonic: "B" for bad/missed slot (the user-
+                    // facing impact); the column label is CSKIP.
+                    KeyCode::Char('b') if app.current_tab == 3 => {
+                        app.toggle_filter(FilterKind::CanonicalSkipOnly);
+                    }
                     KeyCode::Char('l') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::Leader);
                     }
@@ -647,14 +654,6 @@ fn event_loop(
                     // two finalization paths).
                     KeyCode::Char('x') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::SlowOnly);
-                    }
-                    // `m` for mixed-vote rows (N+S / N+F+S). Filters to
-                    // the protocol-ambiguous slots where the validator
-                    // cast both Notarize and Skip on the same slot —
-                    // worth surfacing because vote_pattern renders these
-                    // distinctly and the model permits the combination.
-                    KeyCode::Char('m') if app.current_tab == 3 => {
-                        app.toggle_filter(FilterKind::MixedVotes);
                     }
                     KeyCode::Char('c') if app.current_tab == 3 => {
                         app.clear_filters();
@@ -836,43 +835,6 @@ mod tests {
         let direct = app.slot_rows.iter().filter(|r| r.we_are_leader).count() as u64;
         assert_eq!(app.leader_slot_count, direct);
         assert_eq!(app.leader_slot_count, 3);
-    }
-
-    /// COR-03 follow-up: the `mixed_votes` filter selects rows that
-    /// cast both Notarize and Skip on the same slot — the protocol-
-    /// ambiguous case `vote_pattern` now surfaces as `N+S` / `N+F+S`.
-    #[test]
-    fn mixed_votes_filter_matches_n_and_s_rows() {
-        use crate::model::slot::SkipClassification;
-        use crate::tui::view::SlotViewRow;
-        let mk = |n, s| SlotViewRow {
-            slot: 0,
-            status: SlotStatus::Pending,
-            skip_classification: SkipClassification::NotSkipped,
-            fast: None,
-            we_are_leader: false,
-            assembly_ms: None,
-            consensus_ms: None,
-            lifecycle_ms: None,
-            voted_notarize: n,
-            voted_finalize: false,
-            voted_skip: s,
-            safe_to_notar: false,
-            safe_to_skip: false,
-            crashed_leader: false,
-        };
-        let filters = SlotFilters {
-            mixed_votes: true,
-            ..SlotFilters::default()
-        };
-        // Pure-N or pure-S rows must NOT match.
-        assert!(!filters.matches(&mk(true, false)));
-        assert!(!filters.matches(&mk(false, true)));
-        assert!(!filters.matches(&mk(false, false)));
-        // Both Notarize and Skip set -> matches.
-        assert!(filters.matches(&mk(true, true)));
-        // any_active picks up the new dimension.
-        assert!(filters.any_active());
     }
 
     /// COR-02 regression guard for the math: deriving the per-hour

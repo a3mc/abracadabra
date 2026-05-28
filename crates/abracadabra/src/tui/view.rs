@@ -53,13 +53,17 @@ impl SlotViewRow {
         }
     }
 
-    /// Vote-pattern string for the Slots table. Surfaces every present
-    /// vote — Notarize, Finalize, Skip — concatenated with `+`. The
-    /// `(N, _, S)` and `(N, F, S)` combinations are protocol-ambiguous
-    /// (validator cast both a Notarize and a Skip on the same slot);
-    /// the renderer keeps both flags visible rather than dropping Skip
-    /// so the operator can spot the case. See the `mixed_votes` filter
-    /// on `SlotFilters` for the matching tab-3 filter binding.
+    /// Vote-pattern string for the Slots table.
+    ///
+    /// In normal Alpenglow operation a slot has exactly one of:
+    /// `N`, `N+F`, `S`, or `-` (no vote). The `N+S` / `N+F+S` arms are
+    /// kept as defensive last-resort matchers — they're protocol-
+    /// impossible in current Alpenglow (`try_notar` / `try_skip_window`
+    /// both gate on `vote_history.voted(slot)`; an attempted second
+    /// vote would panic at `vote_history.add_vote`). If one of those
+    /// strings ever surfaces in the TUI, it's a real protocol
+    /// invariant break and the validator likely already panicked
+    /// before our log captured it.
     pub const fn vote_pattern(&self) -> &'static str {
         match (self.voted_notarize, self.voted_finalize, self.voted_skip) {
             (true, true, true) => "N+F+S",
@@ -76,10 +80,11 @@ impl SlotViewRow {
     /// For skipped slots, the `SkipClassification` discriminator
     /// determines the operator-visible label:
     ///
-    ///   - `BSKIP` — we voted skip on a slot the cluster reached
-    ///     canonical agreement on (real participation failure).
+    ///   - `CSKIP` — we voted skip on a slot that became canonical
+    ///     (real participation failure).
     ///   - `SKIP`  — we voted skip; cluster outcome indeterminate from
-    ///     log alone (could be a right skip OR an unverified bad skip).
+    ///     log alone (could be a right skip OR an unverified
+    ///     canonical skip).
     ///
     /// Until Stage 2 RPC enrichment lands, plain `SKIP` is the
     /// indeterminate bucket — NOT a claim of correctness. The legend
@@ -88,17 +93,27 @@ impl SlotViewRow {
         match self.status {
             SlotStatus::FastFinalized | SlotStatus::SlowFinalized => "FIN",
             SlotStatus::Skipped => match self.skip_classification {
-                SkipClassification::Bad(_) => "BSKIP",
+                SkipClassification::CanonicalSkip(_) => "CSKIP",
                 _ => "SKIP",
             },
             SlotStatus::Pending => "PEND",
         }
     }
 
+    /// Path column — the CLUSTER's finalization path, not ours.
+    ///
+    ///   F  cluster fast-finalized (80% Notarize cert)
+    ///   S  cluster slow-finalized (60% Notarize + 60% Finalize)
+    ///   ` ` no Finalized event observed for this slot
+    ///
+    /// For CSKIP rows this column still reflects the cluster outcome —
+    /// "we voted skip on a slot the cluster easily fast-finalized" is
+    /// a different diagnostic from "we voted skip on a slot the
+    /// cluster also struggled with."
     pub const fn fast_str(&self) -> &'static str {
         match (self.status, self.fast) {
             (SlotStatus::FastFinalized, _) | (_, Some(true)) => "F",
-            (SlotStatus::SlowFinalized, _) | (_, Some(false)) => "s",
+            (SlotStatus::SlowFinalized, _) | (_, Some(false)) => "S",
             _ => " ",
         }
     }

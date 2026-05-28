@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use time::OffsetDateTime;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
-use crate::model::slot::{BadSkipEvidence, SkipClassification};
+use crate::model::slot::{CanonicalSkipEvidence, SkipClassification};
 use crate::model::state::{LogIssueGroup, State, MAX_GROUP_TIMESTAMPS};
 use crate::parser::line::Level;
 use crate::parser::{Event, EventKind};
@@ -317,9 +317,10 @@ fn record_log_pattern<F: FnOnce() -> String>(
 
 const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_slots";
 
-/// Stage 1 bad-skip classifier (pure log; no RPC).
+/// Stage 1 canonical-skip classifier (pure log; no RPC).
 ///
-/// For each slot where we cast a Skip vote, prove `bad` from log alone via:
+/// For each slot where we cast a Skip vote, prove the slot was
+/// canonical from log alone via:
 ///
 ///   (a) **direct evidence** — we observed a `Finalized` event for this
 ///       slot ourselves. The cluster reached a finalization cert here.
@@ -328,9 +329,9 @@ const CLUSTER_SLOTS_MODULE: &str = "solana_core::cluster_slots_service::cluster_
 ///       this slot. The cluster placed this slot on the rooted chain.
 ///
 /// Otherwise the slot is `Indeterminate` — could be a right-skip
-/// (cluster also skipped) or an unverified bad-skip. Stage 2 (RPC
-/// enrichment, future work) would tighten this further by querying
-/// `getBlocks` for ground truth.
+/// (cluster also skipped) or an unverified canonical skip. Stage 2
+/// (RPC enrichment, future work) would tighten this further by
+/// querying `getBlocks` for ground truth.
 ///
 /// Empirical validation: on 5 logs spanning ~5 days, this classifier
 /// matched RPC ground truth 100% on the verifiable subset. See
@@ -362,29 +363,45 @@ pub fn classify_skips(state: &mut State) {
         }
     }
 
-    // Step 3: classify each slot record. `NotSkipped` is the default.
-    let mut bad_direct: u64 = 0;
-    let mut bad_ancestry: u64 = 0;
+    // Step 3: classify each slot record AND collect unique-slot counts
+    // for the headline KPIs (since per-event counters in `OverallStats`
+    // double-count canonical-skip slots which appear in both the
+    // `votes_skip` and `finalized_*` buckets).
+    let mut canon_direct: u64 = 0;
+    let mut canon_ancestry: u64 = 0;
     let mut indeterminate: u64 = 0;
+    let mut finalized_slot_count: u64 = 0;
+    let mut skipped_slot_count: u64 = 0;
+    let mut pending_slot_count: u64 = 0;
     for (slot, rec) in state.slots.iter_mut() {
         if rec.voted_skip_at.is_none() {
             rec.skip_classification = SkipClassification::NotSkipped;
-            continue;
-        }
-        rec.skip_classification = if rec.finalized_at.is_some() {
-            bad_direct = bad_direct.saturating_add(1);
-            SkipClassification::Bad(BadSkipEvidence::DirectFinalize)
-        } else if ancestors.contains(slot) {
-            bad_ancestry = bad_ancestry.saturating_add(1);
-            SkipClassification::Bad(BadSkipEvidence::Ancestry)
         } else {
-            indeterminate = indeterminate.saturating_add(1);
-            SkipClassification::Indeterminate
-        };
+            skipped_slot_count = skipped_slot_count.saturating_add(1);
+            rec.skip_classification = if rec.finalized_at.is_some() {
+                canon_direct = canon_direct.saturating_add(1);
+                SkipClassification::CanonicalSkip(CanonicalSkipEvidence::DirectFinalize)
+            } else if ancestors.contains(slot) {
+                canon_ancestry = canon_ancestry.saturating_add(1);
+                SkipClassification::CanonicalSkip(CanonicalSkipEvidence::Ancestry)
+            } else {
+                indeterminate = indeterminate.saturating_add(1);
+                SkipClassification::Indeterminate
+            };
+        }
+        if rec.finalized_at.is_some() {
+            finalized_slot_count = finalized_slot_count.saturating_add(1);
+        }
+        if rec.finalized_at.is_none() && rec.voted_skip_at.is_none() {
+            pending_slot_count = pending_slot_count.saturating_add(1);
+        }
     }
-    state.overall.bad_skips_direct = bad_direct;
-    state.overall.bad_skips_ancestry = bad_ancestry;
+    state.overall.canonical_skips_direct = canon_direct;
+    state.overall.canonical_skips_ancestry = canon_ancestry;
     state.overall.indeterminate_skips = indeterminate;
+    state.overall.finalized_slot_count = finalized_slot_count;
+    state.overall.skipped_slot_count = skipped_slot_count;
+    state.overall.pending_slot_count = pending_slot_count;
 }
 
 /// Derived alerts computed after the stream has been fully ingested.

@@ -14,7 +14,7 @@
 use time::{Duration, OffsetDateTime};
 
 use crate::model::analysis;
-use crate::model::slot::SlotRecord;
+use crate::model::slot::{SkipClassification, SlotRecord};
 use crate::model::state::State;
 
 /// Per-window statistics. Times in microseconds where applicable so we can
@@ -40,6 +40,20 @@ pub struct WindowStats {
 
     pub fast_finalize_pct: f64,
     pub vote_skip_rate_pct: f64,
+    /// Total vote-skips in window (denominator for canonical-skip %).
+    pub vote_skips: u64,
+    /// Subset of `vote_skips` proven to have landed on canonical slots
+    /// by the Stage 1 classifier (direct Finalized observation or
+    /// ancestry walk). The operator-facing failure indicator.
+    pub canonical_skips: u64,
+    /// Vote-skips with no log-only evidence of cluster outcome. Used
+    /// to render the canonical-skip percentage as a lower bound
+    /// (`≥ X%`) when non-zero — same convention as the headline strip.
+    pub indeterminate_skips: u64,
+    /// `canonical_skips / vote_skips * 100`. Zero when `vote_skips`
+    /// is zero. The `indeterminate_skips > 0` case turns this into a
+    /// lower bound at the renderer.
+    pub canonical_skip_pct: f64,
     pub crashed_leaders: u64,
     pub fragmentation: u64,
 
@@ -83,11 +97,33 @@ fn compute_one(
     label: &'static str,
     duration: Duration,
 ) -> WindowStats {
-    // Collect slot records whose first_shred_at lies in [start, end).
+    // Anchor each slot to the FIRST available timestamp from this
+    // priority chain:
+    //
+    //   first_shred_at → voted_notarize_at → voted_skip_at →
+    //   timeout_crashed_leader_at
+    //
+    // Using `first_shred_at` alone (the previous behaviour) silently
+    // dropped skip-cascade slots — slots where TCL fired and
+    // `try_skip_window` cast Skip without our node ever observing a
+    // shred. Those slots have `first_shred_at == None` but are real
+    // log activity (we cast Skip for them), so the vote-skip and
+    // canonical-skip counts went off by the cascade-slot count and
+    // the windowed `vote-skip rate %` no longer matched the headline.
+    //
+    // The same fall-back chain is used by `model/buckets.rs` for the
+    // time-series tab; keeping them aligned ensures the two views
+    // disagree about nothing.
+    let anchor = |r: &SlotRecord| -> Option<OffsetDateTime> {
+        r.first_shred_at
+            .or(r.voted_notarize_at)
+            .or(r.voted_skip_at)
+            .or(r.timeout_crashed_leader_at)
+    };
     let in_window: Vec<&SlotRecord> = state
         .slots
         .values()
-        .filter(|r| r.first_shred_at.is_some_and(|t| t >= start && t < end))
+        .filter(|r| anchor(r).is_some_and(|t| t >= start && t < end))
         .collect();
 
     let slot_count = in_window.len() as u64;
@@ -127,6 +163,8 @@ fn compute_one(
     let mut fast = 0u64;
     let mut slow = 0u64;
     let mut skip = 0u64;
+    let mut canonical = 0u64;
+    let mut indeterminate = 0u64;
     let mut crashed = 0u64;
     let mut s2n = 0u64;
     let mut s2s = 0u64;
@@ -138,6 +176,15 @@ fn compute_one(
         }
         if r.voted_skip_at.is_some() {
             skip += 1;
+            // Stage 1 classifier (populated by aggregator::classify_skips
+            // before window stats are computed) partitions skip-voted
+            // slots into canonical / indeterminate / right-skip (the
+            // last only appears once Stage 2 RPC enrichment lands).
+            match r.skip_classification {
+                SkipClassification::CanonicalSkip(_) => canonical += 1,
+                SkipClassification::Indeterminate => indeterminate += 1,
+                SkipClassification::NotSkipped => {}
+            }
         }
         if r.timeout_crashed_leader_at.is_some() {
             crashed += 1;
@@ -157,6 +204,11 @@ fn compute_one(
     };
     let vote_skip_rate_pct = if slot_count > 0 {
         skip as f64 * 100.0 / slot_count as f64
+    } else {
+        0.0
+    };
+    let canonical_skip_pct = if skip > 0 {
+        canonical as f64 * 100.0 / skip as f64
     } else {
         0.0
     };
@@ -184,6 +236,10 @@ fn compute_one(
         slot_duration_p95_us: analysis::percentile(&durations, 0.95).unwrap_or(0),
         fast_finalize_pct,
         vote_skip_rate_pct,
+        vote_skips: skip,
+        canonical_skips: canonical,
+        indeterminate_skips: indeterminate,
+        canonical_skip_pct,
         crashed_leaders: crashed,
         fragmentation: s2n.saturating_add(s2s),
         assembly_p50_us: analysis::percentile(&assembly, 0.50).unwrap_or(0),

@@ -65,19 +65,35 @@ pub struct OverallStats {
     // Skip classification (populated by aggregator::classify_skips).
     //
     // `votes_skip` above counts every "Voting skip for SLOT" event we
-    // observed. These three counters partition that into bad-skip
-    // evidence categories — operator-facing failure indicator.
+    // observed. These three counters partition that into evidence
+    // categories — operator-facing failure indicator.
     /// We voted skip on a slot we also observed `Finalized` for. The
     /// most direct evidence of participation failure.
-    pub bad_skips_direct: u64,
+    pub canonical_skips_direct: u64,
     /// We voted skip on a slot that is an ancestor of a finalized slot
     /// (parent chain from a finalized descendant reaches this slot).
     /// Equally definitive — the slot is on the rooted chain.
-    pub bad_skips_ancestry: u64,
+    pub canonical_skips_ancestry: u64,
     /// We voted skip on a slot with no canonical-status evidence in the
-    /// log. Could be a right skip or an unverified bad skip — Stage 1
-    /// alone cannot say.
+    /// log. Could be a right skip or an unverified canonical skip —
+    /// Stage 1 alone cannot say.
     pub indeterminate_skips: u64,
+
+    // Unique-slot counts (populated by classify_skips). These exist
+    // alongside the per-event counters above because the event counts
+    // can double-count: a slot with both `voted_skip_at` and
+    // `finalized_at` set (a canonical skip) contributes to BOTH
+    // `votes_skip` (event) AND `finalized_fast/slow` (event). The
+    // subtraction formula `total - fin - skip` therefore underflows
+    // on canonical-skip slots and saturates PEND to a misleading zero.
+    /// Slots with `finalized_at` set (unique).
+    pub finalized_slot_count: u64,
+    /// Slots with `voted_skip_at` set (unique).
+    pub skipped_slot_count: u64,
+    /// Slots with neither `finalized_at` nor `voted_skip_at` — the
+    /// honest pending count. May still carry partial signal (we
+    /// observed shreds, voted notarize, etc.).
+    pub pending_slot_count: u64,
 
     // Cluster cert outcomes (events we received).
     pub block_notarized_count: u64,

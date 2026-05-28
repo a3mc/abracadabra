@@ -34,12 +34,6 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let header = build_header(stats);
     let rows = build_rows(stats);
 
-    // Constraints: 1 label column + 1 per window.
-    let mut constraints = vec![Constraint::Length(24)];
-    for _ in stats {
-        constraints.push(Constraint::Length(11));
-    }
-
     // Title carries the only piece of "duration" info that's actually useful —
     // the log's total length. Per-window durations are implicit from the
     // header column names (24h / 12h / 6h / 3h / 1h).
@@ -47,16 +41,37 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .first()
         .map_or_else(String::new, |s| humanize_dur(s.duration.whole_seconds()));
     let title = format!(" rolling-window comparison — log spans {log_span} ");
+
+    // Render the outer border + title across the FULL panel area so the
+    // tab still occupies the screen visually. The table then renders
+    // into a padded inner rectangle: 3 columns of left padding, 1 row
+    // of top breathing room. This avoids the "table glued to the
+    // top-left corner with a wasteland on the right" effect when the
+    // terminal is wide.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(theme::title_style());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let padded = Rect {
+        x: inner.x.saturating_add(3),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(3),
+        height: inner.height.saturating_sub(1),
+    };
+
+    // Constraints: 1 label column + 1 per window.
+    let mut constraints = vec![Constraint::Length(24)];
+    for _ in stats {
+        constraints.push(Constraint::Length(11));
+    }
+
     let table = Table::new(rows, constraints)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_style(theme::title_style()),
-        )
         .style(Style::default().fg(theme::FG));
-    frame.render_widget(table, area);
+    frame.render_widget(table, padded);
 }
 
 fn build_header<'a>(stats: &[WindowStats]) -> Row<'a> {
@@ -83,11 +98,19 @@ fn build_rows<'a>(stats: &[WindowStats]) -> Vec<Row<'a>> {
     // The `duration` row was here; dropped because window column headers
     // (24h, 12h, ...) duplicate it. Total log span moved to the title.
 
+    // Empty spacer right after the column-header row so `metric / all /
+    // 24h / …` doesn't visually fuse with the first data row.
+    rows.push(spacer());
+
     rows.push(metric_row("slot count", stats, |s| commas(s.slot_count)));
     rows.push(metric_row("slot rate (slots/s)", stats, |s| {
         format!("{:.2}", s.slot_rate_per_sec)
     }));
-    rows.push(metric_row("slot dur p50 (ms)", stats, |s| {
+    // p50 is the headline-per-family row across the whole table — tinted
+    // cyan via `highlighted_metric_row` so a quick scan picks it out from
+    // its p95 sibling. Slot duration's p50 belongs to that convention
+    // too (was previously rendered as a plain row by oversight).
+    rows.push(highlighted_metric_row("slot dur p50 (ms)", stats, |s| {
         format!("{}", s.slot_duration_p50_us / 1000)
     }));
     rows.push(metric_row("slot dur p95 (ms)", stats, |s| {
@@ -104,7 +127,7 @@ fn build_rows<'a>(stats: &[WindowStats]) -> Vec<Row<'a>> {
         );
         (v, style)
     }));
-    rows.push(metric_row_styled("vote skip rate %", stats, |s| {
+    rows.push(metric_row_styled("vote-skip rate %", stats, |s| {
         let v = format!("{:.2}%", s.vote_skip_rate_pct);
         let style = theme::band_lower_better(
             s.vote_skip_rate_pct,
@@ -113,6 +136,29 @@ fn build_rows<'a>(stats: &[WindowStats]) -> Vec<Row<'a>> {
         );
         (v, style)
     }));
+    // Operator-facing failure indicator. Lower-bound marker ("≥") prefixed
+    // when the indeterminate bucket is non-zero — same convention as the
+    // headline strip and Overview-tab health row.
+    rows.push(metric_row_styled("canonical-skip %", stats, |s| {
+        let bound = if s.indeterminate_skips > 0 { "≥" } else { "" };
+        let v = format!("{bound}{:.2}%", s.canonical_skip_pct);
+        let style = theme::band_lower_better(
+            s.canonical_skip_pct,
+            theme::CANONICAL_SKIP_WARN_PCT,
+            theme::CANONICAL_SKIP_BAD_PCT,
+        );
+        (v, style)
+    }));
+    rows.push(metric_row("canonical skips", stats, |s| {
+        commas(s.canonical_skips)
+    }));
+    rows.push(metric_row("indeterminate", stats, |s| {
+        commas(s.indeterminate_skips)
+    }));
+    rows.push(metric_row("vote-skips (total)", stats, |s| {
+        commas(s.vote_skips)
+    }));
+    rows.push(spacer());
     rows.push(metric_row("crashed leaders", stats, |s| {
         commas(s.crashed_leaders)
     }));

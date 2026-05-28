@@ -24,7 +24,7 @@ pub enum SlotStatus {
 
 /// How we know a slot was canonical even though we voted skip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BadSkipEvidence {
+pub enum CanonicalSkipEvidence {
     /// We observed a `Finalized` event for this slot in our own log.
     /// Definitive — the cluster reached a finalization cert here.
     DirectFinalize,
@@ -36,28 +36,33 @@ pub enum BadSkipEvidence {
 
 /// Per-slot skip classification — orthogonal to `SlotStatus`.
 ///
-/// Stage 1 (log only) produces `NotSkipped`, `Bad(...)`, or
+/// Stage 1 (log only) produces `NotSkipped`, `CanonicalSkip(...)`, or
 /// `Indeterminate`. Stage 2 (RPC enrichment, not yet implemented) will
-/// additionally produce `Right` for skips confirmed non-canonical via
-/// `getBlocks`, and may upgrade `Indeterminate` to `Bad` or `Right`.
+/// additionally produce `RightSkip` for skips confirmed non-canonical
+/// via `getBlocks`, and may upgrade `Indeterminate` accordingly.
+///
+/// "Canonical skip" = we voted skip on a slot that became canonical.
+/// The slot is canonical; our skip vote landed on it incorrectly. The
+/// term is operator-facing; user docs and the TUI use the same wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipClassification {
     /// This node did not cast a skip vote for this slot.
     NotSkipped,
-    /// We voted skip on a slot the cluster reached canonical agreement
-    /// on. This is a real participation failure.
-    Bad(BadSkipEvidence),
+    /// We voted skip on a slot that became canonical (real participation
+    /// failure). Evidence describes how we know the slot is canonical.
+    CanonicalSkip(CanonicalSkipEvidence),
     /// We voted skip and no evidence from the log proves the slot's
     /// canonical status either way. Could be a right skip (cluster
-    /// also skipped) or an unverified bad skip — log alone cannot say.
-    /// Resolvable via Stage 2 RPC enrichment when available.
+    /// also skipped) or an unverified canonical skip — log alone
+    /// cannot say. Resolvable via Stage 2 RPC enrichment.
     Indeterminate,
 }
 
 impl SkipClassification {
-    /// True iff this is a confirmed bad skip via either evidence type.
-    pub const fn is_bad(&self) -> bool {
-        matches!(self, Self::Bad(_))
+    /// True iff this is a confirmed canonical skip via either evidence
+    /// type. This is the operator-facing "did we fail" indicator.
+    pub const fn is_canonical_skip(&self) -> bool {
+        matches!(self, Self::CanonicalSkip(_))
     }
 }
 

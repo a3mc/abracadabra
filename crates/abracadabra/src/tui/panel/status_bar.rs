@@ -72,8 +72,8 @@ fn render_left(
             Span::styled(" leader  ", theme::label_style()),
             Span::styled("f/x/s", theme::title_style()),
             Span::styled(" fast/slow/skip  ", theme::label_style()),
-            Span::styled("m", theme::title_style()),
-            Span::styled(" mixed-votes  ", theme::label_style()),
+            Span::styled("b", theme::title_style()),
+            Span::styled(" canonical-skip  ", theme::label_style()),
             Span::styled("c", theme::title_style()),
             Span::styled(" clear  ", theme::label_style()),
         ]);

@@ -169,19 +169,22 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         },
     );
     let total_slots = state.slots.len() as u64;
-    // Bad-skip rate is the operator-facing failure indicator. Numerator
-    // is skips we proved landed on canonical slots (Stage 1 classifier);
-    // denominator is total skips we cast. When indeterminate skips exist
-    // the displayed number is a lower bound — marked with `>=`.
-    let bad_skips = ov.bad_skips_direct.saturating_add(ov.bad_skips_ancestry);
-    let bad_skip_pct = pct(bad_skips, ov.votes_skip);
+    // Canonical-skip percentage is the operator-facing failure
+    // indicator. Numerator is vote-skips we proved landed on canonical
+    // slots (Stage 1 classifier); denominator is total vote-skips we
+    // cast. When indeterminate skips exist the displayed number is a
+    // lower bound — marked with `>=`.
+    let canon_skips = ov
+        .canonical_skips_direct
+        .saturating_add(ov.canonical_skips_ancestry);
+    let canon_skip_pct = pct(canon_skips, ov.votes_skip);
     let bound_marker = if ov.indeterminate_skips > 0 { ">=" } else { "  " };
     println!(
-        "  {:<18} {}{:>5.2}%   {} bad of {} skips{}",
-        "bad-skip rate",
+        "  {:<18} {}{:>5.2}%   {} canonical of {} vote-skips{}",
+        "canonical-skip",
         bound_marker,
-        bad_skip_pct,
-        commas(bad_skips),
+        canon_skip_pct,
+        commas(canon_skips),
         commas(ov.votes_skip),
         if ov.indeterminate_skips > 0 {
             format!(" ({} indeterminate)", commas(ov.indeterminate_skips))
@@ -191,8 +194,8 @@ pub fn print_summary(state: &State, stats: &RunStats) {
     );
     let skip_pct = pct(ov.votes_skip, total_slots);
     println!(
-        "  {:<18} {:>6}   {} of {} slots (raw — see bad-skip rate above)",
-        "vote skip rate",
+        "  {:<18} {:>6}   {} of {} slots (raw — see canonical-skip above)",
+        "vote-skip",
         format!("{skip_pct:.2}%"),
         commas(ov.votes_skip),
         commas(total_slots),

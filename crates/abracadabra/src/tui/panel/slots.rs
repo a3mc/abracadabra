@@ -48,22 +48,39 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let state = app.state;
     let ov = &state.overall;
     let total = state.slots.len() as u64;
+    // Use unique-slot counts (populated by classify_skips) instead of
+    // per-event counters. Event counts double-count slots that are
+    // both Finalized and voted-skip (canonical skips). The subtraction
+    // formula `total - fin - skip` would saturate PEND to a misleading
+    // zero — see audit/2026-05-27-tui-vs-alpenglow/TRIAGE.md item B7.
+    let fin = ov.finalized_slot_count;
+    let skip = ov.skipped_slot_count;
+    let pend = ov.pending_slot_count;
+    let canon = ov
+        .canonical_skips_direct
+        .saturating_add(ov.canonical_skips_ancestry);
+    // Fast-finalize share computed from event counts (these don't
+    // double-count between fast and slow; a slot has one or the other).
     let fin_fast = ov.finalized_fast;
     let fin_slow = ov.finalized_slow;
-    let fin = fin_fast.saturating_add(fin_slow);
-    let skip = ov.votes_skip;
-    let pend = total.saturating_sub(fin).saturating_sub(skip);
+    let fin_events = fin_fast.saturating_add(fin_slow);
     // Pre-counted once in `App::new` to avoid a full BTreeMap scan per frame.
     let leader = app.leader_slot_count;
 
     let fin_pct = pct(fin, total);
-    let fast_share = pct(fin_fast, fin);
+    let fast_share = pct(fin_fast, fin_events);
     let skip_pct = pct(skip, total);
+    let canon_pct = pct(canon, skip);
     let fin_style = theme::band_higher_better(fin_pct, theme::FIN_GOOD_PCT, theme::FIN_WARN_PCT);
     let skip_style = theme::band_lower_better(
         skip_pct,
         theme::VOTE_SKIP_WARN_PCT,
         theme::VOTE_SKIP_BAD_PCT,
+    );
+    let canon_style = theme::band_lower_better(
+        canon_pct,
+        theme::CANONICAL_SKIP_WARN_PCT,
+        theme::CANONICAL_SKIP_BAD_PCT,
     );
 
     // Read pre-computed lifecycle percentiles instead of re-sorting
@@ -82,6 +99,11 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let pipe = || Span::styled("  |  ", theme::label_style());
 
     // Line 1 — dataset identity & outcome split.
+    //
+    // `vote-skip` is how often this validator cast a Skip vote
+    // (distinct from Solana's block-production "skip" — operator
+    // mental model differs). `canonical-skip` is the subset that
+    // proved wrong (we voted skip on a slot that became canonical).
     let line1 = Line::from(vec![
         Span::styled("slots ", theme::label_style()),
         Span::styled(commas(total), theme::value_style()),
@@ -100,8 +122,12 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             theme::label_style(),
         ),
         pipe(),
-        Span::styled("SKIP ", theme::label_style()),
+        Span::styled("vote-skip ", theme::label_style()),
         Span::styled(format!("{skip_pct:.1}%"), skip_style),
+        Span::styled(format!(" ({} slots, ", commas(skip)), theme::label_style()),
+        Span::styled("canonical-skip ", theme::label_style()),
+        Span::styled(format!("{canon_pct:.2}%"), canon_style),
+        Span::styled(format!(" = {} slots)", commas(canon)), theme::label_style()),
         pipe(),
         Span::styled("PEND ", theme::label_style()),
         Span::styled(
@@ -242,13 +268,14 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
 
     let lines = vec![
         section_title("Column legend  (table columns + event tags · keys toggle filters)"),
-        // status — four states inline. BSKIP is the new bad-skip marker;
-        // plain SKIP is local-skip with indeterminate cluster outcome.
+        // status — four states inline. CSKIP marks a slot where we
+        // voted skip but the slot became canonical (we missed it);
+        // plain SKIP is vote-skip with indeterminate cluster outcome.
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
             Span::styled("FIN", theme::good_style()),
             Span::styled(" finalized   ", theme::label_style()),
-            Span::styled("BSKIP", theme::bad_style()),
+            Span::styled("CSKIP", theme::bad_style()),
             Span::styled(" we voted skip on a canonical slot   ", theme::label_style()),
             Span::styled("SKIP", theme::warn_style()),
             Span::styled(" we voted skip, cluster outcome unknown   ", theme::label_style()),
@@ -261,17 +288,26 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("s ", theme::accent_style()),
             Span::styled("SKIP", theme::warn_style()),
             Span::styled("+", theme::label_style()),
-            Span::styled("BSKIP", theme::bad_style()),
-            Span::styled("  filter to skip-voted slots (both buckets)", theme::label_style()),
+            Span::styled("CSKIP", theme::bad_style()),
+            Span::styled("  all vote-skip rows (both buckets)", theme::label_style()),
         ]),
-        // path — F is tickable via 'f' to filter fast-finalized only
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            mark(filters.canonical_skip_only),
+            Span::styled("b ", theme::accent_style()),
+            Span::styled("CSKIP", theme::bad_style()),
+            Span::styled("  only canonical skips (proven via log)", theme::label_style()),
+        ]),
+        // path — column shows the CLUSTER's finalization path, not
+        // ours. Important distinction for CSKIP rows: F there means
+        // "we missed a slot the cluster fast-finalized" (worse for us).
         Line::from(vec![
             Span::styled("  path    ", theme::label_style()),
             mark(filters.fast_only),
             Span::styled("f ", theme::accent_style()),
             Span::styled("F", theme::good_style()),
             Span::styled(
-                "  fast-finalized — FastFinalize cert (≥80%)",
+                "  cluster fast-finalized (80% Notarize)",
                 theme::label_style(),
             ),
         ]),
@@ -279,9 +315,9 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(TAG_INDENT, theme::label_style()),
             mark(filters.slow_only),
             Span::styled("x ", theme::accent_style()),
-            Span::styled("s", theme::warn_style()),
+            Span::styled("S", theme::accent_style()),
             Span::styled(
-                "  slow-finalized — Notarize + Finalize 2-round",
+                "  cluster slow-finalized (60% Notarize + 60% Finalize)",
                 theme::label_style(),
             ),
         ]),
@@ -327,10 +363,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
                 theme::label_style(),
             ),
         ]),
-        // vote-pattern column reference. N+S and N+F+S are protocol-
-        // ambiguous (validator cast both Notarize and Skip on the same
-        // slot); rendered explicitly so the operator can spot them, and
-        // filterable via `m`.
+        // vote-pattern column reference.
         Line::from(vec![
             Span::styled("  vote    ", theme::label_style()),
             Span::styled("N", theme::value_style()),
@@ -339,16 +372,6 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(" finalize  ", theme::label_style()),
             Span::styled("S", theme::value_style()),
             Span::styled(" skip", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled(TAG_INDENT, theme::label_style()),
-            mark(filters.mixed_votes),
-            Span::styled("m ", theme::accent_style()),
-            Span::styled("N+S / N+F+S", theme::bad_style()),
-            Span::styled(
-                "  mixed votes — Notarize AND Skip on same slot",
-                theme::label_style(),
-            ),
         ]),
         // Footer: clear-all hint.
         Line::from(vec![
@@ -532,8 +555,8 @@ fn filter_chips(f: SlotFilters) -> String {
     if f.skipped_only {
         chips.push("skipped");
     }
-    if f.mixed_votes {
-        chips.push("mixed-votes");
+    if f.canonical_skip_only {
+        chips.push("canonical-skip");
     }
     if chips.is_empty() {
         String::new()
@@ -545,15 +568,25 @@ fn filter_chips(f: SlotFilters) -> String {
 fn row_for(s: &SlotViewRow) -> Row<'_> {
     // Color-banding for the status cell:
     //   FastFinalized / SlowFinalized → green (healthy outcome)
-    //   Skipped + Bad (verified bad skip) → red (real failure)
+    //   Skipped + CanonicalSkip (proven bad) → red (real failure)
     //   Skipped + Indeterminate/NotSkipped → yellow (unverified;
-    //                                              could be right or bad)
+    //                                              could be right or canonical)
     //   Pending → gray (no terminal state yet)
     let status_style = match s.status {
         SlotStatus::FastFinalized | SlotStatus::SlowFinalized => theme::good_style(),
-        SlotStatus::Skipped if s.skip_classification.is_bad() => theme::bad_style(),
+        SlotStatus::Skipped if s.skip_classification.is_canonical_skip() => theme::bad_style(),
         SlotStatus::Skipped => theme::warn_style(),
         SlotStatus::Pending => theme::label_style(),
+    };
+    // Path column gets its own coloring so fast vs slow are visually
+    // distinct (the status column collapses both into "FIN" + green).
+    // Slow uses accent (cyan) — still successful, but not optimal,
+    // and avoids overloading yellow which already marks SKIP / S2N
+    // / S2S elsewhere.
+    let path_style = match (s.status, s.fast) {
+        (SlotStatus::FastFinalized, _) | (_, Some(true)) => theme::good_style(),
+        (SlotStatus::SlowFinalized, _) | (_, Some(false)) => theme::accent_style(),
+        _ => theme::label_style(),
     };
     // Per-stage health bands. `None` (pending) -> gray so we don't
     // accidentally paint missing data green.
@@ -569,7 +602,7 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
     Row::new(vec![
         Line::from(Span::styled(commas(s.slot), theme::value_style())),
         Line::from(Span::styled(s.status_str(), status_style)),
-        Line::from(Span::styled(s.fast_str(), status_style)),
+        Line::from(Span::styled(s.fast_str(), path_style)),
         Line::from(Span::styled(leader_mark, theme::title_style())),
         Line::from(Span::styled(fmt_ms(s.assembly_ms), asm_style)),
         Line::from(Span::styled(fmt_ms(s.consensus_ms), theme::value_style())),
