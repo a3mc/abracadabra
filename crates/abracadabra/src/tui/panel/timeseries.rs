@@ -32,6 +32,11 @@ use crate::model::buckets::TimeBuckets;
 use crate::tui::theme;
 use crate::tui::widget::{commas, fit_to_width};
 
+/// Input tuple for a paired secondary series on a `CardSpec`:
+/// `(label, color, per-bucket values)`. Aliased to keep the
+/// `with_secondary` signature readable (clippy::type_complexity).
+type SecondarySeriesInput = (&'static str, Color, Vec<u64>);
+
 #[derive(Debug, Clone, Copy)]
 enum Kind {
     /// Per-bucket count (events). Stats line shows total / peak / avg.
@@ -90,7 +95,7 @@ impl Metric {
         kind: Kind,
         color: Color,
         data: Vec<u64>,
-        secondary: Option<(&'static str, Color, Vec<u64>)>,
+        secondary: Option<SecondarySeriesInput>,
     ) -> Self {
         let (deviation, dev_peak) = baseline_subtract(&data);
         let secondary = secondary.map(|(sec_label, sec_color, sec_data)| {
@@ -249,12 +254,13 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
                 Span::styled(commas(total), theme::value_style()),
             ];
             if let Some(sec) = &m.secondary {
-                spans.push(Span::styled(format!("  {} ", sec.label), theme::label_style()));
+                spans.push(Span::styled(
+                    format!("  {} ", sec.label),
+                    theme::label_style(),
+                ));
                 spans.push(Span::styled(
                     commas(sec.total),
-                    Style::default()
-                        .fg(sec.color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(sec.color).add_modifier(Modifier::BOLD),
                 ));
             }
             spans.extend([
@@ -531,13 +537,13 @@ struct MirrorSparkline<'a> {
 impl Widget for MirrorSparkline<'_> {
     #[allow(clippy::cast_possible_truncation)]
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
         // Bottom-anchored eighths character set — same as ratatui's
         // `Sparkline`. Used directly for the bottom-up side and via
         // the bg/fg trick for the top-down side.
         const BARS: [&str; 9] = ["", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
 
         let h = area.height as usize;
         // Split the area in half. With odd height the bottom side gets

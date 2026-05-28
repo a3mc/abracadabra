@@ -395,7 +395,7 @@ pub fn classify_skips(state: &mut State) {
     let mut finalized_slot_count: u64 = 0;
     let mut skipped_slot_count: u64 = 0;
     let mut pending_slot_count: u64 = 0;
-    for (slot, rec) in state.slots.iter_mut() {
+    for (slot, rec) in &mut state.slots {
         if rec.voted_skip_at.is_none() {
             rec.skip_classification = SkipClassification::NotSkipped;
         } else {

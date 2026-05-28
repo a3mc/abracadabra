@@ -88,7 +88,11 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     // canonical-skip share is a floor, not a point estimate. Same
     // convention as header.rs:81, overview.rs:249, windows.rs:143,
     // runner.rs:181 — operators flipping tabs must see one story.
-    let canon_bound = if ov.indeterminate_skips > 0 { "≥" } else { "" };
+    let canon_bound = if ov.indeterminate_skips > 0 {
+        "≥"
+    } else {
+        ""
+    };
 
     // Read pre-computed lifecycle percentiles instead of re-sorting
     // ~179k entries per frame (see `App::latency` / `LatencySnapshot`).
@@ -286,7 +290,10 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             mark(filters.vskip_only),
             Span::styled("v ", theme::accent_style()),
             Span::styled("VSKIP", theme::warn_style()),
-            Span::styled("  vote-skip rows (no canonical evidence)", theme::label_style()),
+            Span::styled(
+                "  vote-skip rows (no canonical evidence)",
+                theme::label_style(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
@@ -303,10 +310,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             mark(filters.fast_only),
             Span::styled("f ", theme::accent_style()),
             Span::styled("F", theme::good_style()),
-            Span::styled(
-                "  cluster fast-finalized (80% Notar)",
-                theme::label_style(),
-            ),
+            Span::styled("  cluster fast-finalized (80% Notar)", theme::label_style()),
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
@@ -403,7 +407,10 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled("  consensus ", theme::label_style()),
             Span::styled("↶", theme::accent_style()),
-            Span::styled("  cluster finalized before local replay", theme::label_style()),
+            Span::styled(
+                "  cluster finalized before local replay",
+                theme::label_style(),
+            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);

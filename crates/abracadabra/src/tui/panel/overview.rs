@@ -23,10 +23,10 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // file & time metadata (4 lines + borders)
-            Constraint::Length(5),  // headline health (2-column, 3 rows + borders)
+            Constraint::Length(6), // file & time metadata (4 lines + borders)
+            Constraint::Length(5), // headline health (2-column, 3 rows + borders)
             Constraint::Length(8), // vote / cert totals (3 columns: heading + 3-4 metric rows + borders + top pad)
-            Constraint::Length(7),  // latency stages (Table: header + 3 rows + borders)
+            Constraint::Length(7), // latency stages (Table: header + 3 rows + borders)
             Constraint::Length(5), // leader-timeout / vote-resume stats
             Constraint::Min(3),    // alerts summary
         ])
@@ -180,8 +180,7 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     // value on a continuation line, but only when at least one standstill
     // range exists in the log.
     let crashed_outside_pct = if leader_windows_total > 0 {
-        ov.timeout_crashed_leaders_outside_standstill as f64 * 100.0
-            / leader_windows_total as f64
+        ov.timeout_crashed_leaders_outside_standstill as f64 * 100.0 / leader_windows_total as f64
     } else {
         0.0
     };
@@ -271,7 +270,11 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(
                 format!(
                     "{:>6.2}%",
-                    if has_standstill { crashed_outside_pct } else { crashed_pct }
+                    if has_standstill {
+                        crashed_outside_pct
+                    } else {
+                        crashed_pct
+                    }
                 ),
                 theme::value_style(),
             ),
@@ -284,7 +287,11 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
                         ov.timeout_crashed_leaders
                     }),
                     commas(leader_windows_total),
-                    if has_standstill { ", excl. standstill" } else { "" },
+                    if has_standstill {
+                        ", excl. standstill"
+                    } else {
+                        ""
+                    },
                 ),
                 theme::label_style(),
             ),

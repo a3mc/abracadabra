@@ -15,8 +15,7 @@ use std::os::unix::fs::symlink;
 #[test]
 fn yank_to_existing_symlink_does_not_overwrite_target() {
     // Set up an isolated yank dir under a tempdir.
-    let tmp =
-        std::env::temp_dir().join(format!("abracadabra-yank-test-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("abracadabra-yank-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
@@ -264,17 +263,13 @@ fn toggle_filter_flips_each_dimension_and_recomputes_indices() {
     // surface is exercised end-to-end.
     let mut state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
     // Slot 1: VSKIP (skip vote, no finalize, indeterminate).
-    state.slot_mut(1).voted_skip_at =
-        Some(time::macros::datetime!(2026-05-23 16:00:00 UTC));
+    state.slot_mut(1).voted_skip_at = Some(time::macros::datetime!(2026-05-23 16:00:00 UTC));
     // Slot 2: CSKIP (skip vote + finalize → CanonicalSkip after analyze).
-    state.slot_mut(2).voted_skip_at =
-        Some(time::macros::datetime!(2026-05-23 16:00:01 UTC));
-    state.slot_mut(2).finalized_at =
-        Some(time::macros::datetime!(2026-05-23 16:00:02 UTC));
+    state.slot_mut(2).voted_skip_at = Some(time::macros::datetime!(2026-05-23 16:00:01 UTC));
+    state.slot_mut(2).finalized_at = Some(time::macros::datetime!(2026-05-23 16:00:02 UTC));
     state.slot_mut(2).fast_finalize = Some(true);
     // Slot 3: plain finalized.
-    state.slot_mut(3).finalized_at =
-        Some(time::macros::datetime!(2026-05-23 16:00:03 UTC));
+    state.slot_mut(3).finalized_at = Some(time::macros::datetime!(2026-05-23 16:00:03 UTC));
     state.slot_mut(3).fast_finalize = Some(true);
 
     // Run classifier so CSKIP row carries the discriminator.

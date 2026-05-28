@@ -78,7 +78,11 @@ pub fn render(state: &State, frame: &mut Frame<'_>, area: Rect) {
         theme::CANONICAL_SKIP_WARN_PCT,
         theme::CANONICAL_SKIP_BAD_PCT,
     );
-    let canon_bound = if ov.indeterminate_skips > 0 { "≥" } else { "" };
+    let canon_bound = if ov.indeterminate_skips > 0 {
+        "≥"
+    } else {
+        ""
+    };
     let standstill_style = if ov.standstill_events == 0 {
         theme::good_style()
     } else {

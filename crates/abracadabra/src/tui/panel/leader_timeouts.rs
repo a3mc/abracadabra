@@ -38,10 +38,10 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Constraint::Length(3),  // stats KPIs
             Constraint::Length(11), // distribution histogram
             Constraint::Length(8),  // per-bucket trend (was 6; 2 extra
-                                    // rows give the bar area 4 rows
-                                    // instead of 2 — visible spikes
-                                    // even on a baseline-flat series)
-            Constraint::Min(8),     // list + band reference (split horizontally)
+            // rows give the bar area 4 rows
+            // instead of 2 — visible spikes
+            // even on a baseline-flat series)
+            Constraint::Min(8), // list + band reference (split horizontally)
         ])
         .split(area);
 
@@ -82,7 +82,10 @@ fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("< 1.5 s    ", theme::label_style()),
             Span::styled(commas(normal), theme::value_style()),
             Span::styled(
-                format!(" ({:.1}%)  — majority of events on healthy clusters", pct(normal, total)),
+                format!(
+                    " ({:.1}%)  — majority of events on healthy clusters",
+                    pct(normal, total)
+                ),
                 theme::label_style(),
             ),
         ]),
@@ -91,7 +94,10 @@ fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("1.5 – 3.0 s ", theme::label_style()),
             Span::styled(commas(elevated), theme::value_style()),
             Span::styled(
-                format!(" ({:.1}%)  — slow recovery / next-leader delay", pct(elevated, total)),
+                format!(
+                    " ({:.1}%)  — slow recovery / next-leader delay",
+                    pct(elevated, total)
+                ),
                 theme::label_style(),
             ),
         ]),
@@ -100,7 +106,10 @@ fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Span::styled("≥ 3.0 s    ", theme::label_style()),
             Span::styled(commas(severe), theme::value_style()),
             Span::styled(
-                format!(" ({:.1}%)  — multi-window outage or stretched-timeout standstill", pct(severe, total)),
+                format!(
+                    " ({:.1}%)  — multi-window outage or stretched-timeout standstill",
+                    pct(severe, total)
+                ),
                 theme::label_style(),
             ),
         ]),

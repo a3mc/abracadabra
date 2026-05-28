@@ -179,7 +179,11 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         .canonical_skips_direct
         .saturating_add(ov.canonical_skips_ancestry);
     let canon_skip_pct = pct(canon_skips, ov.votes_skip);
-    let bound_marker = if ov.indeterminate_skips > 0 { ">=" } else { "  " };
+    let bound_marker = if ov.indeterminate_skips > 0 {
+        ">="
+    } else {
+        "  "
+    };
     println!(
         "  {:<18} {}{:>5.2}%   {} canonical of {} vote-skips{}",
         "canonical-skip",

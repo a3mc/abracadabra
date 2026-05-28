@@ -7,10 +7,10 @@
 //!   - `standstill`     — `standstill_ranges` build-up + TCL filter
 //!   - `classify_skips` — `aggregator::classify_skips` paths
 //!   - `log_patterns`   — `ingest_issue` / `record_log_pattern` /
-//!                        `surface_log_pattern_alerts` family
+//!     `surface_log_pattern_alerts` family
 //!   - `produce_window` — `EventKind::ProduceWindow` corruption guards
 //!   - `analyze_alerts` — `analyze` post-pass: sort order, dedup,
-//!                        local-leader-summary gating
+//!     local-leader-summary gating
 
 mod analyze_alerts;
 mod classify_skips;
