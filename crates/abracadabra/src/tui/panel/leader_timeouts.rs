@@ -11,7 +11,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Paragraph, Row, Table};
+use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::model::analysis;
@@ -37,7 +37,10 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .constraints([
             Constraint::Length(3),  // stats KPIs
             Constraint::Length(11), // distribution histogram
-            Constraint::Length(6),  // per-bucket trend
+            Constraint::Length(8),  // per-bucket trend (was 6; 2 extra
+                                    // rows give the bar area 4 rows
+                                    // instead of 2 — visible spikes
+                                    // even on a baseline-flat series)
             Constraint::Min(8),     // list + band reference (split horizontally)
         ])
         .split(area);
@@ -64,72 +67,100 @@ fn render_band_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let (normal, elevated, severe) = app.latency.resume_severity_counts;
     let (p50, p95, p99, max) = app.latency.resume_pcts_us;
 
+    // Style for glossary terms — bold white, distinct from both the
+    // dim label-grey of explanation text and the bold-cyan of section
+    // titles. The visual hierarchy is title > term > explanation.
+    let term_style = theme::value_style().add_modifier(Modifier::BOLD);
+
     let lines = vec![
         section_title("Severity bands"),
-        Line::raw(""),
+        // Single line per band: colored label + threshold + count
+        // + percentage + short interpretation. Wraps cleanly via the
+        // Paragraph's Wrap config on narrow terminals.
         Line::from(vec![
             Span::styled("  NORMAL   ", theme::good_style()),
-            Span::styled("< 1.5 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("< 1.5 s    ", theme::label_style()),
             Span::styled(commas(normal), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(normal, total)),
+                format!(" ({:.1}%)  — majority of events on healthy clusters", pct(normal, total)),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    healthy clusters: majority of events",
-            theme::label_style(),
-        )]),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("  ELEVATED ", theme::warn_style()),
-            Span::styled("1.5 – 3.0 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("1.5 – 3.0 s ", theme::label_style()),
             Span::styled(commas(elevated), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(elevated, total)),
+                format!(" ({:.1}%)  — slow recovery / next-leader delay", pct(elevated, total)),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    leader recovered slowly",
-            theme::label_style(),
-        )]),
-        Line::raw(""),
         Line::from(vec![
             Span::styled("  SEVERE   ", theme::bad_style()),
-            Span::styled(">= 3.0 s", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("    count ", theme::label_style()),
+            Span::styled("≥ 3.0 s    ", theme::label_style()),
             Span::styled(commas(severe), theme::value_style()),
             Span::styled(
-                format!(" ({:>4.1}%)", pct(severe, total)),
+                format!(" ({:.1}%)  — multi-window outage or stretched-timeout standstill", pct(severe, total)),
                 theme::label_style(),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    2+ consecutive leader failures",
-            theme::label_style(),
-        )]),
         Line::raw(""),
         section_title("Observed percentiles"),
         kv_time_highlight("  median", p50),
         kv_time("  p95   ", p95),
         kv_time("  p99   ", p99),
         kv_time("  max   ", max),
+        Line::raw(""),
+        // Glossary anchors at the bottom — read the incidents table
+        // on the left, then look down-right for column meanings.
+        // One-line-per-term keeps the section ~7 rows tall so it
+        // survives narrow / zoomed terminals without overflowing.
+        // The Paragraph's Wrap config reflows any line that exceeds
+        // the panel's actual width.
+        section_title("What this measures"),
+        Line::from(vec![
+            Span::styled("  leader timeout", term_style),
+            Span::styled(
+                "  TCL event — timer fires ~1.4 s into window if no shreds arrive.",
+                theme::label_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  resume time   ", term_style),
+            Span::styled(
+                "  wall-clock TCL → next Voting notarize (list sorted by this).",
+                theme::label_style(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  slot gap      ", term_style),
+            Span::styled(
+                "  slots elapsed from TCL until we cast next Voting notarize.",
+                theme::label_style(),
+            ),
+        ]),
     ];
 
+    // Render the outer block + title across the full panel area, then
+    // render the Paragraph into a padded inner rect: 1 row top
+    // padding, 3 cols left padding, 2 cols right padding. Stops the
+    // "Severity bands" title from butting against the top border and
+    // gives every line some breathing room on both sides so it
+    // matches the other widgets' visual rhythm.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" band reference ")
         .title_style(theme::title_style());
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let padded = Rect {
+        x: inner.x.saturating_add(3),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(5),
+        height: inner.height.saturating_sub(1),
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
 }
 
 fn section_title(s: &str) -> Line<'_> {
