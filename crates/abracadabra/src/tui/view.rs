@@ -100,21 +100,23 @@ impl SlotViewRow {
     /// For skipped slots, the `SkipClassification` discriminator
     /// determines the operator-visible label:
     ///
-    ///   - `CSKIP` — we voted skip on a slot that became canonical
+    ///   - `CSKIP` — we voted skip on a slot that became Canonical
     ///     (real participation failure).
-    ///   - `SKIP`  — we voted skip; cluster outcome indeterminate from
-    ///     log alone (could be a right skip OR an unverified
-    ///     canonical skip).
+    ///   - `VSKIP` — Vote/Validator skip: we voted skip; cluster
+    ///     outcome indeterminate from log alone (could be a right
+    ///     skip OR an unverified canonical skip).
     ///
-    /// Until Stage 2 RPC enrichment lands, plain `SKIP` is the
-    /// indeterminate bucket — NOT a claim of correctness. The legend
-    /// must make that explicit.
+    /// The `V`/`C` prefix convention disambiguates the column at
+    /// a glance: both labels describe *our* vote, with the prefix
+    /// indicating whether canonical evidence exists. Until Stage 2
+    /// RPC enrichment lands, plain `VSKIP` is the indeterminate
+    /// bucket — NOT a claim of correctness.
     pub const fn status_str(&self) -> &'static str {
         match self.status {
             SlotStatus::FastFinalized | SlotStatus::SlowFinalized => "FIN",
             SlotStatus::Skipped => match self.skip_classification {
                 SkipClassification::CanonicalSkip(_) => "CSKIP",
-                _ => "SKIP",
+                _ => "VSKIP",
             },
             SlotStatus::Pending => "PEND",
         }

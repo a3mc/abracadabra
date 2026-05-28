@@ -131,9 +131,11 @@ fn format_alert_for_yank(state: &State, alert: &Alert) -> String {
     out
 }
 
-/// One-bit filter dimensions for the Slots tab. Multiple flags AND
+/// One-bit filter dimensions for the Slots tab. Most flags AND
 /// together (e.g. `tcl + leader` -> only rows that are both
-/// `crashed_leader` AND `we_are_leader`).
+/// `crashed_leader` AND `we_are_leader`). The skip-family pair
+/// (`vskip_only`, `canonical_skip_only`) is the exception — they OR
+/// together so `[v]+[c]` shows both buckets at once.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SlotFilters {
     pub tcl: bool,
@@ -142,11 +144,11 @@ pub struct SlotFilters {
     pub leader: bool,
     pub fast_only: bool,
     pub slow_only: bool,
-    pub skipped_only: bool,
+    /// Rows where the slot is VSKIP (vote-skip with no canonical
+    /// evidence — the indeterminate bucket). Toggled with `[v]`.
+    pub vskip_only: bool,
     /// Rows where the slot is CSKIP (vote-skip on a canonical slot).
-    /// This is the headline operator-facing failure filter — narrower
-    /// than `skipped_only`, which keeps all vote-skip rows including
-    /// the indeterminate bucket.
+    /// Toggled with `[c]`. Headline operator-facing failure filter.
     pub canonical_skip_only: bool,
 }
 
@@ -158,7 +160,7 @@ impl SlotFilters {
             || self.leader
             || self.fast_only
             || self.slow_only
-            || self.skipped_only
+            || self.vskip_only
             || self.canonical_skip_only
     }
 
@@ -181,11 +183,17 @@ impl SlotFilters {
         if self.slow_only && !matches!(r.status, SlotStatus::SlowFinalized) {
             return false;
         }
-        if self.skipped_only && !matches!(r.status, SlotStatus::Skipped) {
-            return false;
-        }
-        if self.canonical_skip_only && !r.skip_classification.is_canonical_skip() {
-            return false;
+        // Skip-family OR semantics: when either flag is on, the row
+        // must match at least one of the requested buckets. Both off
+        // means no skip filter (no constraint added).
+        if self.vskip_only || self.canonical_skip_only {
+            let is_cskip = r.skip_classification.is_canonical_skip();
+            let is_vskip = matches!(r.status, SlotStatus::Skipped) && !is_cskip;
+            let want_v = self.vskip_only && is_vskip;
+            let want_c = self.canonical_skip_only && is_cskip;
+            if !(want_v || want_c) {
+                return false;
+            }
         }
         true
     }
@@ -202,7 +210,7 @@ pub enum FilterKind {
     Leader,
     FastOnly,
     SlowOnly,
-    SkippedOnly,
+    VskipOnly,
     CanonicalSkipOnly,
 }
 
@@ -445,8 +453,8 @@ impl<'s> App<'s> {
             FilterKind::Leader => self.slot_filters.leader = !self.slot_filters.leader,
             FilterKind::FastOnly => self.slot_filters.fast_only = !self.slot_filters.fast_only,
             FilterKind::SlowOnly => self.slot_filters.slow_only = !self.slot_filters.slow_only,
-            FilterKind::SkippedOnly => {
-                self.slot_filters.skipped_only = !self.slot_filters.skipped_only;
+            FilterKind::VskipOnly => {
+                self.slot_filters.vskip_only = !self.slot_filters.vskip_only;
             }
             FilterKind::CanonicalSkipOnly => {
                 self.slot_filters.canonical_skip_only = !self.slot_filters.canonical_skip_only;
@@ -631,16 +639,15 @@ fn event_loop(
                     KeyCode::Char('p') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::S2s);
                     }
-                    // `s` is the natural mnemonic for the SKIP status
-                    // filter. Free now that S2S moved to `p`.
-                    KeyCode::Char('s') if app.current_tab == 3 => {
-                        app.toggle_filter(FilterKind::SkippedOnly);
+                    // `v` for VSKIP (we Voted skip, no canonical evidence).
+                    // `c` for CSKIP (Canonical-skip). The two skip filters
+                    // OR together in `SlotFilters::matches` so pressing
+                    // both shows the union — equivalent to the old `[s]`
+                    // "both buckets" toggle.
+                    KeyCode::Char('v') if app.current_tab == 3 => {
+                        app.toggle_filter(FilterKind::VskipOnly);
                     }
-                    // `b` for the canonical-skip filter — narrower subset
-                    // of skip-voted slots (only CSKIP, not the indeterminate
-                    // bucket). Mnemonic: "B" for bad/missed slot (the user-
-                    // facing impact); the column label is CSKIP.
-                    KeyCode::Char('b') if app.current_tab == 3 => {
+                    KeyCode::Char('c') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::CanonicalSkipOnly);
                     }
                     KeyCode::Char('l') if app.current_tab == 3 => {
@@ -649,13 +656,15 @@ fn event_loop(
                     KeyCode::Char('f') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::FastOnly);
                     }
-                    // `x` for slow-finalized — no natural mnemonic, but
-                    // visually pairs with `f` for fast (f/x toggles the
-                    // two finalization paths).
-                    KeyCode::Char('x') if app.current_tab == 3 => {
+                    // `s` for SLOW (was previously the combined VSKIP+CSKIP
+                    // toggle; that combined behaviour is now expressed by
+                    // pressing both `v` and `c`).
+                    KeyCode::Char('s') if app.current_tab == 3 => {
                         app.toggle_filter(FilterKind::SlowOnly);
                     }
-                    KeyCode::Char('c') if app.current_tab == 3 => {
+                    // `x` clears all filters — moved here from `c` to free
+                    // `c` for CSKIP. `x` reads as "cancel / clear".
+                    KeyCode::Char('x') if app.current_tab == 3 => {
                         app.clear_filters();
                     }
                     _ => {}

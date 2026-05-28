@@ -272,23 +272,23 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
     let lines = vec![
         section_title("Filters available:"),
         Line::from(""),
-        // status filters (description of FIN/CSKIP/SKIP/PEND values
-        // is in the static reference block at the bottom of the panel)
+        // status filters (description of FIN/CSKIP/VSKIP/PEND values
+        // is in the static reference block at the bottom of the panel).
+        // VSKIP and CSKIP toggles OR together — press both for the
+        // old "both buckets" view.
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
-            mark(filters.skipped_only),
-            Span::styled("s ", theme::accent_style()),
-            Span::styled("SKIP", theme::warn_style()),
-            Span::styled("+", theme::label_style()),
-            Span::styled("CSKIP", theme::bad_style()),
-            Span::styled("  all vote-skip rows (both buckets)", theme::label_style()),
+            mark(filters.vskip_only),
+            Span::styled("v ", theme::accent_style()),
+            Span::styled("VSKIP", theme::warn_style()),
+            Span::styled("  vote-skip rows (no canonical evidence)", theme::label_style()),
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
             mark(filters.canonical_skip_only),
-            Span::styled("b ", theme::accent_style()),
+            Span::styled("c ", theme::accent_style()),
             Span::styled("CSKIP", theme::bad_style()),
-            Span::styled("  only canonical skips (proven via log)", theme::label_style()),
+            Span::styled("  canonical skips (proven via log)", theme::label_style()),
         ]),
         // ---- path — column shows the CLUSTER's finalization path, not
         // ours. Important distinction for CSKIP rows: F there means
@@ -306,7 +306,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
             mark(filters.slow_only),
-            Span::styled("x ", theme::accent_style()),
+            Span::styled("s ", theme::accent_style()),
             Span::styled("S", theme::accent_style()),
             Span::styled(
                 "  cluster slow-finalized (60% Notar + 60% Final)",
@@ -363,7 +363,7 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
-            Span::styled("[c] ", theme::accent_style()),
+            Span::styled("[x] ", theme::accent_style()),
             Span::styled("clear all filters", theme::label_style()),
         ]),
         Line::from(""),
@@ -376,10 +376,13 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
-            Span::styled("SKIP", theme::warn_style()),
-            Span::styled(" we voted skip, outcome unknown   ", theme::label_style()),
+            Span::styled("VSKIP", theme::warn_style()),
+            Span::styled(" we voted skip, outcome unknown", theme::label_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
             Span::styled("PEND", theme::label_style()),
-            Span::styled(" pending", theme::label_style()),
+            Span::styled("  pending", theme::label_style()),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -542,11 +545,11 @@ fn filter_chips(f: SlotFilters) -> String {
     if f.slow_only {
         chips.push("slow");
     }
-    if f.skipped_only {
-        chips.push("skipped");
+    if f.vskip_only {
+        chips.push("vskip");
     }
     if f.canonical_skip_only {
-        chips.push("canonical-skip");
+        chips.push("cskip");
     }
     if chips.is_empty() {
         String::new()
