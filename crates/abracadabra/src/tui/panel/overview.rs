@@ -23,10 +23,10 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // file & time metadata (4 lines + borders)
-            Constraint::Length(5), // headline health (2-column, 3 rows + borders)
-            Constraint::Length(6), // vote / cert totals
-            Constraint::Length(7), // latency stages (Table: header + 3 rows + borders)
+            Constraint::Length(6),  // file & time metadata (4 lines + borders)
+            Constraint::Length(5),  // headline health (2-column, 3 rows + borders)
+            Constraint::Length(8), // vote / cert totals (3 columns: heading + 3-4 metric rows + borders + top pad)
+            Constraint::Length(7),  // latency stages (Table: header + 3 rows + borders)
             Constraint::Length(5), // leader-timeout / vote-resume stats
             Constraint::Min(3),    // alerts summary
         ])
@@ -227,28 +227,16 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
 
-    // Finalize row shows BOTH fast and slow shares so the operator
-    // sees the whole finalization picture in one line — the slow
-    // share is implicit (100 - fast) but spelling it out matches the
-    // detail in `vote & cert totals` below.
-    let slow_pct = if total_final > 0 {
-        ov.finalized_slow as f64 * 100.0 / total_final as f64
-    } else {
-        0.0
-    };
+    // Finalize row — verdict only. The raw fast/slow split with
+    // percentages lives in the `vote & cert totals` widget below
+    // (`finalized` column); showing it again here would duplicate
+    // data. Keep the band-coloured `[✓]`/`[✗]` mark + verdict text
+    // so this row still functions as an operator-glance health
+    // indicator alongside the canonical-skip and crashed-leaders
+    // rows.
     let mut left_lines = vec![
         Line::from(vec![
             Span::styled(format!("  {:<16}", "fast-finalize"), theme::label_style()),
-            Span::styled(
-                format!("{fast_pct:>6.2}%"),
-                theme::value_style().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" / slow ", theme::label_style()),
-            Span::styled(
-                format!("{slow_pct:.2}%"),
-                Style::default().fg(theme::SPARK_ALT_PATH),
-            ),
-            Span::raw("  "),
             Span::styled(fast_mark, fast_style),
             Span::raw(" "),
             Span::styled(fast_verdict, fast_style),
@@ -361,6 +349,12 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    let slow_pct = 100.0 - fast_pct;
+    // True fallback = NotarFallback cert that fired without a matching
+    // Notarize cert. Cluster reached the fallback path because it
+    // couldn't form a 60% Notarize cert directly (fragmentation).
+    // Most NotarFallback events are automatic companions to Notarize
+    // (every 60% Notarize cert auto-emits NotarFallback too).
     let true_fb = ov
         .block_notar_fallback_count
         .saturating_sub(ov.block_notarized_count);
@@ -369,58 +363,104 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    let (fb_verdict, fb_style) = if fb_pct < 0.5 {
+        ("rare/healthy", theme::good_style())
+    } else {
+        ("ELEVATED", theme::warn_style())
+    };
 
-    let lines = vec![
+    // Outer block with title + horizontal split into three columns
+    // (votes / certs / finalized). Each column owns its Paragraph so
+    // labels and values stay aligned within the column independent
+    // of the others.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" vote & cert totals  (full log) ".to_owned())
+        .title_style(theme::title_style())
+        .padding(Padding::new(2, 1, 1, 0));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(inner);
+
+    // Helpers for consistent label/value alignment within each column.
+    // Column heading uses `title_style` (cyan + bold) so it matches
+    // the panel title bar and other section headings throughout the
+    // TUI — these are visually "second-level titles" for the
+    // sub-sections inside a single panel.
+    let heading = |text: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            text.to_owned(),
+            theme::title_style().add_modifier(Modifier::BOLD),
+        ))
+    };
+    // Labels start at column 0 inside the column so they align under
+    // the bold heading (also at column 0). Outer-block Padding
+    // already gives a 2-col gap from the panel border for every line.
+    let row = |label: &str, value: u64| -> Line<'static> {
         Line::from(vec![
-            Span::styled("Local votes    ", theme::label_style()),
-            Span::styled("Notarize ", theme::label_style()),
-            Span::styled(commas(ov.votes_notarize), theme::value_style()),
-            Span::styled("   Finalize ", theme::label_style()),
-            Span::styled(commas(ov.votes_finalize), theme::value_style()),
-            Span::styled("   Skip ", theme::label_style()),
-            Span::styled(commas(ov.votes_skip), theme::value_style()),
-        ]),
+            Span::styled(format!("{label:<16}"), theme::label_style()),
+            Span::styled(format!("{:>9}", commas(value)), theme::value_style()),
+        ])
+    };
+    let row_with_suffix =
+        |label: &str, value: u64, suffix: String, style: Style| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(format!("{label:<16}"), theme::label_style()),
+                Span::styled(format!("{:>9}", commas(value)), theme::value_style()),
+                Span::raw("  "),
+                Span::styled(suffix, style),
+            ])
+        };
+
+    // ---- Column 1: votes ----
+    let votes_lines = vec![
+        heading("votes"),
+        row("Notarize", ov.votes_notarize),
+        row("Finalize", ov.votes_finalize),
+        row("Skip", ov.votes_skip),
+    ];
+    frame.render_widget(Paragraph::new(votes_lines), cols[0]);
+
+    // ---- Column 2: certs ----
+    let certs_lines = vec![
+        heading("certs"),
+        row("Notarized", ov.block_notarized_count),
+        row("NotarFallback", ov.block_notar_fallback_count),
         Line::from(vec![
-            Span::styled("Cluster certs  ", theme::label_style()),
-            Span::styled("Block Notarized ", theme::label_style()),
-            Span::styled(commas(ov.block_notarized_count), theme::value_style()),
-            Span::styled("   Block notar-fb ", theme::label_style()),
-            Span::styled(commas(ov.block_notar_fallback_count), theme::value_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("Finalized      ", theme::label_style()),
-            Span::styled(commas(total_final), theme::value_style()),
-            Span::styled(
-                format!(
-                    "   fast {} / slow {} = {:.2}% fast",
-                    commas(ov.finalized_fast),
-                    commas(ov.finalized_slow),
-                    fast_pct,
-                ),
-                theme::label_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("True fallbacks ", theme::label_style()),
+            Span::styled("true FB ", theme::label_style()),
             Span::styled(commas(true_fb), theme::value_style()),
-            Span::styled(
-                format!(
-                    "   {fb_pct:.3}% — {}",
-                    if fb_pct < 0.5 {
-                        "rare/healthy"
-                    } else {
-                        "ELEVATED"
-                    },
-                ),
-                if fb_pct < 0.5 {
-                    theme::good_style()
-                } else {
-                    theme::warn_style()
-                },
-            ),
+            Span::styled(format!("  {fb_pct:.3}%"), theme::label_style()),
+            Span::raw("  "),
+            Span::styled(fb_verdict, fb_style),
         ]),
     ];
-    paragraph_in_block(frame, area, " vote & cert totals  (full log) ", lines);
+    frame.render_widget(Paragraph::new(certs_lines), cols[1]);
+
+    // ---- Column 3: finalized ----
+    let finalized_lines = vec![
+        heading("finalized"),
+        row("total", total_final),
+        row_with_suffix(
+            "fast",
+            ov.finalized_fast,
+            format!("{fast_pct:.2}%"),
+            theme::good_style(),
+        ),
+        row_with_suffix(
+            "slow",
+            ov.finalized_slow,
+            format!("{slow_pct:.2}%"),
+            Style::default().fg(theme::SPARK_ALT_PATH),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(finalized_lines), cols[2]);
 }
 
 // ---------- Latency stage breakdown ----------
