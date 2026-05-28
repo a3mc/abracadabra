@@ -95,6 +95,23 @@ pub const VOTE_SKIP_BAD_PCT: f64 = 15.0;
 pub const CANONICAL_SKIP_WARN_PCT: f64 = 0.5;
 pub const CANONICAL_SKIP_BAD_PCT: f64 = 2.0;
 
+/// **True-fallback percentage** — share of `BlockNotarFallback` cluster
+/// events that did NOT have a matching `BlockNotarized` for the same
+/// slot. See `docs/alpenglow/03-protocol-overview.md`: every successful
+/// 60% Notarize cert auto-emits a NotarFallback companion, so most
+/// NotarFallback events are benign. A "true FB" — fallback without
+/// matching Notarize — means the cluster could not reach the 60%
+/// Notarize threshold and fell back to the wider-quorum path. That is
+/// the operator-relevant fragmentation signal.
+///
+/// `0.5%` cutoff chosen by symmetry with `CANONICAL_SKIP_WARN_PCT`:
+/// both measure rare cluster-side adverse events on the same
+/// per-slot-event denominator scale, so the "anything below ~0.5% is
+/// noise" framing carries over until empirical data says otherwise.
+/// Re-calibrate alongside the canonical-skip thresholds when a
+/// multi-day, multi-validator corpus is available.
+pub const TRUE_FB_ELEVATED_PCT: f64 = 0.5;
+
 /// Per-slot assembly time (first_shred → block_emitted) in ms. Baseline
 /// sits ≈ 450 ms in a healthy 21h log; 500 ms is the visible-spike
 /// floor (shred propagation / replay bottlenecks); >600 ms is well

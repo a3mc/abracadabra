@@ -84,6 +84,11 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         theme::CANONICAL_SKIP_WARN_PCT,
         theme::CANONICAL_SKIP_BAD_PCT,
     );
+    // Lower-bound marker when indeterminate skips exist: the displayed
+    // canonical-skip share is a floor, not a point estimate. Same
+    // convention as header.rs:81, overview.rs:249, windows.rs:143,
+    // runner.rs:181 — operators flipping tabs must see one story.
+    let canon_bound = if ov.indeterminate_skips > 0 { "≥" } else { "" };
 
     // Read pre-computed lifecycle percentiles instead of re-sorting
     // ~179k entries per frame (see `App::latency` / `LatencySnapshot`).
@@ -134,7 +139,7 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         Span::styled(format!("{skip_pct:.1}%"), skip_style),
         Span::styled(format!(" ({} slots, ", commas(skip)), theme::label_style()),
         Span::styled("canonical-skip ", theme::label_style()),
-        Span::styled(format!("{canon_pct:.2}%"), canon_style),
+        Span::styled(format!("{canon_bound}{canon_pct:.2}%"), canon_style),
         Span::styled(format!(" = {} slots)", commas(canon)), theme::label_style()),
         pipe(),
         Span::styled("PEND ", theme::label_style()),

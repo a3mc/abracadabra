@@ -363,7 +363,7 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
-    let (fb_verdict, fb_style) = if fb_pct < 0.5 {
+    let (fb_verdict, fb_style) = if fb_pct < theme::TRUE_FB_ELEVATED_PCT {
         ("rare/healthy", theme::good_style())
     } else {
         ("ELEVATED", theme::warn_style())
@@ -436,7 +436,7 @@ fn render_vote_cert_totals(state: &State, frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![
             Span::styled("true FB ", theme::label_style()),
             Span::styled(commas(true_fb), theme::value_style()),
-            Span::styled(format!("  {fb_pct:.3}%"), theme::label_style()),
+            Span::styled(format!("  {fb_pct:.2}%"), theme::label_style()),
             Span::raw("  "),
             Span::styled(fb_verdict, fb_style),
         ]),

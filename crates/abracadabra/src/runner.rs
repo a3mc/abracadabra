@@ -14,6 +14,7 @@ use crate::model::alerts::Severity;
 use crate::model::analysis;
 use crate::model::state::State;
 use crate::parser::{self, Parsed};
+use crate::tui::theme;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -281,12 +282,12 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         commas(ov.block_notarized_count),
     );
     println!(
-        "  {:<22} {:>10}   +{} TRUE fallbacks ({:.3}% — {})",
+        "  {:<22} {:>10}   +{} TRUE fallbacks ({:.2}% — {})",
         "Block notar-fallback",
         commas(ov.block_notar_fallback_count),
         commas(true_fb),
         true_fb_pct,
-        if true_fb_pct < 0.5 {
+        if true_fb_pct < theme::TRUE_FB_ELEVATED_PCT {
             "rare/healthy"
         } else {
             "elevated"

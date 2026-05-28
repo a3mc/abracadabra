@@ -223,11 +223,26 @@ pub fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
 }
 
 /// Severity classification for a vote-resume time.
+///
+/// Band cuts (`1.5 s` Elevated, `3.0 s` Severe) are **provisional** and
+/// have NOT been calibrated against a multi-day, multi-validator log
+/// corpus. They were chosen by inspection of a single ~7 h log window
+/// and reflect "noticeably slow" vs. "obviously slow" rather than any
+/// empirical p90 / p99 baseline.
+///
+/// Re-validation pending: run `scripts/calibrate_resume_thresholds.sh`
+/// against a corpus of 5+ validator logs spanning at least 24 h each;
+/// adjust the constants to match the observed p90 (Elevated) and p99
+/// (Severe) of the `TimeoutCrashedLeader -> next Voting notarize`
+/// distribution. The script outputs honest percentile recommendations.
+///
+/// Do not tighten these bands without that data — false-positive
+/// Elevated/Severe verdicts in operator UI erode the signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
-    Normal,   // <1.5 s
-    Elevated, // 1.5..3.0 s
-    Severe,   // >=3.0 s
+    Normal,   // <1.5 s  (provisional)
+    Elevated, // 1.5..3.0 s  (provisional)
+    Severe,   // >=3.0 s  (provisional)
 }
 
 impl Severity {
@@ -237,6 +252,10 @@ impl Severity {
     /// `Severe` rather than silently sliding into `Normal` via integer
     /// division truncation toward zero. `debug_assert` flags the upstream
     /// invariant break in debug builds.
+    ///
+    /// Band cuts are provisional — see the `Severity` type docstring and
+    /// `scripts/calibrate_resume_thresholds.sh` for the re-validation
+    /// path.
     pub const fn from_us(us: i64) -> Self {
         debug_assert!(us >= 0, "Severity::from_us called with negative µs");
         if us < 0 {

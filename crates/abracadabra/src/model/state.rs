@@ -131,11 +131,44 @@ pub struct OverallStats {
     /// `MAX_LEADER_WINDOW_SPAN`. Corruption-defence counter — a malformed
     /// `end` could otherwise force the aggregator to materialise
     /// `end - start + 1` `SlotRecord`s in the `slots` map.
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary yet — same
+    /// disposition as `parent_ready_recoveries`. Reserved for future
+    /// ingest-corruption monitoring: a non-zero count signals truncated
+    /// log lines or an upstream agave bug in window emission. Do not
+    /// remove; cost is one `u64`, write is a single `saturating_add` in
+    /// the ingest path, and the raw count is the only evidence we
+    /// rejected anything.
     pub malformed_produce_window: u64,
 
     // Standstill activity.
+    /// `Standstill` (firing) events. Surfaced on every operator-facing
+    /// panel (`header.rs`, `overview.rs`, `runner::print_summary`) as the
+    /// headline stuck-cluster indicator.
     pub standstill_events: u64,
+    /// `StandstillExtending` events — emitted while the cluster is still
+    /// stuck, distinct from the initial `Standstill` firing. Counts each
+    /// extension log line; multiple Extending events compose into one
+    /// standstill period (collapsed into `standstill_ranges`).
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary yet —
+    /// reserved for future per-period analysis (e.g. extension cadence
+    /// as a "how stuck" proxy). The collapsed `standstill_ranges` view
+    /// is what the TUI renders today; the raw extending count is kept
+    /// for ratio metrics (extensions / period) that have not been
+    /// calibrated yet. Do not remove; cost is one `u64` per
+    /// `OverallStats`.
     pub standstill_extending_events: u64,
+    /// `StandstillEnded` events — emitted when a stuck period closes.
+    /// Number of closed periods (each Ended event terminates one open
+    /// standstill anchored by the first Extending in the period).
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary yet —
+    /// reserved for future "period count vs `standstill_events` firing
+    /// count" sanity-check metrics. `standstill_ranges.len()` already
+    /// gives the same number once `analyze` closes off any unmatched
+    /// open period, but the raw event count is the only way to detect
+    /// log truncation between Extending and Ended. Do not remove.
     pub standstill_ended_events: u64,
     pub refreshing_votes: u64,
 
@@ -175,9 +208,43 @@ pub struct OverallStats {
 
     // Cluster slots loose-end signal counts.
     pub no_epoch_metadata: u64,
+    /// `No epoch info for slot <N>` cluster-slots-service log pattern
+    /// count. Each occurrence also raises a Critical `LogPattern` alert
+    /// via `record_log_pattern`, so the operator sees one collapsed
+    /// alert row regardless of the raw count.
+    ///
+    /// Intentionally NOT surfaced as a standalone metric — the alert
+    /// row carries the count already. Reserved for future cluster-slots
+    /// health rate analysis (e.g. occurrences per epoch as a "stale
+    /// metadata" proxy). Do not remove; same one-`u64` cost rationale
+    /// as the other reserved counters.
     pub no_epoch_info_for_slot: u64,
+    /// `Updating epoch_metadata` INFO log count. Counter-only — no
+    /// alert raised (`UpdatingEpochMetadata` is benign in steady-state).
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary —
+    /// reserved for future epoch-boundary diagnostics where an unusual
+    /// update cadence might indicate cluster-slots churn. Do not
+    /// remove; one-`u64` cost.
     pub updating_epoch_metadata: u64,
+    /// `Evicting epoch_metadata` INFO log count. Counter-only — no
+    /// alert raised (`EvictingEpochMetadata` is benign in steady-state).
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary —
+    /// reserved for future epoch-boundary diagnostics (eviction rate
+    /// pairs with `updating_epoch_metadata` for a churn signal). Do
+    /// not remove; one-`u64` cost.
     pub evicting_epoch_metadata: u64,
+    /// `Invalid update call to ClusterSlots, can not roll time
+    /// backwards!` log pattern count. Each occurrence also raises a
+    /// Warn `LogPattern` alert via `record_log_pattern`.
+    ///
+    /// Intentionally NOT surfaced as a standalone metric — the alert
+    /// row carries the count. Reserved for future cluster-slots health
+    /// analysis: a non-zero count is evidence of out-of-order epoch
+    /// update calls into agave's ClusterSlots, which is worth tracking
+    /// independent of the collapsed alert. Do not remove; one-`u64`
+    /// cost.
     pub invalid_cluster_slots_update: u64,
     pub cluster_slots_service_stopped: bool,
 
