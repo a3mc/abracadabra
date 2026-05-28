@@ -150,13 +150,26 @@ pub fn ingest(state: &mut State, event: Event) {
                 format!("Standstill firing at finalized slot {slot}"),
             ));
         }
-        EventKind::StandstillExtending { .. } => {
+        EventKind::StandstillExtending { slot } => {
             state.overall.standstill_extending_events =
                 state.overall.standstill_extending_events.saturating_add(1);
+            // First Extending in a stuck period anchors the entry slot.
+            // Repeated extends inside the same period do not re-anchor.
+            if state.overall.open_standstill_entry.is_none() {
+                state.overall.open_standstill_entry = Some(slot);
+            }
         }
-        EventKind::StandstillEnded { .. } => {
+        EventKind::StandstillEnded {
+            entry_slot,
+            exit_slot,
+        } => {
             state.overall.standstill_ended_events =
                 state.overall.standstill_ended_events.saturating_add(1);
+            state
+                .overall
+                .standstill_ranges
+                .push((entry_slot, exit_slot));
+            state.overall.open_standstill_entry = None;
         }
         EventKind::RefreshingVote => {
             state.overall.refreshing_votes = state.overall.refreshing_votes.saturating_add(1);
@@ -413,6 +426,46 @@ pub fn classify_skips(state: &mut State) {
     state.overall.pending_slot_count = pending_slot_count;
 }
 
+/// Close off an unmatched `StandstillExtending` left open at end-of-stream
+/// by pushing `(entry, max_slot_seen)` into `standstill_ranges`. The log
+/// may have been cut mid-standstill, or the validator may still be in one
+/// at capture time; either way the range needs an upper bound.
+fn close_open_standstill(state: &mut State) {
+    let Some(entry) = state.overall.open_standstill_entry.take() else {
+        return;
+    };
+    let exit = state.slots.keys().copied().max().unwrap_or(entry);
+    state.overall.standstill_ranges.push((entry, exit));
+}
+
+/// Populate `timeout_crashed_leaders_outside_standstill` by iterating
+/// `SlotRecord`s and counting `timeout_crashed_leader_at`-bearing slots
+/// whose slot number is not inside any standstill range.
+///
+/// Ranges expected to be small (single digits in typical logs), so a
+/// linear scan per TCL slot is fine.
+fn compute_tcl_outside_standstill(state: &mut State) {
+    let ranges = &state.overall.standstill_ranges;
+    if ranges.is_empty() {
+        state.overall.timeout_crashed_leaders_outside_standstill =
+            state.overall.timeout_crashed_leaders;
+        return;
+    }
+    let mut count: u64 = 0;
+    for (slot, rec) in &state.slots {
+        if rec.timeout_crashed_leader_at.is_none() {
+            continue;
+        }
+        let in_standstill = ranges
+            .iter()
+            .any(|(entry, exit)| *slot >= *entry && *slot <= *exit);
+        if !in_standstill {
+            count = count.saturating_add(1);
+        }
+    }
+    state.overall.timeout_crashed_leaders_outside_standstill = count;
+}
+
 /// Derived alerts computed after the stream has been fully ingested.
 ///
 /// Emits one `LogPattern` alert per `(severity, module)` group and a
@@ -435,6 +488,8 @@ pub fn analyze(state: &mut State) {
         "analyze() must run at most once per State",
     );
     classify_skips(state);
+    close_open_standstill(state);
+    compute_tcl_outside_standstill(state);
     surface_log_pattern_alerts(state);
     surface_local_leader_summary(state);
     // Establish the post-analyze invariant on `state.alerts`: Critical

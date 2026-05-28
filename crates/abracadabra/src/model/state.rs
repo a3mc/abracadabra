@@ -128,6 +128,22 @@ pub struct OverallStats {
     pub standstill_ended_events: u64,
     pub refreshing_votes: u64,
 
+    /// Closed standstill periods as `(entry_slot, exit_slot)` ranges.
+    /// Built incrementally from `StandstillExtending` / `StandstillEnded`
+    /// events; unmatched `StandstillExtending` at end-of-stream is closed
+    /// off in `aggregator::analyze`.
+    pub standstill_ranges: Vec<(u64, u64)>,
+
+    /// Transient: entry slot of the currently-open standstill, set by
+    /// `StandstillExtending` and cleared by `StandstillEnded`. Closed off
+    /// in `analyze` if non-`None` at the end of ingest.
+    pub open_standstill_entry: Option<u64>,
+
+    /// `timeout_crashed_leaders` filtered to TCLs whose slot is not in
+    /// any standstill range. Populated by `aggregator::analyze`. Equals
+    /// `timeout_crashed_leaders` when `standstill_ranges.is_empty()`.
+    pub timeout_crashed_leaders_outside_standstill: u64,
+
     /// Number of `Triggering parent ready` lines observed — i.e. how many
     /// times `event_handler::add_missing_parent_ready` fired the stuck-
     /// cluster recovery path. Expected to be rare; a spike is a signal

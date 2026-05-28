@@ -237,6 +237,83 @@ fn safe_to_skip_marks_slot_and_counter() {
 }
 
 #[test]
+fn standstill_range_built_and_tcl_excluded() {
+    // Two TCLs: one inside a closed standstill range, one outside.
+    // After `analyze`, only the outside one should be counted in
+    // `timeout_crashed_leaders_outside_standstill`, while
+    // `timeout_crashed_leaders` retains the raw count.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:00.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 1000",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:01.000000000Z INFO  agave_votor::event_handler] \
+         PK: Extending timeouts starting at slot 2000",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:02.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 2050",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:03.000000000Z INFO  agave_votor::event_handler] \
+         PK: Standstill initially detected at slot=2000 has ended at \
+         slot=2100. Ending timeout extension",
+    );
+    analyze(&mut state);
+    assert_eq!(state.overall.timeout_crashed_leaders, 2);
+    assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 1);
+    assert_eq!(state.overall.standstill_ranges, vec![(2000, 2100)]);
+    assert!(state.overall.open_standstill_entry.is_none());
+}
+
+#[test]
+fn standstill_open_at_eos_closes_to_last_slot() {
+    // Extending without a matching Ended at EOS: `analyze` should close
+    // the range using the highest known slot.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:00.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 3500",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:01.000000000Z INFO  agave_votor::event_handler] \
+         PK: Extending timeouts starting at slot 3000",
+    );
+    analyze(&mut state);
+    // Closing range is (3000, max_slot_seen). max_slot = 3500 from the TCL.
+    assert_eq!(state.overall.standstill_ranges, vec![(3000, 3500)]);
+    // TCL at 3500 is inside the closed range → excluded.
+    assert_eq!(state.overall.timeout_crashed_leaders, 1);
+    assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 0);
+}
+
+#[test]
+fn no_standstill_means_excluded_equals_total() {
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:00.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 100",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-23T16:00:01.000000000Z INFO  agave_votor::event_handler] \
+         PK: TimeoutCrashedLeader 200",
+    );
+    analyze(&mut state);
+    assert!(state.overall.standstill_ranges.is_empty());
+    assert_eq!(state.overall.timeout_crashed_leaders, 2);
+    assert_eq!(state.overall.timeout_crashed_leaders_outside_standstill, 2);
+}
+
+#[test]
 fn standstill_emits_inline_alert() {
     let mut state = State::default();
     parse_and_ingest(

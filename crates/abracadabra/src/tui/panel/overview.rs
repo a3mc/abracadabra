@@ -170,6 +170,22 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
+    // Standstill-aware crashed-leader %.
+    //
+    // During standstill the per-slot timeout is stretched (up to ~1h cap),
+    // so a `TimeoutCrashedLeader` event firing inside a standstill range
+    // is not evidence of leader misbehavior — the timeout would have fired
+    // for any leader under that condition. We surface the standstill-
+    // excluded number as the primary signal and the raw (incl. standstill)
+    // value on a continuation line, but only when at least one standstill
+    // range exists in the log.
+    let crashed_outside_pct = if leader_windows_total > 0 {
+        ov.timeout_crashed_leaders_outside_standstill as f64 * 100.0
+            / leader_windows_total as f64
+    } else {
+        0.0
+    };
+    let has_standstill = !ov.standstill_ranges.is_empty();
 
     let (fast_style, fast_mark, fast_verdict) = if fast_pct >= theme::FAST_FIN_GOOD_PCT {
         (theme::good_style(), "[✓]", "healthy (>=80%)")
@@ -220,7 +236,7 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     } else {
         0.0
     };
-    let left_lines = vec![
+    let mut left_lines = vec![
         Line::from(vec![
             Span::styled(format!("  {:<16}", "fast-finalize"), theme::label_style()),
             Span::styled(
@@ -264,17 +280,41 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(format!("  {:<16}", "crashed leaders"), theme::label_style()),
-            Span::styled(format!("{crashed_pct:>6.2}%"), theme::value_style()),
             Span::styled(
                 format!(
-                    "  ({} of {} windows)",
-                    commas(ov.timeout_crashed_leaders),
+                    "{:>6.2}%",
+                    if has_standstill { crashed_outside_pct } else { crashed_pct }
+                ),
+                theme::value_style(),
+            ),
+            Span::styled(
+                format!(
+                    "  ({} of {} windows{})",
+                    commas(if has_standstill {
+                        ov.timeout_crashed_leaders_outside_standstill
+                    } else {
+                        ov.timeout_crashed_leaders
+                    }),
                     commas(leader_windows_total),
+                    if has_standstill { ", excl. standstill" } else { "" },
                 ),
                 theme::label_style(),
             ),
         ]),
     ];
+    if has_standstill {
+        left_lines.push(Line::from(vec![
+            Span::styled(format!("  {:<16}", ""), theme::label_style()),
+            Span::styled(format!("{crashed_pct:>6.2}%"), theme::label_style()),
+            Span::styled(
+                format!(
+                    "  ({} incl. standstill)",
+                    commas(ov.timeout_crashed_leaders),
+                ),
+                theme::label_style(),
+            ),
+        ]));
+    }
 
     let right_lines = vec![
         Line::from(vec![
