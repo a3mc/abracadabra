@@ -34,8 +34,10 @@ pub fn render(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(60), // table
-            Constraint::Percentage(40), // reference
+            Constraint::Percentage(55), // table
+            Constraint::Percentage(45), // reference (bumped from 40 -> 45 after
+                                        // dropping the validator-info footer to
+                                        // give the legend breathing room).
         ])
         .split(chunks[1]);
     render_table(app, frame, bottom[0]);
@@ -110,10 +112,8 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         pipe(),
         Span::styled("leader ", theme::label_style()),
         Span::styled(commas(leader), theme::value_style()),
-        Span::styled(
-            format!(" ({:.2}%)", pct(leader, total)),
-            theme::label_style(),
-        ),
+        // The (X.XX%) suffix that used to live here is now expressed as
+        // `our slot share` on line 2 with an explicit label — see B6.
         pipe(),
         Span::styled("FIN ", theme::label_style()),
         Span::styled(format!("{fin_pct:.1}%"), fin_style),
@@ -142,6 +142,8 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 
     // Line 2 — lifecycle latency percentiles. p50 in accent so the
     // headline reads first; tails neutral; max coloured by health band.
+    // Trailing `our slot share` = leader_slots / total_slots over the
+    // log window (window-relative, not stake — see TRIAGE B6).
     let line2 = Line::from(vec![
         Span::styled("lifecycle ", theme::label_style()),
         Span::styled("p50 ", theme::label_style()),
@@ -155,6 +157,9 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         pipe(),
         Span::styled("max ", theme::label_style()),
         Span::styled(format!("{max_ms} ms"), max_style),
+        pipe(),
+        Span::styled("our slot share ", theme::label_style()),
+        Span::styled(format!("{:.2}%", pct(leader, total)), theme::value_style()),
     ]);
 
     let block = Block::default()
@@ -180,21 +185,22 @@ fn render_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     // the bottom — sections "float" with breathing room rather than
     // clustering at the top. Wrap on every Paragraph keeps content
     // readable on narrow / zoomed viewports.
+    // Validator-share metric used to live in a buried footer section
+    // here; moved into the `slot stats` line 2 (see B6 fix 2026-05-28)
+    // so it has actual visibility. This panel now hosts only the
+    // latency bands and the legend, with breathing room between.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),  // latency content (1 title + 3 bands + 1 p95)
             Constraint::Fill(1),    // gap
             Constraint::Length(12), // legend content (1 title + 11 entries)
-            Constraint::Fill(1),    // gap
-            Constraint::Length(2),  // validator content (1 title + 1 line)
             Constraint::Fill(1),    // bottom gap
         ])
         .split(inner);
 
     render_latency_reference(app, frame, chunks[0]);
     render_legend(app.slot_filters, frame, chunks[2]);
-    render_validator_info(app, frame, chunks[4]);
 }
 
 fn render_latency_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
@@ -383,40 +389,6 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_validator_info(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
-    let state = app.state;
-    let total = state.slots.len() as u64;
-    // Pre-counted once in `App::new` (see `App::leader_slot_count`).
-    let leader = app.leader_slot_count;
-    // A leader window = 4 consecutive slots (Solana
-    // `NUM_CONSECUTIVE_LEADER_SLOTS`). We divide leader-slot count by 4
-    // to derive the window count for display; the aggregator counts
-    // `ProduceWindow` events directly in `state.overall.produce_windows`
-    // (these should match modulo edge truncation at log boundaries).
-    let windows = state.overall.produce_windows;
-
-    let lines = vec![
-        section_title("Our validator"),
-        Line::from(vec![
-            Span::styled("  leader ", theme::label_style()),
-            Span::styled(commas(leader), theme::value_style()),
-            Span::styled(
-                format!(" slots  ≈ {:.2}% stake", pct(leader, total)),
-                theme::label_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  = ", theme::label_style()),
-            Span::styled(commas(windows), theme::value_style()),
-            Span::styled(
-                " 4-slot windows (NUM_CONSECUTIVE_LEADER_SLOTS)",
-                theme::label_style(),
-            ),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
 fn section_title(s: &str) -> Line<'_> {
     Line::from(Span::styled(
         s.to_owned(),
@@ -482,6 +454,10 @@ fn render_table(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         .collect();
 
     let chips = filter_chips(app.slot_filters);
+    // Total slot count is already shown in the `slot stats` KPI strip
+    // above (`slots 179,016`), so the panel title drops the redundant
+    // `N total` field and shows only the cursor position. The filtered
+    // variant still needs the `M of N` count to disambiguate.
     let title = if app.slot_filters.any_active() {
         format!(
             " slots — {chips}  ({} of {} | cursor {} / {}) ",
@@ -492,8 +468,7 @@ fn render_table(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         )
     } else {
         format!(
-            " slots ({} total | cursor {} / {}) ",
-            commas(total as u64),
+            " slots (cursor {} / {}) ",
             commas(app.slot_scroll as u64 + 1),
             commas(total as u64),
         )

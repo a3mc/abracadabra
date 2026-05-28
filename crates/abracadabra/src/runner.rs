@@ -232,13 +232,13 @@ pub fn print_summary(state: &State, stats: &RunStats) {
     // -- Leadership
     if ov.produce_windows > 0 {
         let leader_slots = state.slots.values().filter(|s| s.we_are_leader).count() as u64;
-        let stake_share = pct(leader_slots, total_slots);
+        let leader_slot_share = pct(leader_slots, total_slots);
         println!("\n-- Leadership --");
         println!(
-            "  our leader windows {:>6}   {} slots | ~{:.2}% stake share",
+            "  our leader windows {:>6}   {} slots | {:.2}% leader-slot share",
             commas(ov.produce_windows),
             commas(leader_slots),
-            stake_share,
+            leader_slot_share,
         );
     }
 
