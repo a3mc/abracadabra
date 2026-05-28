@@ -272,26 +272,10 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
     let lines = vec![
         section_title("Filters available:"),
         Line::from(""),
-        // ---- status — split across two lines so the four tag
-        // descriptions don't pack into one ~128-char inline string that
-        // wraps unpredictably on narrow panels.
+        // status filters (description of FIN/CSKIP/SKIP/PEND values
+        // is in the static reference block at the bottom of the panel)
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
-            Span::styled("FIN", theme::good_style()),
-            Span::styled(" finalized   ", theme::label_style()),
-            Span::styled("CSKIP", theme::bad_style()),
-            Span::styled(" we voted skip on canonical", theme::label_style()),
-        ]),
-        Line::from(vec![
-            Span::styled(TAG_INDENT, theme::label_style()),
-            Span::styled("SKIP", theme::warn_style()),
-            Span::styled(" we voted skip, outcome unknown   ", theme::label_style()),
-            Span::styled("PEND", theme::label_style()),
-            Span::styled(" pending", theme::label_style()),
-        ]),
-        // status filters
-        Line::from(vec![
-            Span::styled(TAG_INDENT, theme::label_style()),
             mark(filters.skipped_only),
             Span::styled("s ", theme::accent_style()),
             Span::styled("SKIP", theme::warn_style()),
@@ -370,14 +354,32 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
                 theme::label_style(),
             ),
         ]),
-        // ---- footer: clear-all utility, then the static vote-column
-        // reference at the absolute bottom (per 2026-05-28 layout pass).
-        // Blank spacer separates the static reference from the
-        // interactive filter rows above.
+        // ---- footer: clear-all utility, then the static column-value
+        // reference rows at the absolute bottom (status descriptions,
+        // vote pattern, consensus inverted glyph). These describe what
+        // column values mean — they are not filter toggles — so they
+        // sit below the [c] separator. Each subgroup gets a blank
+        // line above it for visual grouping.
+        Line::from(""),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
             Span::styled("[c] ", theme::accent_style()),
             Span::styled("clear all filters", theme::label_style()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  status  ", theme::label_style()),
+            Span::styled("FIN", theme::good_style()),
+            Span::styled(" finalized   ", theme::label_style()),
+            Span::styled("CSKIP", theme::bad_style()),
+            Span::styled(" we voted skip on canonical", theme::label_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            Span::styled("SKIP", theme::warn_style()),
+            Span::styled(" we voted skip, outcome unknown   ", theme::label_style()),
+            Span::styled("PEND", theme::label_style()),
+            Span::styled(" pending", theme::label_style()),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -388,6 +390,12 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(" finalize  ", theme::label_style()),
             Span::styled("S", theme::value_style()),
             Span::styled(" skip", theme::label_style()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  consensus ", theme::label_style()),
+            Span::styled("↶", theme::accent_style()),
+            Span::styled("  cluster finalized before local replay", theme::label_style()),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -581,13 +589,23 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
     let leader_mark = if s.we_are_leader { "[*]" } else { "" };
     let events = events_str(s);
 
+    // Consensus cell: when the cert beat local replay (`consensus_inverted`),
+    // render `↶` in accent colour instead of the plain `-` used for
+    // missing-data rows. Right-padded into the column to match the
+    // `NNN.N ms` width of the data path.
+    let (consensus_text, consensus_style) = if s.consensus_inverted {
+        ("        ↶".to_owned(), theme::accent_style())
+    } else {
+        (fmt_ms(s.consensus_ms), theme::value_style())
+    };
+
     Row::new(vec![
         Line::from(Span::styled(commas(s.slot), theme::value_style())),
         Line::from(Span::styled(s.status_str(), status_style)),
         Line::from(Span::styled(s.fast_str(), path_style)),
         Line::from(Span::styled(leader_mark, theme::title_style())),
         Line::from(Span::styled(fmt_ms(s.assembly_ms), asm_style)),
-        Line::from(Span::styled(fmt_ms(s.consensus_ms), theme::value_style())),
+        Line::from(Span::styled(consensus_text, consensus_style)),
         Line::from(Span::styled(fmt_ms(s.lifecycle_ms), lat_style)),
         Line::from(Span::styled(s.vote_pattern(), theme::value_style())),
         Line::from(Span::styled(events, theme::warn_style())),

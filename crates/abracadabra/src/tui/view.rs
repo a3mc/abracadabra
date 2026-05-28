@@ -18,7 +18,18 @@ pub struct SlotViewRow {
     /// `first_shred_at` → `block_emitted_at` (shred reception + replay).
     pub assembly_ms: Option<f64>,
     /// `block_emitted_at` → `finalized_at` (pure consensus rounds).
+    /// `None` when either timestamp is missing OR when finalized_at
+    /// precedes block_emitted_at (cluster outran our local replay) —
+    /// the latter case is also flagged in `consensus_inverted` so the
+    /// renderer can distinguish "data missing" from "early cert".
     pub consensus_ms: Option<f64>,
+    /// True when both `block_emitted_at` and `finalized_at` are Some
+    /// AND `finalized_at < block_emitted_at` — i.e. the finalization
+    /// cert arrived via gossip before our local replay completed.
+    /// Honest, observable, rare-ish ordering. The TUI renders this
+    /// with a distinct glyph (`↶`) instead of the plain `-` used for
+    /// missing-data rows.
+    pub consensus_inverted: bool,
     /// `first_shred_at` → `finalized_at` (full lifecycle = assembly + consensus).
     pub lifecycle_ms: Option<f64>,
     pub voted_notarize: bool,
@@ -34,6 +45,14 @@ impl SlotViewRow {
         let to_ms = |us: i64| us as f64 / 1000.0;
         let assembly_ms = SlotRecord::delta_us(r.first_shred_at, r.block_emitted_at).map(to_ms);
         let consensus_ms = SlotRecord::delta_us(r.block_emitted_at, r.finalized_at).map(to_ms);
+        // Detect the early-cert ordering separately from
+        // missing-data: both anchors are present AND the cert beats
+        // local replay. `delta_us` returns `None` in this case, so we
+        // re-check the underlying timestamps to surface the cause.
+        let consensus_inverted = matches!(
+            (r.block_emitted_at, r.finalized_at),
+            (Some(b), Some(f)) if f < b
+        );
         let lifecycle_ms = SlotRecord::delta_us(r.first_shred_at, r.finalized_at).map(to_ms);
         Self {
             slot: r.slot,
@@ -43,6 +62,7 @@ impl SlotViewRow {
             we_are_leader: r.we_are_leader,
             assembly_ms,
             consensus_ms,
+            consensus_inverted,
             lifecycle_ms,
             voted_notarize: r.voted_notarize_at.is_some(),
             voted_finalize: r.voted_finalize_at.is_some(),
@@ -263,6 +283,7 @@ mod tests {
             we_are_leader: false,
             assembly_ms: None,
             consensus_ms: None,
+            consensus_inverted: false,
             lifecycle_ms: None,
             voted_notarize: n,
             voted_finalize: f,

@@ -17,7 +17,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
 use crate::model::alerts::{Alert, AlertKind, Severity};
@@ -148,11 +148,15 @@ fn render_list(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         " alerts ({}) — j/k cursor · CRIT first, by count ",
         state.alerts.len(),
     );
+    // 1-line top pad so the first alert row isn't jammed against the
+    // title bar / border. Bottom/left/right kept at 0 — ratatui's
+    // List widget handles internal indentation via the row spans.
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_style(theme::title_style()),
+            .title_style(theme::title_style())
+            .padding(Padding::new(0, 0, 1, 0)),
     );
     let mut lstate = ListState::default();
     lstate.select(Some(
@@ -259,11 +263,16 @@ fn render_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         return;
     };
 
+    // Padding gives breathing room from the border on all sides:
+    // 2 left, 1 right, 1 top, 0 bottom. Applied to the outer block
+    // so all three detail-render variants inherit it without each
+    // having to inject leading-space spans per line.
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(" detail ")
         .title_style(theme::title_style())
-        .border_style(theme::label_style());
+        .border_style(theme::label_style())
+        .padding(Padding::new(2, 1, 1, 0));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -363,6 +372,7 @@ fn render_local_leader_detail(
             Span::styled("last    ", theme::label_style()),
             Span::styled(fmt_ts(last_at), theme::value_style()),
         ]),
+        Line::raw(""),
         Line::from(vec![
             Span::styled("span    ", theme::label_style()),
             Span::styled(span_str, theme::accent_style()),
@@ -470,16 +480,19 @@ fn render_log_pattern_detail(
             Span::styled("last    ", theme::label_style()),
             Span::styled(fmt_ts(group.last_at), theme::value_style()),
         ]),
+        Line::raw(""),
         Line::from(vec![
             Span::styled("span    ", theme::label_style()),
             Span::styled(span_str, theme::accent_style()),
         ]),
         Line::raw(""),
         Line::from(vec![Span::styled("first sample", theme::label_style())]),
+        Line::raw(""),
         Line::from(vec![Span::styled(
             sanitize_for_tui(&group.sample_body).into_owned(),
             theme::value_style(),
         )]),
+        Line::raw(""),
         Line::from(vec![Span::styled(
             "  (later bodies may differ — sample is the first one seen)",
             theme::label_style(),

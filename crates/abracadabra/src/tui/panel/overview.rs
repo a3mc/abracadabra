@@ -9,7 +9,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::model::alerts::Severity;
@@ -590,36 +590,46 @@ fn render_resume_stats(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
 // ---------- Alerts summary ----------
 
 fn render_alerts_summary(state: &State, frame: &mut Frame<'_>, area: Rect) {
-    if state.alerts.is_empty() {
-        let line = Line::from(vec![Span::styled("(no alerts)", theme::good_style())]);
-        paragraph_in_block(frame, area, " alerts ", vec![line]);
-        return;
-    }
-    let lines: Vec<Line<'_>> = state
-        .alerts
-        .iter()
-        .map(|a| {
-            let (tag, style) = match a.severity {
-                Severity::Info => ("[INFO]", theme::label_style()),
-                Severity::Warn => ("[WARN]", theme::warn_style()),
-                Severity::Critical => ("[CRIT]", theme::bad_style()),
-            };
-            Line::from(vec![
-                Span::styled(tag, style),
-                Span::raw(" "),
-                // Alert descriptions can include log-derived bodies
-                // (LogPattern groups embed the sample) — strip control
-                // bytes before they reach the terminal.
-                Span::raw(sanitize_for_tui(&a.description).into_owned()),
-            ])
-        })
-        .collect();
-    paragraph_in_block(
-        frame,
-        area,
-        &format!(" alerts ({}) ", state.alerts.len()),
-        lines,
-    );
+    // This widget uses its own block (not `paragraph_in_block`) so
+    // the `Padding::new(2, 1, 1, 0)` treatment is scoped here only —
+    // other overview widgets keep their current zero-padding layout.
+    let title = if state.alerts.is_empty() {
+        " alerts ".to_owned()
+    } else {
+        format!(" alerts ({}) ", state.alerts.len())
+    };
+    let lines: Vec<Line<'_>> = if state.alerts.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            "(no alerts)",
+            theme::good_style(),
+        )])]
+    } else {
+        state
+            .alerts
+            .iter()
+            .map(|a| {
+                let (tag, style) = match a.severity {
+                    Severity::Info => ("[INFO]", theme::label_style()),
+                    Severity::Warn => ("[WARN]", theme::warn_style()),
+                    Severity::Critical => ("[CRIT]", theme::bad_style()),
+                };
+                Line::from(vec![
+                    Span::styled(tag, style),
+                    Span::raw(" "),
+                    // Alert descriptions can include log-derived bodies
+                    // (LogPattern groups embed the sample) — strip
+                    // control bytes before they reach the terminal.
+                    Span::raw(sanitize_for_tui(&a.description).into_owned()),
+                ])
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(theme::title_style())
+        .padding(Padding::new(2, 1, 1, 0));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // ---------- shared helpers ----------
