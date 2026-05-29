@@ -200,10 +200,81 @@ fn standstill_emits_inline_alert() {
          ALNSCya: Standstill 1234567",
     );
     assert_eq!(state.overall.standstill_events, 1);
-    assert!(state
+    assert!(state.alerts.iter().any(|a| matches!(
+        a.kind,
+        AlertKind::StandstillObserved {
+            at_slot: 1_234_567,
+            count: 1,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn repeated_standstill_at_same_slot_merges_into_one_alert() {
+    // Sustained cluster halt — `Standstill {slot}` fires every ~10s at
+    // the same slot. The aggregator must merge into a single alert
+    // (count = N, last_at updated) rather than push N separate alerts.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-28T17:50:01.000000000Z INFO  agave_votor::event_handler] \
+         ALNSCya: Standstill 2063704",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-28T17:50:12.000000000Z INFO  agave_votor::event_handler] \
+         ALNSCya: Standstill 2063704",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-28T17:50:23.000000000Z INFO  agave_votor::event_handler] \
+         ALNSCya: Standstill 2063704",
+    );
+    // Event counter still tracks every firing.
+    assert_eq!(state.overall.standstill_events, 3);
+    // Alerts collapse to one.
+    let standstill_alerts: Vec<&AlertKind> = state
         .alerts
         .iter()
-        .any(|a| matches!(a.kind, AlertKind::StandstillObserved { at_slot: 1_234_567 })));
+        .filter(|a| matches!(a.kind, AlertKind::StandstillObserved { .. }))
+        .map(|a| &a.kind)
+        .collect();
+    assert_eq!(standstill_alerts.len(), 1);
+    match standstill_alerts[0] {
+        AlertKind::StandstillObserved {
+            at_slot,
+            count,
+            last_at,
+        } => {
+            assert_eq!(*at_slot, 2_063_704);
+            assert_eq!(*count, 3);
+            assert_eq!(*last_at, time::macros::datetime!(2026-05-28 17:50:23 UTC));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn standstills_at_distinct_slots_remain_separate_alerts() {
+    // Two cluster halts at different anchor slots — must NOT merge.
+    let mut state = State::default();
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-28T17:50:01.000000000Z INFO  agave_votor::event_handler] \
+         ALNSCya: Standstill 2063704",
+    );
+    parse_and_ingest(
+        &mut state,
+        "[2026-05-28T18:00:00.000000000Z INFO  agave_votor::event_handler] \
+         ALNSCya: Standstill 2063750",
+    );
+    let standstill_count = state
+        .alerts
+        .iter()
+        .filter(|a| matches!(a.kind, AlertKind::StandstillObserved { .. }))
+        .count();
+    assert_eq!(standstill_count, 2);
 }
 
 #[test]

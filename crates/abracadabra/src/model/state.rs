@@ -183,6 +183,15 @@ pub struct OverallStats {
     /// in `analyze` if non-`None` at the end of ingest.
     pub open_standstill_entry: Option<u64>,
 
+    /// Transient: per-`at_slot` index into `state.alerts` for live
+    /// `AlertKind::StandstillObserved` entries. Allows the aggregator
+    /// to merge subsequent `Standstill {slot}` events at the same slot
+    /// into the existing alert (count++, last_at update) rather than
+    /// pushing a new alert each time. Indices are valid only during
+    /// ingest — `analyze` re-sorts `state.alerts` afterward and the
+    /// map is no longer consulted.
+    pub standstill_alert_indices: HashMap<u64, usize>,
+
     /// `timeout_crashed_leaders` filtered to TCLs whose slot is not in
     /// any standstill range. Populated by `aggregator::analyze`. Equals
     /// `timeout_crashed_leaders` when `standstill_ranges.is_empty()`.

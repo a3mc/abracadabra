@@ -18,8 +18,20 @@ pub enum AlertKind {
     /// Informational marker, NOT a problem on its own.
     ClusterSlotsShutdownObserved,
 
-    /// Standstill firing — finalization stalled for ≥10s.
-    StandstillObserved { at_slot: u64 },
+    /// Standstill firing — finalization stalled for ≥10s. During a
+    /// sustained cluster halt the `Standstill {slot}` log line repeats
+    /// every ~10s with the same `at_slot` (the highest finalized slot
+    /// the cluster cannot advance past). The aggregator dedups by
+    /// `at_slot`: the first event pushes the alert, subsequent events
+    /// at the same slot bump `count` and update `last_at` on the
+    /// existing entry. The enclosing `Alert.at` field carries the
+    /// *first* firing timestamp, matching `LogPattern.first_at`
+    /// semantics.
+    StandstillObserved {
+        at_slot: u64,
+        count: u64,
+        last_at: OffsetDateTime,
+    },
 
     /// Repeated WARN/ERROR lines from a single module that no dedicated
     /// parser recognises. Aggregated by `(severity, module)` so noisy
@@ -75,13 +87,21 @@ mod tests {
         let a = Alert::new(
             Severity::Warn,
             datetime!(2026-05-24 13:06:32 UTC),
-            AlertKind::StandstillObserved { at_slot: 1207084 },
+            AlertKind::StandstillObserved {
+                at_slot: 1207084,
+                count: 1,
+                last_at: datetime!(2026-05-24 13:06:32 UTC),
+            },
             "stuck".to_owned(),
         );
         assert_eq!(a.severity, Severity::Warn);
         assert!(matches!(
             a.kind,
-            AlertKind::StandstillObserved { at_slot: 1207084 }
+            AlertKind::StandstillObserved {
+                at_slot: 1207084,
+                count: 1,
+                ..
+            }
         ));
     }
 }

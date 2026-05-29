@@ -204,12 +204,14 @@ fn severity_tag(s: Severity) -> (&'static str, Style) {
     }
 }
 
-/// Best-effort "count" per alert kind. For `LogPattern` it's the group
-/// count; for `LocalLeaderSummary` it's the leader-slot count. Other
-/// kinds are singleton events and report `1`.
+/// Best-effort "count" per alert kind. For `LogPattern` and merged
+/// `StandstillObserved` entries it's the firing count; for
+/// `LocalLeaderSummary` it's the leader-slot count. Other kinds are
+/// singleton events and report `1`.
 const fn alert_count(a: &Alert) -> u64 {
     match &a.kind {
         AlertKind::LogPattern { count, .. } => *count,
+        AlertKind::StandstillObserved { count, .. } => *count,
         AlertKind::LocalLeaderSummary { slot_count, .. } => *slot_count,
         _ => 1,
     }
@@ -333,10 +335,6 @@ fn render_local_leader_detail(
         ])
         .split(area);
 
-    // Annotate the math explicitly: a "leader window" is a 4-slot
-    // burst (Solana `NUM_CONSECUTIVE_LEADER_SLOTS = 4`). Without the
-    // qualifier the relationship between `windows` and `slots` reads
-    // arbitrary.
     let lines = vec![
         Line::from(vec![
             Span::styled(tag, tag_style),
@@ -350,20 +348,12 @@ fn render_local_leader_detail(
                 commas(window_count),
                 theme::value_style().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "    (4-slot bursts, per NUM_CONSECUTIVE_LEADER_SLOTS)",
-                theme::label_style(),
-            ),
         ]),
         Line::from(vec![
             Span::styled("slots   ", theme::label_style()),
             Span::styled(
                 commas(slot_count),
                 theme::value_style().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("    = {} × 4", commas(window_count)),
-                theme::label_style(),
             ),
         ]),
         Line::from(vec![
@@ -382,9 +372,14 @@ fn render_local_leader_detail(
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
 
+    // X-axis is auto-scaled to the first/last ProduceWindow timestamps,
+    // NOT to the full log time range. The `autoscale` suffix makes
+    // that explicit: if the chart appears to fill the panel, it does
+    // — but only across the leader-window-active span, which may be
+    // shorter than the log span.
     let axis_caption = Line::from(Span::styled(
         format!(
-            "  leader windows over time   {}  →  {}",
+            "  leader windows over time   {}  →  {}   (autoscale)",
             short_ts(first_at),
             short_ts(last_at),
         ),
@@ -503,9 +498,12 @@ fn render_log_pattern_detail(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
 
     // Axis caption above the sparkline so the user can read time→.
+    // Same `(autoscale)` suffix as the LocalLeaderSummary path —
+    // X-axis is bounded by this pattern's first/last occurrence, not
+    // the full log time range.
     let axis_caption = Line::from(Span::styled(
         format!(
-            "  events over time   {}  →  {}",
+            "  events over time   {}  →  {}   (autoscale)",
             short_ts(group.first_at),
             short_ts(group.last_at),
         ),
@@ -549,29 +547,77 @@ fn render_generic_detail(alert: &Alert, frame: &mut Frame<'_>, area: Rect) {
         AlertKind::IdentityChanged => "operator identity rotation",
         _ => "single-event marker",
     };
-    let lines = vec![
+
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(tag, tag_style),
             Span::raw("  "),
             Span::styled(kind_label, theme::accent_style()),
         ]),
         Line::raw(""),
-        Line::from(vec![
+    ];
+
+    // Standstill-specific multi-firing rows. Other kinds fall through
+    // to the single-`at` row + footer below.
+    let is_multi_firing_standstill = matches!(
+        &alert.kind,
+        AlertKind::StandstillObserved { count, .. } if *count > 1
+    );
+    if let AlertKind::StandstillObserved {
+        at_slot,
+        count,
+        last_at,
+    } = &alert.kind
+    {
+        lines.push(Line::from(vec![
+            Span::styled("anchor    ", theme::label_style()),
+            Span::styled(format!("slot {at_slot}"), theme::value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("firings   ", theme::label_style()),
+            Span::styled(
+                commas(*count),
+                theme::value_style().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("first at  ", theme::label_style()),
+            Span::styled(fmt_ts(alert.at), theme::value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("last at   ", theme::label_style()),
+            Span::styled(fmt_ts(*last_at), theme::value_style()),
+        ]));
+        let span_secs = (*last_at - alert.at).whole_seconds().max(0);
+        if span_secs > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("span      ", theme::label_style()),
+                Span::styled(humanize_dur(span_secs), theme::accent_style()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
             Span::styled("at        ", theme::label_style()),
             Span::styled(fmt_ts(alert.at), theme::value_style()),
-        ]),
-        Line::raw(""),
-        Line::from(vec![Span::styled("description", theme::label_style())]),
-        Line::from(vec![Span::styled(
-            sanitize_for_tui(&alert.description).into_owned(),
-            theme::value_style(),
-        )]),
-        Line::raw(""),
-        Line::from(vec![Span::styled(
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "description",
+        theme::label_style(),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        sanitize_for_tui(&alert.description).into_owned(),
+        theme::value_style(),
+    )]));
+    lines.push(Line::raw(""));
+    if !is_multi_firing_standstill {
+        lines.push(Line::from(vec![Span::styled(
             "  (this alert is a single-event marker — no per-line timestamps to plot)",
             theme::label_style(),
-        )]),
-    ];
+        )]));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 

@@ -44,6 +44,11 @@ enum Kind {
     /// Per-bucket time value in milliseconds. Stats line shows min /
     /// avg / max.
     Time,
+    /// Per-bucket rate value (e.g. tx/s). Stats line shows min / avg
+    /// / peak with the unit suffix. No "total" because summing a rate
+    /// across buckets is meaningless; no "/bkt" suffix because each
+    /// value already is a per-second rate, not a per-bucket count.
+    Rate,
 }
 
 /// Per-bucket secondary series rendered as a second sparkline below
@@ -83,6 +88,11 @@ struct Metric {
     /// Optional second sparkline (e.g. canonical-skip below total
     /// vote-skip). When present, the chart area is split 50/50.
     secondary: Option<SecondarySeries>,
+    /// Optional pre-formatted extra stat appended to the stats line
+    /// (e.g. `~14k tx/block` on the tx-pressure card). Lets a card
+    /// surface a single derived value without paying for a separate
+    /// card slot when the grid is already full.
+    subtitle: Option<String>,
 }
 
 impl Metric {
@@ -116,7 +126,13 @@ impl Metric {
             deviation,
             dev_peak,
             secondary,
+            subtitle: None,
         }
+    }
+
+    fn with_subtitle(mut self, subtitle: String) -> Self {
+        self.subtitle = Some(subtitle);
+        self
     }
 }
 
@@ -236,18 +252,25 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
     // sparse vs sustained patterns at a glance: 8/127 reads as
     // sparse, 127/127 as sustained.
     let stats_line = match m.kind {
-        Kind::Time => Line::from(vec![
-            Span::styled("min ", theme::label_style()),
-            Span::styled(format_value(min, m.kind), theme::value_style()),
-            Span::styled("  avg ", theme::label_style()),
-            Span::styled(format_value(avg, m.kind), theme::value_style()),
-            Span::styled("  max ", theme::label_style()),
-            Span::styled(format_value(max, m.kind), theme::value_style()),
-            Span::styled(
+        Kind::Time | Kind::Rate => {
+            let mut spans = vec![
+                Span::styled("min ", theme::label_style()),
+                Span::styled(format_value(min, m.kind), theme::value_style()),
+                Span::styled("  avg ", theme::label_style()),
+                Span::styled(format_value(avg, m.kind), theme::value_style()),
+                Span::styled("  peak ", theme::label_style()),
+                Span::styled(format_value(max, m.kind), theme::value_style()),
+            ];
+            if let Some(sub) = &m.subtitle {
+                spans.push(Span::styled("  ·  ", theme::label_style()));
+                spans.push(Span::styled(sub.clone(), theme::value_style()));
+            }
+            spans.push(Span::styled(
                 format!("  ·  active {active}/{n_buckets} bkts"),
                 theme::label_style(),
-            ),
-        ]),
+            ));
+            Line::from(spans)
+        }
         Kind::Count => {
             let mut spans = vec![
                 Span::styled("total ", theme::label_style()),
@@ -330,6 +353,18 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
     let s2s = b.safe_to_skip_count();
     let our_leader = b.our_leader_slot_count();
     let final_total = b.finalized_total_count();
+    let tx_rate = b.tx_per_second();
+    // Overall avg signatures per block across the log = Σ signature_sum /
+    // Σ blocks observed. Pretty-formatted for the tx-pressure subtitle:
+    // `~14k tx/block`. Bucket-size-independent, so a 10m bucket and a
+    // 1h bucket read on the same scale (unlike per-bucket counts).
+    let total_sigs: u64 = b.buckets.iter().map(|x| x.signature_sum).sum();
+    let total_blocks: u64 = b.buckets.iter().map(|x| x.signature_sample_count).sum();
+    let avg_tx_per_block = if total_blocks > 0 {
+        total_sigs / total_blocks
+    } else {
+        0
+    };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let lat_ms: Vec<u64> = b
         .lifecycle_p95_us()
@@ -415,6 +450,18 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
             theme::SPARK_TIME,
             resume_ms,
         )),
+        // Tx pressure: signed transactions per second, computed from
+        // bank-frozen signature_count. Includes both user txs and vote
+        // txs — baseline at ~2 votes per active validator per slot
+        // means most of the baseline is votes; spikes above baseline
+        // are real user load. SPARK_TIME (cyan) — pressure is a neutral
+        // input metric, not a health verdict; the operator reads it
+        // alongside skip / latency / crashed-leader cards to spot
+        // correlations.
+        CardSpec::Single(
+            Metric::new("tx pressure", Kind::Rate, theme::SPARK_TIME, tx_rate)
+                .with_subtitle(format!("{} tx/block (avg)", commas(avg_tx_per_block))),
+        ),
     ]
 }
 
@@ -754,6 +801,7 @@ fn format_value(v: u64, kind: Kind) -> String {
     match kind {
         Kind::Count => commas(v),
         Kind::Time => format!("{v} ms"),
+        Kind::Rate => format!("{} tx/s", commas(v)),
     }
 }
 

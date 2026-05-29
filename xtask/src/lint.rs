@@ -124,16 +124,30 @@ pub fn run_lint() -> Result<(), String> {
 }
 
 pub fn run_lint_production() -> Result<(), String> {
-    println!("--- Clippy: production code (excludes xtask) ---\n");
+    // Mirrors the CI strict gate exactly:
+    //
+    //   cargo clippy --workspace --all-targets --locked -- -D warnings
+    //
+    // Previously this command used `--bins --exclude xtask` and did not
+    // pass `-D warnings`, which let lib-only / test-only / Cargo.lock
+    // drift slip past lint-prod but get caught on CI. The whole point
+    // of running lint-prod locally is "if it passes, CI passes" — that
+    // contract requires identical clippy arguments.
+    //
+    // For the grouped per-lint dashboard view, use `cargo xtask
+    // dashboard-prod` instead — it keeps the relaxed args by design.
+    println!("--- Clippy: workspace, all targets, locked, -D warnings (CI parity) ---\n");
 
     let output = Command::new("cargo")
         .args([
             "clippy",
             "--workspace",
-            "--exclude",
-            "xtask",
-            "--bins",
+            "--all-targets",
+            "--locked",
             "--message-format=short",
+            "--",
+            "-D",
+            "warnings",
         ])
         .output()
         .map_err(|e| format!("Failed to run clippy: {e}"))?;
@@ -153,6 +167,10 @@ pub fn run_lint_production() -> Result<(), String> {
     }
 
     if warnings > 0 {
+        // With `-D warnings` clippy converts warnings to errors so this
+        // branch is normally unreachable; guard kept for the case where
+        // a warning is emitted by a sub-tool that doesn't honour the
+        // deny flag (e.g. rustc-internal warning categories).
         println!("\n[WARN] {warnings} warnings found");
     } else {
         println!("\n[PASS] Production code: zero warnings");

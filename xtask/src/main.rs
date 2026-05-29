@@ -48,7 +48,8 @@ fn print_help() {
 
 Commands:
   lint              Clippy on all workspace targets
-  lint-prod         Clippy on production code only (excludes xtask)
+  lint-prod         Strict CI-parity clippy: --workspace --all-targets --locked -- -D warnings
+                    (run before commit; passing here means CI will pass)
   test              Full workspace test suite
   check             Quick compile check
   dashboard         Clippy dashboard grouped by lint / crate / file (all targets)
