@@ -163,11 +163,8 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         "fast-finalize",
         &format!("{fast_pct:>5.2}%"),
         fast_pct >= 80.0,
-        if fast_pct >= 80.0 {
-            "healthy (>=80%)"
-        } else {
-            "DEGRADED — cluster fragmented"
-        },
+        "healthy (>=80%)",
+        "DEGRADED — cluster fragmented",
     );
     let total_slots = state.slots.len() as u64;
     // Canonical-skip percentage is the operator-facing failure
@@ -210,6 +207,7 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         &commas(ov.standstill_events),
         ov.standstill_events == 0,
         "no liveness issues",
+        "STANDSTILL OBSERVED",
     );
     let frag = ov.safe_to_notar.saturating_add(ov.safe_to_skip);
     let observed_hours = meta
@@ -222,16 +220,30 @@ pub fn print_summary(state: &State, stats: &RunStats) {
         commas(frag),
         frag as f64 / observed_hours,
     );
-    println!(
-        "  {:<18} {:>6}   leader windows that timed out",
-        "crashed leaders",
-        commas(ov.timeout_crashed_leaders),
-    );
+    // Match the TUI overview: when standstill ranges exist, primary
+    // count excludes TCLs that fired inside a standstill window
+    // (where the timeout was stretched and the leader did not
+    // misbehave). Raw count remains visible as a parenthetical.
+    if ov.standstill_ranges.is_empty() {
+        println!(
+            "  {:<18} {:>6}   leader windows that timed out",
+            "crashed leaders",
+            commas(ov.timeout_crashed_leaders),
+        );
+    } else {
+        println!(
+            "  {:<18} {:>6}   leader windows that timed out (excl. standstill; raw {})",
+            "crashed leaders",
+            commas(ov.timeout_crashed_leaders_outside_standstill),
+            commas(ov.timeout_crashed_leaders),
+        );
+    }
     health_line(
         "refresh votes",
         &commas(ov.refreshing_votes),
         ov.refreshing_votes == 0,
         "no standstill recoveries",
+        "resume activity",
     );
 
     // -- Leadership
@@ -378,8 +390,17 @@ pub fn print_summary(state: &State, stats: &RunStats) {
     println!();
 }
 
-fn health_line(label: &str, value: &str, healthy: bool, note: &str) {
-    let mark = if healthy { "[✓]" } else { "[✗]" };
+/// Render a `label value [✓/✗] note` row. Takes separate notes for the
+/// healthy and unhealthy paths — the old single-`note` signature was
+/// printing contradictory rows like `standstills 961 [✗] no liveness
+/// issues` (mark says fail, text says "no issues"). Mirrors the
+/// `verdict_line` helper used by the TUI overview panel.
+fn health_line(label: &str, value: &str, healthy: bool, ok_note: &str, bad_note: &str) {
+    let (mark, note) = if healthy {
+        ("[✓]", ok_note)
+    } else {
+        ("[✗]", bad_note)
+    };
     println!("  {label:<18} {value:>6}   {mark} {note}");
 }
 
