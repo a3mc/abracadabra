@@ -335,10 +335,6 @@ fn render_local_leader_detail(
         ])
         .split(area);
 
-    // Annotate the math explicitly: a "leader window" is a 4-slot
-    // burst (Solana `NUM_CONSECUTIVE_LEADER_SLOTS = 4`). Without the
-    // qualifier the relationship between `windows` and `slots` reads
-    // arbitrary.
     let lines = vec![
         Line::from(vec![
             Span::styled(tag, tag_style),
@@ -352,20 +348,12 @@ fn render_local_leader_detail(
                 commas(window_count),
                 theme::value_style().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "    (4-slot bursts, per NUM_CONSECUTIVE_LEADER_SLOTS)",
-                theme::label_style(),
-            ),
         ]),
         Line::from(vec![
             Span::styled("slots   ", theme::label_style()),
             Span::styled(
                 commas(slot_count),
                 theme::value_style().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("    = {} × 4", commas(window_count)),
-                theme::label_style(),
             ),
         ]),
         Line::from(vec![
@@ -384,9 +372,14 @@ fn render_local_leader_detail(
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
 
+    // X-axis is auto-scaled to the first/last ProduceWindow timestamps,
+    // NOT to the full log time range. The `autoscale` suffix makes
+    // that explicit: if the chart appears to fill the panel, it does
+    // — but only across the leader-window-active span, which may be
+    // shorter than the log span.
     let axis_caption = Line::from(Span::styled(
         format!(
-            "  leader windows over time   {}  →  {}",
+            "  leader windows over time   {}  →  {}   (autoscale)",
             short_ts(first_at),
             short_ts(last_at),
         ),
@@ -505,9 +498,12 @@ fn render_log_pattern_detail(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
 
     // Axis caption above the sparkline so the user can read time→.
+    // Same `(autoscale)` suffix as the LocalLeaderSummary path —
+    // X-axis is bounded by this pattern's first/last occurrence, not
+    // the full log time range.
     let axis_caption = Line::from(Span::styled(
         format!(
-            "  events over time   {}  →  {}",
+            "  events over time   {}  →  {}   (autoscale)",
             short_ts(group.first_at),
             short_ts(group.last_at),
         ),
