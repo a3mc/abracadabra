@@ -44,6 +44,11 @@ enum Kind {
     /// Per-bucket time value in milliseconds. Stats line shows min /
     /// avg / max.
     Time,
+    /// Per-bucket rate value (e.g. tx/s). Stats line shows min / avg
+    /// / peak with the unit suffix. No "total" because summing a rate
+    /// across buckets is meaningless; no "/bkt" suffix because each
+    /// value already is a per-second rate, not a per-bucket count.
+    Rate,
 }
 
 /// Per-bucket secondary series rendered as a second sparkline below
@@ -236,12 +241,12 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, m: &Metric) {
     // sparse vs sustained patterns at a glance: 8/127 reads as
     // sparse, 127/127 as sustained.
     let stats_line = match m.kind {
-        Kind::Time => Line::from(vec![
+        Kind::Time | Kind::Rate => Line::from(vec![
             Span::styled("min ", theme::label_style()),
             Span::styled(format_value(min, m.kind), theme::value_style()),
             Span::styled("  avg ", theme::label_style()),
             Span::styled(format_value(avg, m.kind), theme::value_style()),
-            Span::styled("  max ", theme::label_style()),
+            Span::styled("  peak ", theme::label_style()),
             Span::styled(format_value(max, m.kind), theme::value_style()),
             Span::styled(
                 format!("  ·  active {active}/{n_buckets} bkts"),
@@ -425,8 +430,8 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
         // alongside skip / latency / crashed-leader cards to spot
         // correlations.
         CardSpec::Single(Metric::new(
-            "tx pressure (tx/s)",
-            Kind::Count,
+            "tx pressure",
+            Kind::Rate,
             theme::SPARK_TIME,
             tx_rate,
         )),
@@ -769,6 +774,7 @@ fn format_value(v: u64, kind: Kind) -> String {
     match kind {
         Kind::Count => commas(v),
         Kind::Time => format!("{v} ms"),
+        Kind::Rate => format!("{} tx/s", commas(v)),
     }
 }
 
