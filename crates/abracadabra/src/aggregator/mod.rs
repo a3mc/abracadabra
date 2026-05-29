@@ -219,8 +219,19 @@ pub fn ingest(state: &mut State, event: Event) {
                 "Operator rotated validator identity (Set identity event)".to_owned(),
             ));
         }
-        EventKind::BankFrozen { .. } => {
+        EventKind::BankFrozen {
+            slot,
+            signature_count,
+            ..
+        } => {
             state.overall.bank_frozen_count = state.overall.bank_frozen_count.saturating_add(1);
+            // signature_count = signed tx count in the bank (user txs +
+            // vote txs). Saved on the SlotRecord; aggregated per
+            // time-bucket in `model::buckets` for the tx-pressure card.
+            state
+                .slot_mut(slot)
+                .signature_count
+                .get_or_insert(signature_count);
         }
         EventKind::NoEpochMetadata { epoch } => {
             state.overall.no_epoch_metadata = state.overall.no_epoch_metadata.saturating_add(1);

@@ -330,6 +330,7 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
     let s2s = b.safe_to_skip_count();
     let our_leader = b.our_leader_slot_count();
     let final_total = b.finalized_total_count();
+    let tx_rate = b.tx_per_second();
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let lat_ms: Vec<u64> = b
         .lifecycle_p95_us()
@@ -414,6 +415,20 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
             Kind::Time,
             theme::SPARK_TIME,
             resume_ms,
+        )),
+        // Tx pressure: signed transactions per second, computed from
+        // bank-frozen signature_count. Includes both user txs and vote
+        // txs — baseline at ~2 votes per active validator per slot
+        // means most of the baseline is votes; spikes above baseline
+        // are real user load. SPARK_TIME (cyan) — pressure is a neutral
+        // input metric, not a health verdict; the operator reads it
+        // alongside skip / latency / crashed-leader cards to spot
+        // correlations.
+        CardSpec::Single(Metric::new(
+            "tx pressure (tx/s)",
+            Kind::Count,
+            theme::SPARK_TIME,
+            tx_rate,
         )),
     ]
 }

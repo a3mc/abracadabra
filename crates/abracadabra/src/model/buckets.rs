@@ -26,6 +26,15 @@ pub struct BucketStats {
     /// Count of slots in this bucket for which the local validator was
     /// the leader (`we_are_leader`).
     pub our_leader_slots: u64,
+    /// Sum of `signature_count` (user + vote txs) across slots in this
+    /// bucket. Populated only for slots that observed a `BankFrozen`
+    /// event in the log. Drives the tx-pressure series — divided by
+    /// bucket size in seconds to render as `tx/s`.
+    pub signature_sum: u64,
+    /// Number of slots in the bucket that contributed to
+    /// `signature_sum` (i.e. had a `BankFrozen` observation). Used to
+    /// distinguish "zero load" from "no data yet" at the renderer.
+    pub signature_sample_count: u64,
     /// First_shred -> finalized latencies (microseconds) for slots in this
     /// bucket. Sorted ascending after `TimeBuckets::from_state` returns so
     /// percentile queries on the TUI render path don't re-sort per frame.
@@ -111,6 +120,10 @@ impl TimeBuckets {
             if record.we_are_leader {
                 b.our_leader_slots = b.our_leader_slots.saturating_add(1);
             }
+            if let Some(sigs) = record.signature_count {
+                b.signature_sum = b.signature_sum.saturating_add(sigs);
+                b.signature_sample_count = b.signature_sample_count.saturating_add(1);
+            }
             if let Some(lat) = SlotRecord::delta_us(record.first_shred_at, record.finalized_at) {
                 b.lifecycle_us.push(lat);
             }
@@ -191,6 +204,25 @@ impl TimeBuckets {
 
     pub fn our_leader_slot_count(&self) -> Vec<u64> {
         self.buckets.iter().map(|b| b.our_leader_slots).collect()
+    }
+
+    /// Per-bucket sum of signed transactions (user + vote). Raw integer
+    /// counts — for a per-second rate, see `tx_per_second`.
+    pub fn signature_sum(&self) -> Vec<u64> {
+        self.buckets.iter().map(|b| b.signature_sum).collect()
+    }
+
+    /// Per-bucket transaction rate in signed-tx-per-second.
+    /// `signature_sum / bucket_secs`. Buckets with no `BankFrozen`
+    /// observations render as zero. Useful as the primary tx-pressure
+    /// signal — bucket-size-independent so 10m and 1h buckets read on
+    /// the same scale.
+    pub fn tx_per_second(&self) -> Vec<u64> {
+        let secs = self.bucket_size.whole_seconds().max(1) as u64;
+        self.buckets
+            .iter()
+            .map(|b| b.signature_sum / secs)
+            .collect()
     }
 
     /// Total finalized slots per bucket (fast + slow). Preserves the

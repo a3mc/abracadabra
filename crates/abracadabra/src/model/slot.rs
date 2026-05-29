@@ -98,6 +98,14 @@ pub struct SlotRecord {
 
     pub fast_finalize: Option<bool>,
 
+    /// Number of signed transactions in this slot's bank, harvested from
+    /// the `solana_runtime::bank] bank frozen: SLOT hash: H signature_count:
+    /// N ...` log line via `EventKind::BankFrozen`. Includes both user
+    /// txs and vote txs (votes are ~2/validator/slot, so the *delta*
+    /// above baseline = real cluster load). Drives the tx-pressure
+    /// time-series card.
+    pub signature_count: Option<u64>,
+
     /// True iff our validator was the leader for this slot's window
     /// (derived from ProduceWindow events).
     pub we_are_leader: bool,
@@ -129,6 +137,7 @@ impl SlotRecord {
             safe_to_notar_at: None,
             safe_to_skip_at: None,
             fast_finalize: None,
+            signature_count: None,
             we_are_leader: false,
             skip_classification: SkipClassification::NotSkipped,
         }
