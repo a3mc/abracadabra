@@ -119,8 +119,15 @@ fn format_alert_for_yank(state: &State, alert: &Alert) -> String {
         AlertKind::ClusterSlotsShutdownObserved => {
             out.push_str("kind:          cluster-slots service shutdown observed\n");
         }
-        AlertKind::StandstillObserved { at_slot } => {
+        AlertKind::StandstillObserved {
+            at_slot,
+            count,
+            last_at,
+        } => {
             let _ = writeln!(out, "kind:          standstill at slot {at_slot}");
+            let _ = writeln!(out, "firings:       {count}");
+            let _ = writeln!(out, "first at:      {}", alert.at);
+            let _ = writeln!(out, "last at:       {last_at}");
         }
         AlertKind::IdentityChanged => {
             out.push_str("kind:          operator identity change\n");

@@ -143,12 +143,36 @@ pub fn ingest(state: &mut State, event: Event) {
         }
         EventKind::Standstill { slot } => {
             state.overall.standstill_events = state.overall.standstill_events.saturating_add(1);
-            state.alerts.push(Alert::new(
-                Severity::Warn,
-                event.ts,
-                AlertKind::StandstillObserved { at_slot: slot },
-                format!("Standstill firing at finalized slot {slot}"),
-            ));
+            // Dedup by at_slot: a sustained cluster halt fires
+            // `Standstill {slot}` every ~10s with the same slot. Without
+            // this merge a 3-hour halt produces ~1000 separate alerts.
+            // Mirrors the `LogPattern` count convention.
+            if let Some(&idx) = state.overall.standstill_alert_indices.get(&slot) {
+                if let Some(alert) = state.alerts.get_mut(idx) {
+                    if let AlertKind::StandstillObserved {
+                        ref mut count,
+                        ref mut last_at,
+                        ..
+                    } = alert.kind
+                    {
+                        *count = count.saturating_add(1);
+                        *last_at = event.ts;
+                    }
+                }
+            } else {
+                let idx = state.alerts.len();
+                state.alerts.push(Alert::new(
+                    Severity::Warn,
+                    event.ts,
+                    AlertKind::StandstillObserved {
+                        at_slot: slot,
+                        count: 1,
+                        last_at: event.ts,
+                    },
+                    format!("Standstill firing at finalized slot {slot}"),
+                ));
+                state.overall.standstill_alert_indices.insert(slot, idx);
+            }
         }
         EventKind::StandstillExtending { slot } => {
             state.overall.standstill_extending_events =

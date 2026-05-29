@@ -204,12 +204,14 @@ fn severity_tag(s: Severity) -> (&'static str, Style) {
     }
 }
 
-/// Best-effort "count" per alert kind. For `LogPattern` it's the group
-/// count; for `LocalLeaderSummary` it's the leader-slot count. Other
-/// kinds are singleton events and report `1`.
+/// Best-effort "count" per alert kind. For `LogPattern` and merged
+/// `StandstillObserved` entries it's the firing count; for
+/// `LocalLeaderSummary` it's the leader-slot count. Other kinds are
+/// singleton events and report `1`.
 const fn alert_count(a: &Alert) -> u64 {
     match &a.kind {
         AlertKind::LogPattern { count, .. } => *count,
+        AlertKind::StandstillObserved { count, .. } => *count,
         AlertKind::LocalLeaderSummary { slot_count, .. } => *slot_count,
         _ => 1,
     }
