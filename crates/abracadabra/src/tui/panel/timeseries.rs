@@ -360,11 +360,7 @@ fn build_cards(b: &TimeBuckets) -> Vec<CardSpec> {
     // 1h bucket read on the same scale (unlike per-bucket counts).
     let total_sigs: u64 = b.buckets.iter().map(|x| x.signature_sum).sum();
     let total_blocks: u64 = b.buckets.iter().map(|x| x.signature_sample_count).sum();
-    let avg_tx_per_block = if total_blocks > 0 {
-        total_sigs / total_blocks
-    } else {
-        0
-    };
+    let avg_tx_per_block = total_sigs.checked_div(total_blocks).unwrap_or(0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let lat_ms: Vec<u64> = b
         .lifecycle_p95_us()

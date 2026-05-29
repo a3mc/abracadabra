@@ -49,9 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # Toolchain version is pinned in rust-toolchain.toml so local
+      # developer rustc, xtask lint-prod, and this CI job all share the
+      # same compiler + lint catalogue. To bump Rust: edit one file.
+      - name: install rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.96.0
           components: clippy, rustfmt
 
       - name: cache

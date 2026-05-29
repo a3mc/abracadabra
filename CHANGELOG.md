@@ -69,6 +69,21 @@ plus a new transaction-pressure card.
 - `clippy::derivable_impls` on `SkipClassification`: replaced
   manual `Default` impl with `#[derive(Default)]` +
   `#[default]` on `NotSkipped`.
+- `clippy::manual_checked_ops` (Rust 1.96+) on the
+  `avg_tx_per_block` divide-by-zero guard: replaced
+  `if d > 0 { a / d } else { 0 }` with
+  `a.checked_div(d).unwrap_or(0)`.
+
+### Toolchain
+
+- Added `rust-toolchain.toml` pinning the project to Rust
+  `1.96.0`. `.github/workflows/{ci,release}.yml` install the
+  same version via `dtolnay/rust-toolchain@master` with
+  explicit `toolchain: 1.96.0`. Previously local and CI both
+  said "stable" but tracked different versions, so new lint
+  categories (e.g. `manual_checked_ops` in 1.96) appeared at
+  push time. Bumping Rust now means editing one file plus the
+  two workflow inputs in lockstep.
 
 ## [0.3.2] — 2026-05-28
 
