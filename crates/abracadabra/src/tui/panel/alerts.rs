@@ -551,29 +551,77 @@ fn render_generic_detail(alert: &Alert, frame: &mut Frame<'_>, area: Rect) {
         AlertKind::IdentityChanged => "operator identity rotation",
         _ => "single-event marker",
     };
-    let lines = vec![
+
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(tag, tag_style),
             Span::raw("  "),
             Span::styled(kind_label, theme::accent_style()),
         ]),
         Line::raw(""),
-        Line::from(vec![
+    ];
+
+    // Standstill-specific multi-firing rows. Other kinds fall through
+    // to the single-`at` row + footer below.
+    let is_multi_firing_standstill = matches!(
+        &alert.kind,
+        AlertKind::StandstillObserved { count, .. } if *count > 1
+    );
+    if let AlertKind::StandstillObserved {
+        at_slot,
+        count,
+        last_at,
+    } = &alert.kind
+    {
+        lines.push(Line::from(vec![
+            Span::styled("anchor    ", theme::label_style()),
+            Span::styled(format!("slot {at_slot}"), theme::value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("firings   ", theme::label_style()),
+            Span::styled(
+                commas(*count),
+                theme::value_style().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("first at  ", theme::label_style()),
+            Span::styled(fmt_ts(alert.at), theme::value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("last at   ", theme::label_style()),
+            Span::styled(fmt_ts(*last_at), theme::value_style()),
+        ]));
+        let span_secs = (*last_at - alert.at).whole_seconds().max(0);
+        if span_secs > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("span      ", theme::label_style()),
+                Span::styled(humanize_dur(span_secs), theme::accent_style()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
             Span::styled("at        ", theme::label_style()),
             Span::styled(fmt_ts(alert.at), theme::value_style()),
-        ]),
-        Line::raw(""),
-        Line::from(vec![Span::styled("description", theme::label_style())]),
-        Line::from(vec![Span::styled(
-            sanitize_for_tui(&alert.description).into_owned(),
-            theme::value_style(),
-        )]),
-        Line::raw(""),
-        Line::from(vec![Span::styled(
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "description",
+        theme::label_style(),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        sanitize_for_tui(&alert.description).into_owned(),
+        theme::value_style(),
+    )]));
+    lines.push(Line::raw(""));
+    if !is_multi_firing_standstill {
+        lines.push(Line::from(vec![Span::styled(
             "  (this alert is a single-event marker — no per-line timestamps to plot)",
             theme::label_style(),
-        )]),
-    ];
+        )]));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
