@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-05-29
+
+Tracks alpenglow `ag-v0.3.2`. Post-release polish on standstill
+reporting, runner text-mode verdicts, and Time Series presentation,
+plus a new transaction-pressure card.
+
+### Added
+
+- Transaction-pressure card on the Time Series tab. Series is
+  `Σ signature_count / bucket_seconds` from `bank frozen` log
+  lines, rendered as `tx/s` (bucket-size-independent so 10m and
+  1h zoom levels read on the same scale). Stats line surfaces
+  `min / avg / peak` per second alongside an overall
+  `tx/block (avg)` derived from `Σ signature_sum / Σ blocks`.
+- `Metric::with_subtitle` on the Time Series renderer for inline
+  secondary stats on existing cards (no new grid cell required).
+- `Kind::Rate` variant for per-second metrics. Distinct from
+  `Kind::Count` because summing a rate across buckets is
+  meaningless; the stats line therefore drops the `total` and
+  `/bkt` fields for `Rate` cards.
+
+### Changed
+
+- `StandstillObserved` alerts dedup by anchor slot: repeated
+  `StandstillExtending` events at the same `at_slot` merge into
+  one alert with `count` (firings) and `last_at` (most recent
+  extension). Index lives on `OverallStats.standstill_alert_indices`
+  (transient). Previously a 2.5h standstill produced one alert
+  per extension batch (hundreds of rows).
+- Standstill alert detail pane shows `anchor / firings / first at /
+  last at / span` instead of a single timestamp.
+- Sparkline x-axis caption marked `(autoscale)` so readers know the
+  range is data-driven, not a fixed window.
+- Headline-health canonical-skip line shortened from
+  `(N canonical of M vote-skips · K indeterm)` to
+  `(N of M · K indeterm)` to fit single-line width.
+- Local-leader summary row drops the
+  `(4-slot bursts, per NUM_CONSECUTIVE_LEADER_SLOTS)` qualifier.
+- `runner.rs` text-mode health lines take separate `ok_note` and
+  `bad_note` strings. Previously both paths reused one note,
+  producing contradictory output like `[✗] no liveness issues`.
+  Standstill bad-path verdicts now read `STANDSTILL OBSERVED` /
+  `resume activity` instead of `no liveness issues`.
+- Runner crashed-leader count is standstill-aware when
+  `standstill_ranges` exist: subtracts TCLs that fired inside a
+  standstill window from the headline figure.
+- `cargo xtask lint-prod` mirrors the CI strict clippy gate
+  exactly: `cargo clippy --workspace --all-targets --locked --
+  -D warnings`. Previously it omitted `--all-targets`,
+  `--locked`, and `-D warnings`, allowing local "pass" while
+  CI failed.
+
+### Fixed
+
+- Tx-pressure stats line previously claimed `total N peak K/bkt
+  avg J/bkt` for a per-second series. `total` was the sum of
+  rates (meaningless); the `/bkt` suffix lied about the unit
+  (values were per-second). Fixed by routing the card through
+  `Kind::Rate`.
+- `clippy::derivable_impls` on `SkipClassification`: replaced
+  manual `Default` impl with `#[derive(Default)]` +
+  `#[default]` on `NotSkipped`.
+
 ## [0.3.2] — 2026-05-28
 
 Version aligned with the alpenglow `ag-v0.3.2` tag this release was
