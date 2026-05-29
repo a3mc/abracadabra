@@ -251,9 +251,14 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
             ),
             Span::raw("  "),
             Span::styled(canon_skip_verdict, canon_skip_style),
+            // Parenthetical is compact: row label is already
+            // "canonical-skip" so "canonical" and "vote-skips" inside
+            // would be redundant. The previous wording overflowed the
+            // 50/50 column split on terminals narrower than ~150 cols
+            // (`vote-skips · 1,073 indeterm)` truncated mid-number).
             Span::styled(
                 format!(
-                    "  ({} canonical of {} vote-skips{})",
+                    "  ({} of {}{})",
                     commas(canon_skips),
                     commas(ov.votes_skip),
                     if has_indeterminate {
