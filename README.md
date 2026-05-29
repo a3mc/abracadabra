@@ -51,11 +51,12 @@ Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/re
 
 | | |
 |---|---|
-| `1`–`6` / `Tab` | Switch tabs |
-| `j` / `k` · `PgUp` / `PgDn` · `g` / `G` | Scroll |
+| `1`–`6` / `Tab` / `Shift+Tab` | Switch tabs (forward / back) |
+| `j` / `k` · `↓` / `↑` · `PgDn` / `PgUp` · `g` / `G` · `Home` / `End` | Scroll |
 | `t` `n` `p` | Slots filter — TCL / S2N / S2S |
-| `l` `f` `x` `s` | Slots filter — leader / fast / slow / skipped |
-| `c` | Slots — clear filters |
+| `l` `f` `s` | Slots filter — leader / fast-finalize / slow-finalize |
+| `v` `c` | Slots filter — VSKIP (we voted skip) / CSKIP (canonical skip). Both on = union. |
+| `x` | Slots — clear filters |
 | `y` | Alerts — yank to `/tmp/abracadabra-yank-N.txt` |
 | `q` / `Esc` | Quit |
 
