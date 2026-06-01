@@ -19,3 +19,5 @@ expect_used = "allow"
 [dependencies]
 serde      = { version = "1.0.203", features = ["derive"] }  # audited 2026-05-24 [✓]
 serde_json = "1.0.120"                                       # audited 2026-05-24 [✓]
+# ISO-8601 nanosecond timestamp parsing for replay-log; matches main crate pin.
+time       = { version = "0.3.47", default-features = false, features = ["std", "parsing", "macros"] }  # audited 2026-05-24 [✓]

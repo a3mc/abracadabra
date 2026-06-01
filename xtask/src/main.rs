@@ -8,6 +8,7 @@ mod dashboard;
 mod detail;
 mod lint;
 mod loc_report;
+mod replay_log;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -23,6 +24,7 @@ fn main() {
         Some("detail") => detail::run_detail(args.get(2).map(String::as_str)),
         Some("detail-prod") => detail::run_detail_production(args.get(2).map(String::as_str)),
         Some("loc-report") => loc_report::run_loc_report(),
+        Some("replay-log") => replay_log::run_replay_log(args.get(2..).unwrap_or(&[])),
         Some("fix") => {
             eprintln!(
                 "[DENIED] Automatic fixes are disabled. Every change must be manually reviewed."
@@ -57,6 +59,10 @@ Commands:
   detail [LINT]     Detailed warning report with file:line (all targets)
   detail-prod [LINT]  Detailed warning report for production only
   loc-report        File size report. Warns at >500 LOC, strong-warns at >800.
+  replay-log SRC DST [SPEED]
+                    Replay a captured log into DST at original temporal
+                    pacing. SPEED defaults to 1.0 (10 = ten times faster).
+                    Used to drive the Live tab during development.
 
 Run from the workspace root.
 
