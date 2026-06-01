@@ -1,40 +1,38 @@
 //! Interactive ratatui dashboard.
 //!
 //! Tab layout is decided at startup from the input log's activity
-//! classification. Static logs see the original 6 tabs at `1`-`6` with
-//! their original key bindings; active logs get an extra `Live` tab
-//! prepended at index 0, shifting the rest to `2`-`7`. Static-log
-//! workflows are unchanged. The event loop, key dispatch, and `App`
-//! state live in `app.rs`; each tab has its own `panel::*` module that
+//! classification. `Overview` is always tab `1` so operator muscle
+//! memory survives the active / static distinction. Active logs get
+//! an extra `Live` tab appended at the end (tab `7`); static logs
+//! omit it entirely. The event loop, key dispatch, and `App` state
+//! live in `app.rs`; each tab has its own `panel::*` module that
 //! takes a `&App` and renders into a sub-rect.
 //!
-//! Tabs (active layout — static omits `Live`):
+//! Tabs:
 //!
-//! 1. Live — real-time follow surface (opt-in). Present only when the
-//!    input log is currently being written to; `SPACEBAR` starts
-//!    following. Animation engine: pending.
-//! 2. Overview — stats-only summary: file meta, headline health,
+//! 1. Overview — stats-only summary: file meta, headline health,
 //!    vote/cert totals, latency stages, vote-resume stats, alerts.
-//! 3. Time series — 2-column card grid of sparklines, shared x-axis
+//! 2. Time series — 2-column card grid of sparklines, shared x-axis
 //!    across cards.
-//! 4. Windows — rolling-window comparison table (`all`, 24h, 12h, 6h,
+//! 3. Windows — rolling-window comparison table (`all`, 24h, 12h, 6h,
 //!    3h, 1h).
-//! 5. Slots — KPI strip + dense scrollable slot table with column
+//! 4. Slots — KPI strip + dense scrollable slot table with column
 //!    filters (`t/n/p` TCL/S2N/S2S, `l/f/s` leader/fast/slow,
 //!    `v/c` VSKIP/CSKIP, `x` clear).
-//! 6. Leader timeouts — TCL/vote-resume KPIs, distribution histogram,
+//! 5. Leader timeouts — TCL/vote-resume KPIs, distribution histogram,
 //!    per-bucket trend, incident list.
-//! 7. Alerts — severity rollup + scrollable list + detail pane with
+//! 6. Alerts — severity rollup + scrollable list + detail pane with
 //!    sparkline; `y` yanks current alert to a per-user file.
+//! 7. Live — real-time follow surface (opt-in). Present only when the
+//!    input log is currently being written to; `SPACEBAR` starts
+//!    following. Animation engine: pending.
 //!
 //! Common keys: `j`/`k` / arrows scroll, `PgUp`/`PgDn` page, `g`/`G` /
 //! `Home`/`End` jump. `q` / `Esc` quit. Scroll keys are no-ops on tabs
 //! without scrollable lists. Per-tab keys are documented in the bottom
 //! status bar (`panel::status_bar`).
 //!
-//! Default tab is Live when the input log was detected as active at
-//! startup; Overview when static (so the user is not stuck on a gray
-//! placeholder when running historical analysis).
+//! Default tab is always Overview.
 
 mod app;
 mod panel;

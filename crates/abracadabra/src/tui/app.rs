@@ -224,12 +224,12 @@ pub enum FilterKind {
 /// Logical identifier for each dashboard tab.
 ///
 /// `current_tab: usize` is an index into `App::tabs: Vec<TabId>`. The
-/// layout is decided at construction based on log activity: when the
-/// log is active the list starts with `Live`; when static, `Live` is
-/// omitted so static-log users see exactly the original 6-tab UI with
-/// their original `1`-`6` key bindings. All conditional UI checks
-/// compare against `TabId` rather than raw indices so they stay correct
-/// across both layouts.
+/// layout is decided at construction based on log activity: `Overview`
+/// is always tab `1` so operator muscle memory survives the active /
+/// static distinction. When the log is active, `Live` is appended at
+/// the end (tab `7`); when static it is omitted entirely. All
+/// conditional UI checks compare against `TabId` rather than raw
+/// indices so they stay correct across both layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
     Live,
@@ -255,22 +255,25 @@ impl TabId {
     }
 }
 
-/// Build the tab layout for the given activity classification. Active
-/// logs get the `Live` tab at position 0; static logs get the original
-/// 6 tabs unchanged so historical analysis is uncluttered.
+/// Build the tab layout for the given activity classification.
+///
+/// `Overview` is always tab `1` — operator muscle memory should not
+/// depend on whether the input is active or static. The `Live` tab is
+/// appended at the end when the log is currently being written to;
+/// static logs omit it entirely so the layout matches the historical
+/// 6-tab UI exactly.
 fn tab_layout(activity: &crate::live::detect::Activity) -> Vec<TabId> {
-    let mut v = Vec::with_capacity(7);
-    if matches!(activity, crate::live::detect::Activity::Active) {
-        v.push(TabId::Live);
-    }
-    v.extend([
+    let mut v = vec![
         TabId::Overview,
         TabId::TimeSeries,
         TabId::Windows,
         TabId::Slots,
         TabId::LeaderTimeouts,
         TabId::Alerts,
-    ]);
+    ];
+    if matches!(activity, crate::live::detect::Activity::Active) {
+        v.push(TabId::Live);
+    }
     v
 }
 
@@ -390,10 +393,10 @@ impl<'s> App<'s> {
             latency,
             window_stats,
             leader_slot_count,
-            // Default to tab 0 always — when the layout includes Live
-            // (active log) that is Live; when omitted (static log) that
-            // is Overview. Either way the user lands on the natural
-            // first tab for their session.
+            // Always default to tab 0 (Overview). Overview is the
+            // primary surface for both static and active runs; live
+            // following is an explicit choice the operator makes by
+            // pressing `7` (active layouts only).
             current_tab: 0,
             slot_scroll: 0,
             resume_scroll: 0,
