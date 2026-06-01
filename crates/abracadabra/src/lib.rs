@@ -22,6 +22,7 @@
 
 pub mod aggregator;
 pub mod cli;
+pub mod live;
 pub mod model;
 pub mod parser;
 pub mod runner;
