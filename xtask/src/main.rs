@@ -63,6 +63,8 @@ Commands:
                     Replay a captured log into DST at original temporal
                     pacing. SPEED defaults to 1.0 (10 = ten times faster).
                     Used to drive the Live tab during development.
+                    Recommended DST: log/.replay-sink.log (gitignored,
+                    on /home). Avoid /tmp — it is a small partition.
 
 Run from the workspace root.
 
