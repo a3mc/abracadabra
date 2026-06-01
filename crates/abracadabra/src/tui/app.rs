@@ -334,10 +334,11 @@ pub struct App<'s> {
     /// `live::detect::classify` blocks for ~2s and must not run on
     /// the render path). Drives the Live tab's three render states.
     pub activity: crate::live::detect::Activity,
-    /// True when the user has pressed SPACEBAR on the Live tab to start
-    /// real-time following. LIVE-2 only flips the flag; the actual tail
-    /// thread is wired in LIVE-3. Ignored when `activity` is `Static`.
-    pub following: bool,
+    /// Running tail thread + shared buffer when the user has pressed
+    /// SPACEBAR on the Live tab. `None` means "not following"; `Some`
+    /// means a background thread is reading appends from the input
+    /// file. Dropping the handle stops the thread (see `TailHandle::Drop`).
+    pub tail: Option<crate::live::tail::TailHandle>,
     /// Ordered list of tabs visible in this run. Active logs get
     /// `[Live, Overview, ...]`; static logs omit `Live` for a clean
     /// 6-tab layout. `current_tab` is an index into this vector.
@@ -410,7 +411,7 @@ impl<'s> App<'s> {
             alert_spark_cache: RefCell::new(None),
             tabs: tab_layout(&activity),
             activity,
-            following: false,
+            tail: None,
         }
     }
 
@@ -708,11 +709,21 @@ fn event_loop(
                     KeyCode::Char('7') => app.set_tab(6),
                     KeyCode::Tab => app.next_tab(),
                     KeyCode::BackTab => app.prev_tab(),
-                    // Live-tab-only: SPACEBAR toggles the follow flag.
-                    // Only fires when Live is in the layout (i.e. the
-                    // log is Active); static-log runs do not see this.
+                    // Live-tab-only: SPACEBAR starts or stops the tail
+                    // thread. `app.tail.is_some()` is the single source
+                    // of truth for "are we following?". Static-log runs
+                    // do not see this binding because Live is not in
+                    // the layout.
                     KeyCode::Char(' ') if app.current_kind() == TabId::Live => {
-                        app.following = !app.following;
+                        if app.tail.is_some() {
+                            // Replacing with None drops the handle,
+                            // which signals shutdown and joins the
+                            // thread via TailHandle::Drop.
+                            app.tail = None;
+                        } else {
+                            app.tail =
+                                Some(crate::live::tail::spawn(app.state.file_meta.path.clone()));
+                        }
                     }
                     KeyCode::Char('j') | KeyCode::Down => app.step_scroll(1),
                     KeyCode::Char('k') | KeyCode::Up => app.step_scroll(-1),
@@ -801,7 +812,7 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
         TabId::Live => panel::live::render(
             &app.activity,
             &app.state.file_meta.path,
-            app.following,
+            app.tail.as_ref(),
             frame,
             chunks[2],
         ),

@@ -11,3 +11,4 @@
 //! surface, not a refactor of existing behaviour.
 
 pub mod detect;
+pub mod tail;
