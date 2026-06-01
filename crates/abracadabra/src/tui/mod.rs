@@ -1,14 +1,18 @@
 //! Interactive ratatui dashboard.
 //!
-//! Seven-tab interactive dashboard. The event loop, key dispatch, and
-//! `App` state live in `app.rs`; each tab has its own `panel::*` module
-//! that takes a `&App` and renders into a sub-rect.
+//! Tab layout is decided at startup from the input log's activity
+//! classification. Static logs see the original 6 tabs at `1`-`6` with
+//! their original key bindings; active logs get an extra `Live` tab
+//! prepended at index 0, shifting the rest to `2`-`7`. Static-log
+//! workflows are unchanged. The event loop, key dispatch, and `App`
+//! state live in `app.rs`; each tab has its own `panel::*` module that
+//! takes a `&App` and renders into a sub-rect.
 //!
-//! Tabs (`1`-`7` or `Tab` / `Shift+Tab`):
+//! Tabs (active layout — static omits `Live`):
 //!
-//! 1. Live — real-time follow surface (opt-in). Grayed when the input
-//!    log is classified static (rotated, stale, or not growing); when
-//!    active, `SPACEBAR` starts following. Animation engine: pending.
+//! 1. Live — real-time follow surface (opt-in). Present only when the
+//!    input log is currently being written to; `SPACEBAR` starts
+//!    following. Animation engine: pending.
 //! 2. Overview — stats-only summary: file meta, headline health,
 //!    vote/cert totals, latency stages, vote-resume stats, alerts.
 //! 3. Time series — 2-column card grid of sparklines, shared x-axis

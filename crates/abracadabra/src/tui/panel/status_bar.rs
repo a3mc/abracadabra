@@ -13,11 +13,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::tui::app::TabId;
 use crate::tui::theme;
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
-pub fn render(current_tab: usize, status_message: Option<&str>, frame: &mut Frame<'_>, area: Rect) {
+pub fn render(
+    current_kind: TabId,
+    status_message: Option<&str>,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
     // Reserve right side for ` vX.Y.Z `. +2 for the surrounding spaces.
     let version_width = u16::try_from(VERSION.len() + 2).unwrap_or(10);
     let chunks = Layout::default()
@@ -25,7 +31,7 @@ pub fn render(current_tab: usize, status_message: Option<&str>, frame: &mut Fram
         .constraints([Constraint::Min(0), Constraint::Length(version_width)])
         .split(area);
 
-    render_left(current_tab, status_message, frame, chunks[0]);
+    render_left(current_kind, status_message, frame, chunks[0]);
 
     let version_line = Line::from(Span::styled(format!(" {VERSION} "), theme::label_style()))
         .alignment(Alignment::Right);
@@ -33,7 +39,7 @@ pub fn render(current_tab: usize, status_message: Option<&str>, frame: &mut Fram
 }
 
 fn render_left(
-    current_tab: usize,
+    current_kind: TabId,
     status_message: Option<&str>,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -48,23 +54,26 @@ fn render_left(
         return;
     }
 
+    // The leading "N tabs" hint is left intentionally generic — the
+    // exact key range varies by layout (active vs static) and is
+    // already surfaced in the tab-strip title. Static-log users see
+    // the same hints they always had; active-log users get the
+    // additional SPACE hint on the Live tab.
     let mut spans = vec![
-        Span::styled("1-7", theme::title_style()),
-        Span::styled(" tabs  ", theme::label_style()),
         Span::styled("Tab", theme::title_style()),
         Span::styled(" next  ", theme::label_style()),
     ];
-    // Live tab: SPACEBAR toggles follow when log is active. Hint is
-    // unconditionally shown so users see the affordance even when on
-    // the gray (static) panel; the panel itself explains the state.
-    if current_tab == 0 {
+    if current_kind == TabId::Live {
         spans.extend([
             Span::styled("SPACE", theme::title_style()),
             Span::styled(" toggle follow  ", theme::label_style()),
         ]);
     }
-    // Scroll hints from Slots (tab 4) onward.
-    if current_tab >= 4 {
+    // Scroll hints on tabs that carry a scrollable list.
+    if matches!(
+        current_kind,
+        TabId::Slots | TabId::LeaderTimeouts | TabId::Alerts
+    ) {
         spans.extend([
             Span::styled("j/k", theme::title_style()),
             Span::styled(" scroll  ", theme::label_style()),
@@ -74,9 +83,9 @@ fn render_left(
             Span::styled(" top/bottom  ", theme::label_style()),
         ]);
     }
-    // Slots filter keys (tab 4, shifted from 3 by the Live tab).
-    // Labels match the actual key handlers in app.rs and the README.
-    if current_tab == 4 {
+    // Slots-tab filter keys. Labels match the README and the actual
+    // key handlers in app.rs.
+    if current_kind == TabId::Slots {
         spans.extend([
             Span::styled("t/n/p", theme::title_style()),
             Span::styled(" TCL/S2N/S2S  ", theme::label_style()),
@@ -88,8 +97,7 @@ fn render_left(
             Span::styled(" clear  ", theme::label_style()),
         ]);
     }
-    // Alerts tab (was 5, now 6).
-    if current_tab == 6 {
+    if current_kind == TabId::Alerts {
         spans.extend([
             Span::styled("y", theme::title_style()),
             // Yank target: `$XDG_RUNTIME_DIR/abracadabra` (preferred) or
