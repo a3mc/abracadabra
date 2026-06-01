@@ -31,7 +31,12 @@ fn yank_to_existing_symlink_does_not_overwrite_target() {
 
     // Construct a minimal App and drive the yank.
     let state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
-    let mut app = App::new(&state, None, 60);
+    let mut app = App::new(
+        &state,
+        None,
+        60,
+        crate::live::detect::Activity::Static(crate::live::detect::StaticReason::NoSizeGrowth),
+    );
     let result = app.try_write_yank(&tmp, "yank-body-payload");
 
     // Outcome: yank succeeds, but writes to a DIFFERENT path
@@ -56,7 +61,12 @@ fn yank_to_existing_symlink_does_not_overwrite_target() {
 #[test]
 fn scroll_on_non_list_tab_does_not_mutate_other_cursors() {
     let state = crate::model::state::State::new(PathBuf::from("/tmp/x"), 0);
-    let mut app = App::new(&state, None, 60);
+    let mut app = App::new(
+        &state,
+        None,
+        60,
+        crate::live::detect::Activity::Static(crate::live::detect::StaticReason::NoSizeGrowth),
+    );
     // Pretend the user has navigated 42 rows down the Slots table.
     app.slot_scroll = 42;
     // Switch to Overview (tab 0) and press G — must be a no-op for
@@ -97,7 +107,12 @@ fn leader_slot_count_matches_slot_rows_filter() {
     state.slot_mut(2).we_are_leader = false;
     state.slot_mut(3).we_are_leader = true;
     state.slot_mut(4).we_are_leader = true;
-    let app = App::new(&state, None, 60);
+    let app = App::new(
+        &state,
+        None,
+        60,
+        crate::live::detect::Activity::Static(crate::live::detect::StaticReason::NoSizeGrowth),
+    );
     let direct = app.slot_rows.iter().filter(|r| r.we_are_leader).count() as u64;
     assert_eq!(app.leader_slot_count, direct);
     assert_eq!(app.leader_slot_count, 3);
@@ -275,7 +290,12 @@ fn toggle_filter_flips_each_dimension_and_recomputes_indices() {
     // Run classifier so CSKIP row carries the discriminator.
     crate::aggregator::analyze(&mut state);
 
-    let mut app = App::new(&state, None, 60);
+    let mut app = App::new(
+        &state,
+        None,
+        60,
+        crate::live::detect::Activity::Static(crate::live::detect::StaticReason::NoSizeGrowth),
+    );
     let total_rows = app.slot_rows.len();
     assert_eq!(total_rows, 3);
     // Default: every row passes.

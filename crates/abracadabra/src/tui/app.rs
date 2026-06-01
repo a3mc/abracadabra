@@ -221,7 +221,14 @@ pub enum FilterKind {
     CanonicalSkipOnly,
 }
 
-const TAB_NAMES: [&str; 6] = [
+// Tab 0 is Live (real-time follower, opt-in). When the input log is
+// classified `Static`, the Live tab still appears in the bar but its
+// panel renders a grayed-out reason text. Tabs 1..=6 are the original
+// snapshot-analysis tabs; their behaviour is unchanged. All
+// `current_tab == N` comparisons below were shifted by 1 when the
+// Live tab was inserted at index 0.
+const TAB_NAMES: [&str; 7] = [
+    "Live",
     "Overview",
     "Time series",
     "Windows",
@@ -282,6 +289,15 @@ pub struct App<'s> {
     /// `(alert_scroll, bucket_count)`; invalidated implicitly when the
     /// key changes. Single-threaded TUI -> `RefCell` is sufficient.
     pub alert_spark_cache: RefCell<Option<AlertSparkCache>>,
+    /// Classification of the input log file's activity, computed once
+    /// at startup before the TUI takes over (the size-delta poll in
+    /// `live::detect::classify` blocks for ~2s and must not run on
+    /// the render path). Drives the Live tab's three render states.
+    pub activity: crate::live::detect::Activity,
+    /// True when the user has pressed SPACEBAR on the Live tab to start
+    /// real-time following. LIVE-2 only flips the flag; the actual tail
+    /// thread is wired in LIVE-3. Ignored when `activity` is `Static`.
+    pub following: bool,
 }
 
 /// Cached bucket-timestamps result for the alerts panel sparkline.
@@ -294,7 +310,12 @@ pub struct AlertSparkCache {
 
 #[allow(clippy::missing_const_for_fn)] // interactive state machine — const is semantically wrong
 impl<'s> App<'s> {
-    pub fn new(state: &'s State, buckets: Option<&'s TimeBuckets>, bucket_secs: i64) -> Self {
+    pub fn new(
+        state: &'s State,
+        buckets: Option<&'s TimeBuckets>,
+        bucket_secs: i64,
+        activity: crate::live::detect::Activity,
+    ) -> Self {
         let slot_rows: Vec<SlotViewRow> =
             state.slots.values().map(SlotViewRow::from_record).collect();
         let slot_indices: Vec<usize> = (0..slot_rows.len()).collect();
@@ -328,7 +349,14 @@ impl<'s> App<'s> {
             latency,
             window_stats,
             leader_slot_count,
-            current_tab: 0,
+            // Default to Live (0) when the log is active so the user
+            // lands on the live surface; default to Overview (1) when
+            // the log is static so the primary analysis tab opens
+            // immediately and the user is not stuck on a gray placeholder.
+            current_tab: match activity {
+                crate::live::detect::Activity::Active => 0,
+                crate::live::detect::Activity::Static(_) => 1,
+            },
             slot_scroll: 0,
             resume_scroll: 0,
             alert_scroll: 0,
@@ -339,6 +367,8 @@ impl<'s> App<'s> {
             status_message: None,
             yank_counter: 0,
             alert_spark_cache: RefCell::new(None),
+            activity,
+            following: false,
         }
     }
 
@@ -481,19 +511,21 @@ impl<'s> App<'s> {
     /// short-circuit so the keystroke is a no-op rather than silently
     /// clobbering a cursor on another tab.
     fn scroll_target(&mut self) -> Option<&mut usize> {
+        // Indices shifted +1 by the Live tab insertion: Slots 3→4,
+        // Leader-timeouts 4→5, Alerts 5→6.
         match self.current_tab {
-            3 => Some(&mut self.slot_scroll),
-            4 => Some(&mut self.resume_scroll),
-            5 => Some(&mut self.alert_scroll),
+            4 => Some(&mut self.slot_scroll),
+            5 => Some(&mut self.resume_scroll),
+            6 => Some(&mut self.alert_scroll),
             _ => None,
         }
     }
 
     fn scroll_max(&self) -> usize {
         match self.current_tab {
-            3 => self.slot_indices.len().saturating_sub(1),
-            4 => self.resume_rows.len().saturating_sub(1),
-            5 => self.state.alerts.len().saturating_sub(1),
+            4 => self.slot_indices.len().saturating_sub(1),
+            5 => self.resume_rows.len().saturating_sub(1),
+            6 => self.state.alerts.len().saturating_sub(1),
             _ => 0,
         }
     }
@@ -539,10 +571,15 @@ impl<'s> App<'s> {
     }
 }
 
-pub fn run(state: &State, buckets: Option<&TimeBuckets>, bucket_secs: i64) -> Result<(), TuiError> {
+pub fn run(
+    state: &State,
+    buckets: Option<&TimeBuckets>,
+    bucket_secs: i64,
+    activity: crate::live::detect::Activity,
+) -> Result<(), TuiError> {
     install_panic_hook();
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(state, buckets, bucket_secs);
+    let mut app = App::new(state, buckets, bucket_secs, activity);
     let result = event_loop(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
     result
@@ -610,8 +647,17 @@ fn event_loop(
                     KeyCode::Char('4') => app.set_tab(3),
                     KeyCode::Char('5') => app.set_tab(4),
                     KeyCode::Char('6') => app.set_tab(5),
+                    KeyCode::Char('7') => app.set_tab(6),
                     KeyCode::Tab => app.next_tab(),
                     KeyCode::BackTab => app.prev_tab(),
+                    // Live-tab-only: SPACEBAR toggles the follow flag.
+                    // Only meaningful when the log was classified Active;
+                    // a static file ignores the press silently.
+                    KeyCode::Char(' ') if app.current_tab == 0 => {
+                        if matches!(app.activity, crate::live::detect::Activity::Active) {
+                            app.following = !app.following;
+                        }
+                    }
                     KeyCode::Char('j') | KeyCode::Down => app.step_scroll(1),
                     KeyCode::Char('k') | KeyCode::Up => app.step_scroll(-1),
                     KeyCode::PageDown => app.step_scroll(20),
@@ -628,22 +674,23 @@ fn event_loop(
                     // overwrites `status_message` after the generic
                     // clear above, so the message persists for one
                     // render frame as intended.
-                    KeyCode::Char('y') if app.current_tab == 5 => {
+                    KeyCode::Char('y') if app.current_tab == 6 => {
                         app.yank_current_alert();
                     }
                     // Slot-tab-only filter shortcuts. Constrained to
-                    // `current_tab == 3` so the same letters stay free
+                    // `current_tab == 4` (Slots, shifted from 3 by the
+                    // Live-tab insertion) so the same letters stay free
                     // for future tab-specific bindings elsewhere.
-                    KeyCode::Char('t') if app.current_tab == 3 => {
+                    KeyCode::Char('t') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::Tcl);
                     }
-                    KeyCode::Char('n') if app.current_tab == 3 => {
+                    KeyCode::Char('n') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::S2n);
                     }
                     // `p` for S2S (safe-to-ski**P**); pairs with `n`
                     // for S2N — both safe-to-X events use the last
                     // letter of their qualifier.
-                    KeyCode::Char('p') if app.current_tab == 3 => {
+                    KeyCode::Char('p') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::S2s);
                     }
                     // `v` for VSKIP (we Voted skip, no canonical evidence).
@@ -651,27 +698,27 @@ fn event_loop(
                     // OR together in `SlotFilters::matches` so pressing
                     // both shows the union — equivalent to the old `[s]`
                     // "both buckets" toggle.
-                    KeyCode::Char('v') if app.current_tab == 3 => {
+                    KeyCode::Char('v') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::VskipOnly);
                     }
-                    KeyCode::Char('c') if app.current_tab == 3 => {
+                    KeyCode::Char('c') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::CanonicalSkipOnly);
                     }
-                    KeyCode::Char('l') if app.current_tab == 3 => {
+                    KeyCode::Char('l') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::Leader);
                     }
-                    KeyCode::Char('f') if app.current_tab == 3 => {
+                    KeyCode::Char('f') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::FastOnly);
                     }
                     // `s` for SLOW (was previously the combined VSKIP+CSKIP
                     // toggle; that combined behaviour is now expressed by
                     // pressing both `v` and `c`).
-                    KeyCode::Char('s') if app.current_tab == 3 => {
+                    KeyCode::Char('s') if app.current_tab == 4 => {
                         app.toggle_filter(FilterKind::SlowOnly);
                     }
                     // `x` clears all filters — moved here from `c` to free
                     // `c` for CSKIP. `x` reads as "cancel / clear".
-                    KeyCode::Char('x') if app.current_tab == 3 => {
+                    KeyCode::Char('x') if app.current_tab == 4 => {
                         app.clear_filters();
                     }
                     _ => {}
@@ -695,12 +742,19 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
     panel::header::render(app.state, frame, chunks[0]);
     render_tabs(app, frame, chunks[1]);
     match app.current_tab {
-        0 => panel::overview::render(app, frame, chunks[2]),
-        1 => panel::timeseries::render_detail(app.buckets, frame, chunks[2]),
-        2 => panel::windows::render(app, frame, chunks[2]),
-        3 => panel::slots::render(app, frame, chunks[2]),
-        4 => panel::leader_timeouts::render(app, frame, chunks[2]),
-        5 => panel::alerts::render_full(app, frame, chunks[2]),
+        0 => panel::live::render(
+            &app.activity,
+            &app.state.file_meta.path,
+            app.following,
+            frame,
+            chunks[2],
+        ),
+        1 => panel::overview::render(app, frame, chunks[2]),
+        2 => panel::timeseries::render_detail(app.buckets, frame, chunks[2]),
+        3 => panel::windows::render(app, frame, chunks[2]),
+        4 => panel::slots::render(app, frame, chunks[2]),
+        5 => panel::leader_timeouts::render(app, frame, chunks[2]),
+        6 => panel::alerts::render_full(app, frame, chunks[2]),
         _ => {}
     }
     panel::status_bar::render(
@@ -736,7 +790,7 @@ fn render_tabs(app: &App<'_>, frame: &mut Frame<'_>, area: ratatui::layout::Rect
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" navigate  (1-6 · Tab / Shift+Tab · q to quit) ")
+                .title(" navigate  (1-7 · Tab / Shift+Tab · SPACE follow · q quit) ")
                 .title_style(theme::title_style()),
         )
         .select(app.current_tab)

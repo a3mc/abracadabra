@@ -3,6 +3,7 @@
 pub mod alerts;
 pub mod header;
 pub mod leader_timeouts;
+pub mod live;
 pub mod overview;
 pub mod slots;
 pub mod status_bar;

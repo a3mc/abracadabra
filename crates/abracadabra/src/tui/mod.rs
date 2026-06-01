@@ -1,28 +1,36 @@
 //! Interactive ratatui dashboard.
 //!
-//! Six-tab interactive dashboard. The event loop, key dispatch, and
+//! Seven-tab interactive dashboard. The event loop, key dispatch, and
 //! `App` state live in `app.rs`; each tab has its own `panel::*` module
 //! that takes a `&App` and renders into a sub-rect.
 //!
-//! Tabs (`1`-`6` or `Tab` / `Shift+Tab`):
+//! Tabs (`1`-`7` or `Tab` / `Shift+Tab`):
 //!
-//! 1. Overview — stats-only summary: file meta, headline health,
+//! 1. Live — real-time follow surface (opt-in). Grayed when the input
+//!    log is classified static (rotated, stale, or not growing); when
+//!    active, `SPACEBAR` starts following. Animation engine: pending.
+//! 2. Overview — stats-only summary: file meta, headline health,
 //!    vote/cert totals, latency stages, vote-resume stats, alerts.
-//! 2. Time series — 2-column card grid of sparklines, shared x-axis
+//! 3. Time series — 2-column card grid of sparklines, shared x-axis
 //!    across cards.
-//! 3. Windows — rolling-window comparison table (`all`, 24h, 12h, 6h,
+//! 4. Windows — rolling-window comparison table (`all`, 24h, 12h, 6h,
 //!    3h, 1h).
-//! 4. Slots — KPI strip + dense scrollable slot table with column
-//!    filters (t/n/p/l/f/x/s/m, c clears).
-//! 5. Leader timeouts — TCL/vote-resume KPIs, distribution histogram,
+//! 5. Slots — KPI strip + dense scrollable slot table with column
+//!    filters (`t/n/p` TCL/S2N/S2S, `l/f/s` leader/fast/slow,
+//!    `v/c` VSKIP/CSKIP, `x` clear).
+//! 6. Leader timeouts — TCL/vote-resume KPIs, distribution histogram,
 //!    per-bucket trend, incident list.
-//! 6. Alerts — severity rollup + scrollable list + detail pane with
+//! 7. Alerts — severity rollup + scrollable list + detail pane with
 //!    sparkline; `y` yanks current alert to a per-user file.
 //!
 //! Common keys: `j`/`k` / arrows scroll, `PgUp`/`PgDn` page, `g`/`G` /
 //! `Home`/`End` jump. `q` / `Esc` quit. Scroll keys are no-ops on tabs
-//! 1-3 (no scrollable list). Per-tab keys are documented in the bottom
+//! without scrollable lists. Per-tab keys are documented in the bottom
 //! status bar (`panel::status_bar`).
+//!
+//! Default tab is Live when the input log was detected as active at
+//! startup; Overview when static (so the user is not stuck on a gray
+//! placeholder when running historical analysis).
 
 mod app;
 mod panel;
@@ -51,7 +59,11 @@ pub enum TuiError {
 ///
 /// `bucket_secs` is the time-series bucket size (validated by the CLI
 /// parser; bounds enforced there).
-pub fn run(state: &State, bucket_secs: i64) -> Result<(), TuiError> {
+pub fn run(
+    state: &State,
+    bucket_secs: i64,
+    activity: crate::live::detect::Activity,
+) -> Result<(), TuiError> {
     let buckets = TimeBuckets::from_state(state, bucket_secs);
-    app::run(state, buckets.as_ref(), bucket_secs)
+    app::run(state, buckets.as_ref(), bucket_secs, activity)
 }

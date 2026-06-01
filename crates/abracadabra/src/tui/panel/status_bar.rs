@@ -49,12 +49,22 @@ fn render_left(
     }
 
     let mut spans = vec![
-        Span::styled("1-6", theme::title_style()),
+        Span::styled("1-7", theme::title_style()),
         Span::styled(" tabs  ", theme::label_style()),
         Span::styled("Tab", theme::title_style()),
         Span::styled(" next  ", theme::label_style()),
     ];
-    if current_tab >= 3 {
+    // Live tab: SPACEBAR toggles follow when log is active. Hint is
+    // unconditionally shown so users see the affordance even when on
+    // the gray (static) panel; the panel itself explains the state.
+    if current_tab == 0 {
+        spans.extend([
+            Span::styled("SPACE", theme::title_style()),
+            Span::styled(" toggle follow  ", theme::label_style()),
+        ]);
+    }
+    // Scroll hints from Slots (tab 4) onward.
+    if current_tab >= 4 {
         spans.extend([
             Span::styled("j/k", theme::title_style()),
             Span::styled(" scroll  ", theme::label_style()),
@@ -64,21 +74,22 @@ fn render_left(
             Span::styled(" top/bottom  ", theme::label_style()),
         ]);
     }
-    if current_tab == 3 {
+    // Slots filter keys (tab 4, shifted from 3 by the Live tab).
+    // Labels match the actual key handlers in app.rs and the README.
+    if current_tab == 4 {
         spans.extend([
             Span::styled("t/n/p", theme::title_style()),
             Span::styled(" TCL/S2N/S2S  ", theme::label_style()),
-            Span::styled("l", theme::title_style()),
-            Span::styled(" leader  ", theme::label_style()),
-            Span::styled("f/x/s", theme::title_style()),
-            Span::styled(" fast/slow/skip  ", theme::label_style()),
-            Span::styled("b", theme::title_style()),
-            Span::styled(" canonical-skip  ", theme::label_style()),
-            Span::styled("c", theme::title_style()),
+            Span::styled("l/f/s", theme::title_style()),
+            Span::styled(" leader/fast/slow  ", theme::label_style()),
+            Span::styled("v/c", theme::title_style()),
+            Span::styled(" VSKIP/CSKIP  ", theme::label_style()),
+            Span::styled("x", theme::title_style()),
             Span::styled(" clear  ", theme::label_style()),
         ]);
     }
-    if current_tab == 5 {
+    // Alerts tab (was 5, now 6).
+    if current_tab == 6 {
         spans.extend([
             Span::styled("y", theme::title_style()),
             // Yank target: `$XDG_RUNTIME_DIR/abracadabra` (preferred) or
