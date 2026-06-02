@@ -78,10 +78,50 @@ enum Lane {
     Err,
 }
 
+/// Per-event magnitude for attention lanes. Drives how wide the event
+/// renders so the operator can tell minor jitter from a real burst at
+/// a glance. Turbine ignores this — it's the calm baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Magnitude {
+    Small,
+    Medium,
+    Large,
+}
+
+impl Magnitude {
+    /// Bucket a raw event count. Thresholds picked from observed
+    /// `num_repaired` / `num_discards` / `num_errors` distributions:
+    /// most events sit in 1–5 range; a "real" issue is 30+; a flood
+    /// pushes past 100.
+    const fn classify(count: u64) -> Self {
+        match count {
+            0..=5 => Self::Small,
+            6..=30 => Self::Medium,
+            _ => Self::Large,
+        }
+    }
+
+    /// How many adjacent horizontal cells this magnitude spans.
+    /// Larger magnitudes occupy more space so they stand out, without
+    /// distorting the time axis (cells are stacked at the same
+    /// timestamp, not at different times).
+    const fn cell_width(self) -> u32 {
+        match self {
+            Self::Small => 1,
+            Self::Medium => 2,
+            Self::Large => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Particle {
     spawn_at: Instant,
     lane: Lane,
+    /// `Some` for attention lanes (repair/drop/err); `None` for the
+    /// turbine baseline which renders as a single Braille dot
+    /// regardless of batch size.
+    magnitude: Option<Magnitude>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -107,13 +147,14 @@ impl ShredIngressPane {
         }
     }
 
-    fn spawn(&mut self, lane: Lane) {
+    fn spawn(&mut self, lane: Lane, magnitude: Option<Magnitude>) {
         if self.particles.len() >= PARTICLE_CAP {
             self.particles.remove(0);
         }
         self.particles.push(Particle {
             spawn_at: self.now,
             lane,
+            magnitude,
         });
     }
 }
@@ -132,24 +173,26 @@ impl Pane for ShredIngressPane {
         match m {
             MetricEvent::ShredFetch { shred_count } => {
                 self.numbers.fetch = Some(*shred_count);
-                self.spawn(Lane::Turbine);
+                // Turbine is the calm baseline — single Braille dot
+                // regardless of batch count.
+                self.spawn(Lane::Turbine, None);
             }
             MetricEvent::ShredFetchRepair { shred_count } => {
                 self.numbers.repair = Some(*shred_count);
                 if *shred_count > 0 {
-                    self.spawn(Lane::Repair);
+                    self.spawn(Lane::Repair, Some(Magnitude::classify(*shred_count)));
                 }
             }
             MetricEvent::ShredSigverify { num_discards, .. } => {
                 self.numbers.drop = Some(*num_discards);
                 if *num_discards > 0 {
-                    self.spawn(Lane::Drop);
+                    self.spawn(Lane::Drop, Some(Magnitude::classify(*num_discards)));
                 }
             }
             MetricEvent::RecvWindowInsert { num_errors, .. } => {
                 self.numbers.err = Some(*num_errors);
                 if *num_errors > 0 {
-                    self.spawn(Lane::Err);
+                    self.spawn(Lane::Err, Some(Magnitude::classify(*num_errors)));
                 }
             }
             _ => {}
@@ -211,21 +254,27 @@ impl ShredIngressPane {
         let chart_area = h_chunks[1];
 
         // Visual hierarchy:
-        //   turbine        → Braille DIM (calm noise floor — always-on,
-        //                    expected, no attention needed)
-        //   repair/drop/err → Block BOLD coloured (loud attention
-        //                    events — rare, meaningful)
-        // When a healthy log replays, the eye sees a quiet cyan texture
-        // along the turbine row and three empty rows below; any bold
-        // coloured block on the lower rows pops out of that texture
-        // immediately. The intensity-tier classifier was removed
-        // because in practice every turbine batch landed in the Large
-        // tier (counts ~350) and made the lane indistinguishable from
-        // repair / drop / err.
+        //   turbine        → Braille DIM (calm noise floor)
+        //   repair/drop/err → Block BOLD coloured, with WIDTH
+        //                     proportional to event magnitude. A
+        //                     small repair (1-5 shreds) is 1 cell
+        //                     wide; a flood (100+) is 3 cells. Lets
+        //                     the operator tell minor jitter from a
+        //                     real burst at a glance.
         let mut turbine: Vec<(f64, f64)> = Vec::new();
         let mut repair: Vec<(f64, f64)> = Vec::new();
         let mut drop: Vec<(f64, f64)> = Vec::new();
         let mut err: Vec<(f64, f64)> = Vec::new();
+
+        // Estimate the chart's data-x units per terminal cell so we
+        // can space the magnitude-driven extra particles by ONE cell
+        // each. This keeps the burst centred on the event's time and
+        // grows it horizontally rather than smearing it across time.
+        let dx_per_cell = if chart_area.width > 0 {
+            X_MAX / f64::from(chart_area.width)
+        } else {
+            1.0
+        };
 
         for p in &self.particles {
             let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
@@ -235,9 +284,24 @@ impl ShredIngressPane {
             let x = (age / TRAVERSAL_SECS) * X_MAX;
             match p.lane {
                 Lane::Turbine => turbine.push((x, Y_TURBINE)),
-                Lane::Repair => repair.push((x, Y_REPAIR)),
-                Lane::Drop => drop.push((x, Y_DROP)),
-                Lane::Err => err.push((x, Y_ERR)),
+                Lane::Repair | Lane::Drop | Lane::Err => {
+                    let cells = p.magnitude.map_or(1, Magnitude::cell_width);
+                    let dest = match p.lane {
+                        Lane::Repair => &mut repair,
+                        Lane::Drop => &mut drop,
+                        Lane::Err => &mut err,
+                        Lane::Turbine => unreachable!(),
+                    };
+                    let y = match p.lane {
+                        Lane::Repair => Y_REPAIR,
+                        Lane::Drop => Y_DROP,
+                        Lane::Err => Y_ERR,
+                        Lane::Turbine => unreachable!(),
+                    };
+                    for i in 0..cells {
+                        dest.push((f64::from(i).mul_add(dx_per_cell, x), y));
+                    }
+                }
             }
         }
 
@@ -295,7 +359,8 @@ impl ShredIngressPane {
 
         let line = Line::from(vec![
             Span::styled(format!(" {fetch}"), Style::default().fg(COL_TURBINE)),
-            Span::styled(" sh  ", theme::label_style()),
+            Span::styled(" sh", theme::label_style()),
+            sep(),
             Span::styled(
                 repair,
                 if self.numbers.repair.unwrap_or(0) > 0 {
@@ -304,7 +369,8 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" rep  ", theme::label_style()),
+            Span::styled(" rep", theme::label_style()),
+            sep(),
             Span::styled(
                 drop,
                 if self.numbers.drop.unwrap_or(0) > 0 {
@@ -313,7 +379,8 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" drop  ", theme::label_style()),
+            Span::styled(" drop", theme::label_style()),
+            sep(),
             Span::styled(
                 err,
                 if self.numbers.err.unwrap_or(0) > 0 {
@@ -322,9 +389,10 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" err  ", theme::label_style()),
+            Span::styled(" err", theme::label_style()),
+            sep(),
             Span::styled(
-                "·  per-sample (~1/s)",
+                "per-sample (~1/s)",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -332,6 +400,18 @@ impl ShredIngressPane {
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
+}
+
+/// Inline separator span used between metric groups on the snapshot
+/// row. Picks a visible-but-quiet glyph so the eye can find groups
+/// without the colour itself becoming noise.
+fn sep() -> Span<'static> {
+    Span::styled(
+        "  ·  ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
 }
 
 fn fmt_opt(v: Option<u64>) -> String {
