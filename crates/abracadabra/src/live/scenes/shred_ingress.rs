@@ -78,18 +78,10 @@ enum Lane {
     Err,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Intensity {
-    Small,
-    Medium,
-    Large,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct Particle {
     spawn_at: Instant,
     lane: Lane,
-    intensity: Intensity,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -115,22 +107,13 @@ impl ShredIngressPane {
         }
     }
 
-    const fn classify(count: u64) -> Intensity {
-        match count {
-            0..=20 => Intensity::Small,
-            21..=100 => Intensity::Medium,
-            _ => Intensity::Large,
-        }
-    }
-
-    fn spawn(&mut self, lane: Lane, intensity: Intensity) {
+    fn spawn(&mut self, lane: Lane) {
         if self.particles.len() >= PARTICLE_CAP {
             self.particles.remove(0);
         }
         self.particles.push(Particle {
             spawn_at: self.now,
             lane,
-            intensity,
         });
     }
 }
@@ -149,24 +132,24 @@ impl Pane for ShredIngressPane {
         match m {
             MetricEvent::ShredFetch { shred_count } => {
                 self.numbers.fetch = Some(*shred_count);
-                self.spawn(Lane::Turbine, Self::classify(*shred_count));
+                self.spawn(Lane::Turbine);
             }
             MetricEvent::ShredFetchRepair { shred_count } => {
                 self.numbers.repair = Some(*shred_count);
                 if *shred_count > 0 {
-                    self.spawn(Lane::Repair, Self::classify(*shred_count));
+                    self.spawn(Lane::Repair);
                 }
             }
             MetricEvent::ShredSigverify { num_discards, .. } => {
                 self.numbers.drop = Some(*num_discards);
                 if *num_discards > 0 {
-                    self.spawn(Lane::Drop, Self::classify(*num_discards));
+                    self.spawn(Lane::Drop);
                 }
             }
             MetricEvent::RecvWindowInsert { num_errors, .. } => {
                 self.numbers.err = Some(*num_errors);
                 if *num_errors > 0 {
-                    self.spawn(Lane::Err, Self::classify(*num_errors));
+                    self.spawn(Lane::Err);
                 }
             }
             _ => {}
@@ -227,10 +210,19 @@ impl ShredIngressPane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        // Partition by (lane × intensity). Bigger intensity = bigger marker.
-        let mut turbine_s: Vec<(f64, f64)> = Vec::new();
-        let mut turbine_m: Vec<(f64, f64)> = Vec::new();
-        let mut turbine_l: Vec<(f64, f64)> = Vec::new();
+        // Visual hierarchy:
+        //   turbine        → Braille DIM (calm noise floor — always-on,
+        //                    expected, no attention needed)
+        //   repair/drop/err → Block BOLD coloured (loud attention
+        //                    events — rare, meaningful)
+        // When a healthy log replays, the eye sees a quiet cyan texture
+        // along the turbine row and three empty rows below; any bold
+        // coloured block on the lower rows pops out of that texture
+        // immediately. The intensity-tier classifier was removed
+        // because in practice every turbine batch landed in the Large
+        // tier (counts ~350) and made the lane indistinguishable from
+        // repair / drop / err.
+        let mut turbine: Vec<(f64, f64)> = Vec::new();
         let mut repair: Vec<(f64, f64)> = Vec::new();
         let mut drop: Vec<(f64, f64)> = Vec::new();
         let mut err: Vec<(f64, f64)> = Vec::new();
@@ -241,19 +233,11 @@ impl ShredIngressPane {
                 continue;
             }
             let x = (age / TRAVERSAL_SECS) * X_MAX;
-            let y = match p.lane {
-                Lane::Turbine => Y_TURBINE,
-                Lane::Repair => Y_REPAIR,
-                Lane::Drop => Y_DROP,
-                Lane::Err => Y_ERR,
-            };
-            match (p.lane, p.intensity) {
-                (Lane::Turbine, Intensity::Small) => turbine_s.push((x, y)),
-                (Lane::Turbine, Intensity::Medium) => turbine_m.push((x, y)),
-                (Lane::Turbine, Intensity::Large) => turbine_l.push((x, y)),
-                (Lane::Repair, _) => repair.push((x, y)),
-                (Lane::Drop, _) => drop.push((x, y)),
-                (Lane::Err, _) => err.push((x, y)),
+            match p.lane {
+                Lane::Turbine => turbine.push((x, Y_TURBINE)),
+                Lane::Repair => repair.push((x, Y_REPAIR)),
+                Lane::Drop => drop.push((x, Y_DROP)),
+                Lane::Err => err.push((x, Y_ERR)),
             }
         }
 
@@ -262,21 +246,7 @@ impl ShredIngressPane {
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_TURBINE).add_modifier(Modifier::DIM))
-                .data(&turbine_s),
-            Dataset::default()
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_TURBINE))
-                .data(&turbine_m),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(
-                    Style::default()
-                        .fg(COL_TURBINE)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .data(&turbine_l),
+                .data(&turbine),
             Dataset::default()
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
@@ -491,13 +461,6 @@ mod tests {
         }
         p.tick(Instant::now());
         assert!(p.particles.is_empty());
-    }
-
-    #[test]
-    fn intensity_tiering() {
-        assert_eq!(ShredIngressPane::classify(5), Intensity::Small);
-        assert_eq!(ShredIngressPane::classify(50), Intensity::Medium);
-        assert_eq!(ShredIngressPane::classify(500), Intensity::Large);
     }
 
     #[test]

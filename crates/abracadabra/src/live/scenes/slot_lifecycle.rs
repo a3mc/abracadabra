@@ -66,13 +66,11 @@ const COL_FEC: Color = Color::LightBlue;
 /// Width reserved on the left of the pane for lane labels.
 const LABEL_COL_WIDTH: u16 = 9;
 
-/// Glyphs for single-event lanes — chosen to read as discrete events,
-/// not as bars carrying a magnitude. All three are symmetric so the
-/// flow reads as consistent shapes with semantic colour, not
-/// inconsistent typography (the `✓` we used before was asymmetric
-/// and stood out wrong). FEC alone carries a per-slot count
-/// (`num_recovered`) so it stays as a small Braille dot stream.
-const GLYPH_FAST: &str = "●";
+/// Glyphs for the *attention* single-event lanes — these read as
+/// discrete bold events when they appear. `fast` finalizations and
+/// `fec` recovery are the calm baseline lanes and render as Braille
+/// DIM streams (like the turbine lane in `shred_ingress`); only the
+/// rare attention events get glyphs so they pop out of the texture.
 const GLYPH_SLOW: &str = "◆";
 const GLYPH_SKIP: &str = "✗";
 
@@ -234,11 +232,12 @@ impl SlotLifecyclePane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        // FEC particles render through a Chart (low-noise Braille) —
-        // they have a per-slot count and read as "density of recovery".
+        // Calm baseline streams (fast, fec) → Braille DIM Chart
+        // datasets; they happen on every slot and form a flowing
+        // texture. Attention events (slow, skip) → bold glyph
+        // overlays so they pop out of the texture.
+        let mut fast: Vec<(f64, f64)> = Vec::new();
         let mut fec: Vec<(f64, f64)> = Vec::new();
-        // Fast / slow / skip render as discrete glyphs at computed
-        // (x, y) screen positions — each is one event, not a quantity.
         let mut glyph_events: Vec<(f64, Lane)> = Vec::new();
 
         for p in &self.particles {
@@ -248,17 +247,24 @@ impl SlotLifecyclePane {
             }
             let x = (age / TRAVERSAL_SECS) * X_MAX;
             match p.lane {
+                Lane::Fast => fast.push((x, Y_FAST)),
                 Lane::Fec => fec.push((x, Y_FEC)),
-                _ => glyph_events.push((x, p.lane)),
+                Lane::Slow | Lane::Skip => glyph_events.push((x, p.lane)),
             }
         }
 
-        // FEC stream as a Chart (Braille = subtle).
-        let datasets = vec![Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
-            .data(&fec)];
+        let datasets = vec![
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_GOOD).add_modifier(Modifier::DIM))
+                .data(&fast),
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
+                .data(&fec),
+        ];
         let chart = Chart::new(datasets)
             .x_axis(Axis::default().bounds([0.0, X_MAX]))
             .y_axis(Axis::default().bounds([0.0, 4.0]));
@@ -270,19 +276,15 @@ impl SlotLifecyclePane {
         render_lane_label(frame, label_area, chart_area, "skip", Y_SKIP, COL_BAD);
         render_lane_label(frame, label_area, chart_area, "fec", Y_FEC, COL_FEC);
 
-        // Discrete glyph events painted as text at chart-derived cells.
+        // Attention glyphs (slow / skip) painted as bold text overlays.
         for (x_chart, lane) in glyph_events {
             let (glyph, style) = match lane {
-                Lane::Fast => (
-                    GLYPH_FAST,
-                    Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD),
-                ),
                 Lane::Slow => (GLYPH_SLOW, Style::default().fg(COL_WARN)),
                 Lane::Skip => (
                     GLYPH_SKIP,
                     Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD),
                 ),
-                Lane::Fec => continue, // handled by the Chart above
+                Lane::Fast | Lane::Fec => continue, // handled by the Chart above
             };
             let y_chart = lane_y(lane);
             render_glyph_at(frame, chart_area, glyph, style, x_chart, y_chart);
