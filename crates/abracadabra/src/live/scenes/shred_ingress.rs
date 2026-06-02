@@ -305,9 +305,16 @@ impl ShredIngressPane {
             }
         }
 
+        // Marker::Dot puts every calm-baseline event at the cell
+        // centre; Marker::Block does the same for attention events.
+        // All four lanes therefore share one vertical snapline:
+        // turbine `•`, repair `█`, drop `█`, err `█` all read as
+        // centred-in-cell glyphs. Braille gave sub-pixel positioning
+        // which was perceived as misalignment versus the Block rows
+        // below it.
         let datasets = vec![
             Dataset::default()
-                .marker(Marker::Braille)
+                .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_TURBINE).add_modifier(Modifier::DIM))
                 .data(&turbine),

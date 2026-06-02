@@ -253,14 +253,21 @@ impl SlotLifecyclePane {
             }
         }
 
+        // Marker::Dot for the calm baselines so every event renders
+        // at the same cell-centre baseline as the attention glyphs
+        // (`◆` slow, `✗` skip). Marker::Braille gave sub-pixel
+        // positioning (top / middle / bottom of cell), which read
+        // as visual wobble next to the centred glyphs on the rows
+        // between. Dot loses the sub-pixel density but keeps every
+        // event on the same vertical snapline.
         let datasets = vec![
             Dataset::default()
-                .marker(Marker::Braille)
+                .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_GOOD).add_modifier(Modifier::DIM))
                 .data(&fast),
             Dataset::default()
-                .marker(Marker::Braille)
+                .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
                 .data(&fec),
