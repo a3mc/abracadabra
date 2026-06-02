@@ -107,9 +107,60 @@ impl SceneEngine {
         }
     }
 
-    /// Vertical-split `area` between panes using their constraints,
-    /// then render each into its sub-rect.
+    /// Render the Live-tab layout:
+    ///
+    /// ```text
+    /// ┌────────────────────────────────────────────────────────────┐
+    /// │ shred ingress          │ recent slots                      │  ← top row, 50/50 split
+    /// │ (pane 0)               │ (pane 1)                          │
+    /// ├────────────────────────────────────────────────────────────┤
+    /// │                                                            │  ← reserved breathing room
+    /// │ (future strips land here as a horizontal stack)            │     (pane 2 = EmptyPane)
+    /// ├────────────────────────────────────────────────────────────┤
+    /// │ decorations strip                                          │  ← pane 3
+    /// └────────────────────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// The top-row height is the maximum of the two top panes'
+    /// declared row heights; future strips live in the breathing slot
+    /// in the middle.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        // For the current Live-tab layout: slots[0] = shred ingress,
+        // slots[1] = slot lifecycle, slots[2] = empty filler,
+        // slots[3] = decorations. If any are missing, fall back to a
+        // simple vertical-stack render so this method stays robust to
+        // smaller compositions during development.
+        if self.slots.len() < 4 {
+            self.render_vertical_stack(frame, area);
+            return;
+        }
+
+        let top_height = constraint_max_rows(self.slots[0].constraint, area.height)
+            .max(constraint_max_rows(self.slots[1].constraint, area.height));
+        let v_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(top_height),
+                Constraint::Min(0),
+                self.slots[3].constraint,
+            ])
+            .split(area);
+
+        let top_h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(v_chunks[0]);
+        self.slots[0].pane.render(frame, top_h[0]);
+        self.slots[1].pane.render(frame, top_h[1]);
+        // Middle breathing strip: render the EmptyPane into v_chunks[1]
+        // so it can grow into a real strip later by swapping the pane.
+        self.slots[2].pane.render(frame, v_chunks[1]);
+        self.slots[3].pane.render(frame, v_chunks[2]);
+    }
+
+    /// Vertical stack fallback used when the composition does not
+    /// match the canonical Live-tab layout.
+    fn render_vertical_stack(&self, frame: &mut Frame<'_>, area: Rect) {
         let constraints: Vec<Constraint> = self.slots.iter().map(|s| s.constraint).collect();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -118,6 +169,20 @@ impl SceneEngine {
         for (slot, rect) in self.slots.iter().zip(chunks.iter()) {
             slot.pane.render(frame, *rect);
         }
+    }
+}
+
+/// Resolve a `Constraint` against an available row budget into the
+/// expected row count it would consume. `Length` returns the literal
+/// value; `Percentage` resolves against `area_rows`; `Min` falls back
+/// to its own minimum. Used by the canonical Live-tab layout to size
+/// the top row.
+fn constraint_max_rows(c: Constraint, area_rows: u16) -> u16 {
+    match c {
+        Constraint::Length(n) => n,
+        Constraint::Percentage(p) => (u32::from(area_rows) * u32::from(p) / 100) as u16,
+        Constraint::Min(n) => n,
+        _ => 0,
     }
 }
 

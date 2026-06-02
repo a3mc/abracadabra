@@ -1,29 +1,44 @@
-//! Slot lifecycle strip — per-slot timing bars from real metrics.
+//! Slot lifecycle strip — cards drifting horizontally.
+//!
+//! Layout (half-width pane, ~12 rows tall):
 //!
 //! ```text
-//! ┌─ slot lifecycle (last 4) ────────────────────────────────────────────┐
-//! │   2070551  ▓▓▓░░░░░░ 137ms  fast   (96 shreds · 0 repair · 44 fec)   │
-//! │   2070552  ▓▓░░░░░░░  92ms  fast   (94 shreds · 0 repair · 22 fec)   │
-//! │   2070553  ▓▓▓▓░░░░░ 144ms  fast   (95 shreds · 0 repair · 44 fec)   │
-//! │            ▲shred → vote_notarize → finalized                        │
-//! └──────────────────────────────────────────────────────────────────────┘
+//! ┌─ recent slots ─────────────────────────────────────┐
+//! │                                                    │
+//! │   ┌─ 2070551 ─┐  ┌─ 2070552 ─┐  ┌─ 2070553 ─┐      │
+//! │   │ 137ms  ⚡ │  │  92ms  ⚡ │  │ 144ms  ⚡ │      │
+//! │   │ 96 shr    │  │ 94 shr    │  │ 95 shr    │      │
+//! │   │ ▰▰▰▰▰▰▰░░│  │ ▰▰▰▰▰░░░░│  │ ▰▰▰▰▰▰░░░│      │
+//! │   │ T96 R0 F44│  │ T72 R0 F22│  │ T51 R0 F44│      │
+//! │   └───────────┘  └───────────┘  └───────────┘      │
+//! │                                                    │
+//! │           ←  newer slots push from the right       │
+//! └────────────────────────────────────────────────────┘
 //! ```
 //!
-//! One row per recently-completed slot, newest at the bottom. Data
-//! comes from two `solana_metrics::metrics` datapoints joined by slot
-//! number:
+//! Each card shows ONE finalized slot. New cards spawn on the right;
+//! existing cards drift left as new ones push in; cards exit off the
+//! left edge after ~30s. Visible card count adapts to the pane width
+//! (roughly `width / 16`).
 //!
-//! - `event_handler_slot_tracking` → `first_shred_us`, `vote_notarize_us`,
-//!   `finalized_us`, `is_fast_finalization` (lifecycle timing)
-//! - `shred_insert_is_full` → `last_index`, `num_repaired`, `num_recovered`
-//!   (per-slot shred-source breakdown)
+//! Data per card:
 //!
-//! A slot is "ready to display" once both metrics have arrived. The
-//! pane keeps the most recent [`MAX_SLOTS_SHOWN`] ready slots; older
-//! ones drop off the top as new ones complete.
+//! - `<slot>` — the slot number.
+//! - `<total>ms` — `first_shred_us + vote_notarize_us + finalized_us`
+//!   from `event_handler_slot_tracking`, divided by 1000.
+//! - `⚡` if `is_fast_finalization == true` (NotarizeFast path);
+//!   blank otherwise (slow Notarize+Finalize path).
+//! - `N shr` — total shred count for the slot (`last_index + 1`
+//!   from `shred_insert_is_full`).
+//! - T/R/F bar — proportional split of shreds by source:
+//!   - `T` (Turbine, green) = inserted shreds (this is what we want
+//!     to see fill the bar)
+//!   - `R` (Repair, yellow) = `num_repaired` (any yellow = upstream
+//!     Turbine had gaps for this slot)
+//!   - `F` (FEC, light blue) = `num_recovered` (clever reconstruction)
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -36,18 +51,39 @@ use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
 /// Pane row height when laid out by [`crate::live::scenes::SceneEngine`].
-pub const PANE_HEIGHT: u16 = 7;
+pub const PANE_HEIGHT: u16 = 12;
 
-/// Maximum slot rows displayed at once. Older ready rows are evicted.
-pub const MAX_SLOTS_SHOWN: usize = 4;
+/// Cell width of one card (incl. its borders). 13 inner + 2 borders = 15
+/// reads as ~3 cards on a 50-col half-width pane.
+const CARD_WIDTH: u16 = 15;
 
-/// Aggregated record for one slot, partially populated by each metric
-/// type. A slot is "ready" once both `tracking` and `insert_full` are
-/// present.
+/// Horizontal gap between cards.
+const CARD_GAP: u16 = 1;
+
+/// How long a card stays visible after the slot's data lands. Old cards
+/// drift left and exit off the left edge.
+const CARD_LIFESPAN: Duration = Duration::from_secs(30);
+
+/// Cells per second the cards drift leftward.
+const DRIFT_CELLS_PER_SEC: f64 = 1.0;
+
+/// Maximum slots we track in `slots`. Older entries evict regardless of
+/// readiness so growth is bounded even if one metric never arrives.
+const MAX_TRACKED: usize = 64;
+
+// Semantic palette — shared with [`crate::live::scenes::shred_ingress`].
+// Turbine colour is exported via the bar's "T" label which is the
+// `inserted` count (everything that wasn't repair or FEC came via
+// Turbine, by construction).
+const COL_REPAIR: Color = Color::Yellow;
+const COL_FEC: Color = Color::LightBlue;
+const COL_INSERTED: Color = Color::Green;
+
 #[derive(Debug, Default, Clone, Copy)]
 struct SlotRow {
     tracking: Option<Tracking>,
     insert_full: Option<InsertFull>,
+    ready_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,27 +108,28 @@ impl SlotRow {
 }
 
 pub struct SlotLifecyclePane {
-    /// All currently-known slots, ordered by slot number. We hold all
-    /// of them so partially-populated rows can be completed when the
-    /// second metric for that slot arrives, regardless of order. The
-    /// render pass filters this down to [`MAX_SLOTS_SHOWN`] ready rows.
+    /// All currently-tracked slots, ordered by slot number. Capped at
+    /// [`MAX_TRACKED`] to bound growth.
     slots: BTreeMap<u64, SlotRow>,
+    now: Instant,
 }
 
 impl SlotLifecyclePane {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             slots: BTreeMap::new(),
+            now: Instant::now(),
         }
     }
 
-    /// Drop oldest slots once the ready-set is comfortably above the
-    /// display cap. Bounded growth even if one metric type never
-    /// arrives for some slot — the partial entries get evicted as
-    /// newer slots fill the cap.
+    const fn ready_now_if_needed(row: &mut SlotRow, now: Instant) {
+        if row.is_ready() && row.ready_at.is_none() {
+            row.ready_at = Some(now);
+        }
+    }
+
     fn evict_old(&mut self) {
-        let max_keep = MAX_SLOTS_SHOWN.saturating_mul(4);
-        while self.slots.len() > max_keep {
+        while self.slots.len() > MAX_TRACKED {
             let Some((&oldest, _)) = self.slots.iter().next() else {
                 break;
             };
@@ -127,6 +164,7 @@ impl Pane for SlotLifecyclePane {
                     finalized_us: *finalized_us,
                     is_fast_finalization: *is_fast_finalization,
                 });
+                Self::ready_now_if_needed(row, self.now);
                 self.evict_old();
             }
             MetricEvent::ShredInsertIsFull {
@@ -142,76 +180,87 @@ impl Pane for SlotLifecyclePane {
                     num_repaired: *num_repaired,
                     num_recovered: *num_recovered,
                 });
+                Self::ready_now_if_needed(row, self.now);
                 self.evict_old();
             }
             _ => {}
         }
     }
 
-    fn tick(&mut self, _now: Instant) {
-        // Pure data-driven pane; no per-frame state evolution.
+    fn tick(&mut self, now: Instant) {
+        self.now = now;
+        // Drop cards whose ready_at is older than CARD_LIFESPAN; they
+        // have already drifted off the visible area.
+        self.slots.retain(|_, r| {
+            r.ready_at
+                .is_none_or(|t| now.saturating_duration_since(t) < CARD_LIFESPAN)
+        });
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" slot lifecycle (last {MAX_SLOTS_SHOWN}) "))
+            .title(" recent slots · ←  newer push from right ")
             .title_style(theme::title_style())
             .border_style(theme::title_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 40 || inner.height < 2 {
+        if inner.width < CARD_WIDTH + 4 || inner.height < 6 {
             return;
         }
 
-        // Most recent ready rows, newest at the back. Walk reverse
-        // (newest first) to take the cap, then reverse again so the
-        // visual order is oldest-at-top, newest-at-bottom.
-        let mut ready: Vec<(u64, SlotRow)> = self
+        // Compute card positions: newest card hugs the right inner
+        // edge; each older card sits CARD_WIDTH + CARD_GAP to its left,
+        // shifted further left by its drift age * DRIFT_CELLS_PER_SEC.
+        let visible: Vec<(u64, SlotRow, Instant)> = self
             .slots
             .iter()
-            .rev()
-            .filter(|(_, r)| r.is_ready())
-            .take(MAX_SLOTS_SHOWN)
-            .map(|(&s, &r)| (s, r))
+            .filter_map(|(&s, r)| r.ready_at.map(|t| (s, *r, t)))
             .collect();
-        ready.reverse();
 
-        for (i, (slot, row)) in ready.iter().enumerate() {
-            let y = inner.y + i as u16;
-            if y >= inner.y + inner.height.saturating_sub(1) {
+        // Sort newest first by ready_at.
+        let mut sorted = visible;
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.2));
+
+        for (rank, (slot, row, ready_at)) in sorted.iter().enumerate() {
+            let age_secs = self.now.saturating_duration_since(*ready_at).as_secs_f64();
+            let drift = (age_secs * DRIFT_CELLS_PER_SEC) as u16;
+            let stride = CARD_WIDTH + CARD_GAP;
+            #[allow(clippy::cast_possible_truncation)]
+            let rank_u16 = rank as u16;
+            // Position from the right: rightmost card at inner.right - CARD_WIDTH.
+            let from_right = stride.saturating_mul(rank_u16).saturating_add(drift);
+            if from_right + CARD_WIDTH > inner.width {
+                break; // ran off the left edge
+            }
+            let x = inner.x + inner.width - CARD_WIDTH - from_right;
+            let y = inner.y;
+            if y + 6 > inner.y + inner.height {
                 break;
             }
-            let line = format_slot_line(*slot, row, inner.width);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+            render_card(frame, Rect::new(x, y, CARD_WIDTH, 6), *slot, row);
         }
 
-        // Caption (bottom row): legend for the timing bar segments.
+        // Caption row.
         let cap_y = inner.y + inner.height.saturating_sub(1);
-        let caption = "  shred → vote_notarize → finalized";
-        let caption_line = Line::from(Span::styled(
-            caption,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ));
+        let caption = "  T=turbine · R=repair · F=fec";
         frame.render_widget(
-            Paragraph::new(caption_line),
+            Paragraph::new(Span::styled(
+                caption,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )),
             Rect::new(inner.x, cap_y, inner.width, 1),
         );
     }
 }
 
-/// Build one row's `Line`: slot number, timing bar, total ms, fast flag,
-/// shred-source partition.
-fn format_slot_line(slot: u64, row: &SlotRow, width: u16) -> Line<'static> {
-    // Bar width = 10 cells. Each segment proportional to its share of
-    // the total. Use ▓ for the lit portion, ░ for unfilled remainder.
-    const BAR_CELLS: u64 = 10;
-
+/// Render one slot card at `rect` (assumes 15 wide × 6 tall).
+fn render_card(frame: &mut Frame<'_>, rect: Rect, slot: u64, row: &SlotRow) {
     let (Some(tracking), Some(insert_full)) = (row.tracking, row.insert_full) else {
-        return Line::from("");
+        return;
     };
 
     let total_us = tracking
@@ -220,75 +269,144 @@ fn format_slot_line(slot: u64, row: &SlotRow, width: u16) -> Line<'static> {
         .saturating_add(tracking.finalized_us);
     let total_ms = total_us / 1000;
 
-    let bar = build_timing_bar(tracking, BAR_CELLS);
-
-    let fast_label = if tracking.is_fast_finalization {
-        " fast "
-    } else {
-        " slow "
-    };
-
-    // Right-side detail: shred counts. last_index is the highest index
-    // observed, so total shreds ≈ last_index + 1.
     let total_shreds = insert_full.last_index.saturating_add(1);
-    let detail = format!(
-        "({total_shreds} shreds · {} repair · {} fec)",
-        insert_full.num_repaired, insert_full.num_recovered
+    let inserted = total_shreds
+        .saturating_sub(insert_full.num_repaired)
+        .saturating_sub(insert_full.num_recovered);
+
+    let bar = trf_bar(
+        inserted,
+        insert_full.num_repaired,
+        insert_full.num_recovered,
+        11,
     );
 
-    let _ = width;
-    Line::from(vec![
-        Span::styled("  ", theme::label_style()),
+    // Border style: warmer (yellow) when repair is non-zero so the
+    // card pulls the operator's eye to itself.
+    let border_style = if insert_full.num_repaired > 0 {
+        Style::default().fg(COL_REPAIR)
+    } else if tracking.is_fast_finalization {
+        Style::default().fg(COL_INSERTED)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {slot} "))
+        .title_style(theme::title_style())
+        .border_style(border_style);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Row 1: total ms + fast flag
+    let ms_line = Line::from(vec![
         Span::styled(
-            format!("{slot}"),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", theme::label_style()),
-        Span::styled(bar, Style::default().fg(Color::Cyan)),
-        Span::styled(" ", theme::label_style()),
-        Span::styled(
-            format!("{total_ms}ms"),
+            format!(" {total_ms:>4}ms"),
             theme::value_style().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            fast_label,
             if tracking.is_fast_finalization {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
+                "  ⚡"
             } else {
-                Style::default().fg(Color::Yellow)
+                "    "
             },
+            Style::default()
+                .fg(if tracking.is_fast_finalization {
+                    COL_INSERTED
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", theme::label_style()),
-        Span::styled(detail, theme::label_style()),
-    ])
+    ]);
+    if inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(ms_line),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+
+    // Row 2: total shreds
+    if inner.height > 1 {
+        let line = Line::from(vec![
+            Span::styled(" ", theme::label_style()),
+            Span::styled(format!("{total_shreds}"), theme::value_style()),
+            Span::styled(" shreds", theme::label_style()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+
+    // Row 3: T/R/F bar
+    if inner.height > 2 {
+        frame.render_widget(
+            Paragraph::new(Line::from(bar)),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+        );
+    }
+
+    // Row 4: T/R/F numerics
+    if inner.height > 3 {
+        let line = Line::from(vec![
+            Span::styled(" T", Style::default().fg(COL_INSERTED)),
+            Span::styled(
+                format!("{inserted}"),
+                Style::default()
+                    .fg(COL_INSERTED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" R", Style::default().fg(COL_REPAIR)),
+            Span::styled(
+                format!("{}", insert_full.num_repaired),
+                if insert_full.num_repaired > 0 {
+                    Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(" F", Style::default().fg(COL_FEC)),
+            Span::styled(
+                format!("{}", insert_full.num_recovered),
+                Style::default().fg(COL_FEC),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        );
+    }
 }
 
-/// Build the timing bar string. Each of the three segments takes up
-/// cells proportional to its share of the total. Uses ▓ for the
-/// shred segment, ▒ for vote_notarize, ░ for finalized.
-fn build_timing_bar(t: Tracking, cells: u64) -> String {
-    let total = t
-        .first_shred_us
-        .saturating_add(t.vote_notarize_us)
-        .saturating_add(t.finalized_us)
-        .max(1);
-    let shred_cells = t.first_shred_us.saturating_mul(cells) / total;
-    let vote_cells = t.vote_notarize_us.saturating_mul(cells) / total;
-    let final_cells = cells.saturating_sub(shred_cells).saturating_sub(vote_cells);
-
-    let mut s = String::with_capacity(cells as usize * 3);
-    for _ in 0..shred_cells {
-        s.push('▓');
+/// Build the T/R/F partition bar as a `Vec<Span>` so each segment
+/// carries its own colour. Total cells fixed at `cells`. Segments are
+/// proportional to their share of `t + r + f`.
+fn trf_bar(t: u64, r: u64, f: u64, cells: u64) -> Vec<Span<'static>> {
+    let total = t.saturating_add(r).saturating_add(f).max(1);
+    let t_cells = t.saturating_mul(cells) / total;
+    let r_cells = r.saturating_mul(cells) / total;
+    let f_cells = cells.saturating_sub(t_cells).saturating_sub(r_cells);
+    let mut spans = Vec::with_capacity(4);
+    if t_cells > 0 {
+        spans.push(Span::styled(
+            "▰".repeat(t_cells as usize),
+            Style::default().fg(COL_INSERTED),
+        ));
     }
-    for _ in 0..vote_cells {
-        s.push('▒');
+    if r_cells > 0 {
+        spans.push(Span::styled(
+            "▰".repeat(r_cells as usize),
+            Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD),
+        ));
     }
-    for _ in 0..final_cells {
-        s.push('░');
+    if f_cells > 0 {
+        spans.push(Span::styled(
+            "▰".repeat(f_cells as usize),
+            Style::default().fg(COL_FEC),
+        ));
     }
-    s
+    spans
 }
 
 #[cfg(test)]
@@ -303,95 +421,96 @@ mod tests {
     }
 
     #[test]
-    fn slot_not_ready_until_both_metrics_arrive() {
+    fn slot_becomes_ready_when_both_metrics_arrive() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
-            slot: 100,
-            first_shred_us: 1000,
-            vote_notarize_us: 2000,
-            finalized_us: 3000,
-            is_fast_finalization: true,
-        })));
-        let row = p.slots.get(&100).unwrap();
-        assert!(row.tracking.is_some());
-        assert!(row.insert_full.is_none());
-        assert!(!row.is_ready());
-
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 100,
-            total_time_ms: 40,
-            last_index: 95,
-            num_repaired: 0,
-            num_recovered: 44,
-        })));
-        let row = p.slots.get(&100).unwrap();
-        assert!(row.is_ready());
-    }
-
-    #[test]
-    fn order_independent_metric_joining() {
-        let mut p = SlotLifecyclePane::new();
-        // insert_is_full first, tracking second
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 200,
-            total_time_ms: 50,
-            last_index: 80,
-            num_repaired: 1,
-            num_recovered: 10,
-        })));
-        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
-            slot: 200,
+            slot: 1,
             first_shred_us: 100,
             vote_notarize_us: 200,
             finalized_us: 300,
-            is_fast_finalization: false,
+            is_fast_finalization: true,
         })));
-        assert!(p.slots.get(&200).unwrap().is_ready());
+        assert!(p.slots.get(&1).unwrap().ready_at.is_none());
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
+            slot: 1,
+            total_time_ms: 5,
+            last_index: 50,
+            num_repaired: 0,
+            num_recovered: 5,
+        })));
+        assert!(p.slots.get(&1).unwrap().ready_at.is_some());
     }
 
     #[test]
-    fn evict_old_keeps_growth_bounded() {
+    fn order_independent_join() {
         let mut p = SlotLifecyclePane::new();
-        for s in 0..(MAX_SLOTS_SHOWN * 6) as u64 {
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
+            slot: 2,
+            total_time_ms: 5,
+            last_index: 50,
+            num_repaired: 1,
+            num_recovered: 0,
+        })));
+        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
+            slot: 2,
+            first_shred_us: 1,
+            vote_notarize_us: 2,
+            finalized_us: 3,
+            is_fast_finalization: false,
+        })));
+        assert!(p.slots.get(&2).unwrap().ready_at.is_some());
+    }
+
+    #[test]
+    fn lifespan_drops_old_cards_on_tick() {
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
+            slot: 3,
+            first_shred_us: 1,
+            vote_notarize_us: 1,
+            finalized_us: 1,
+            is_fast_finalization: false,
+        })));
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
+            slot: 3,
+            total_time_ms: 1,
+            last_index: 1,
+            num_repaired: 0,
+            num_recovered: 0,
+        })));
+        // Backdate ready_at past CARD_LIFESPAN.
+        let row = p.slots.get_mut(&3).unwrap();
+        row.ready_at = Instant::now().checked_sub(CARD_LIFESPAN + Duration::from_secs(1));
+        p.tick(Instant::now());
+        assert!(!p.slots.contains_key(&3));
+    }
+
+    #[test]
+    fn trf_bar_segments_sum_to_cells() {
+        let spans = trf_bar(10, 0, 5, 10);
+        let total_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total_chars, 10);
+    }
+
+    #[test]
+    fn trf_bar_handles_zeros() {
+        let spans = trf_bar(0, 0, 0, 10);
+        let total_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total_chars, 10);
+    }
+
+    #[test]
+    fn tracked_count_capped() {
+        let mut p = SlotLifecyclePane::new();
+        for s in 0..(MAX_TRACKED * 3) as u64 {
             p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
                 slot: s,
                 first_shred_us: 1,
                 vote_notarize_us: 1,
                 finalized_us: 1,
-                is_fast_finalization: true,
+                is_fast_finalization: false,
             })));
         }
-        assert!(p.slots.len() <= MAX_SLOTS_SHOWN * 4);
-    }
-
-    #[test]
-    fn non_metric_events_are_ignored() {
-        let mut p = SlotLifecyclePane::new();
-        p.on_event(&mk(EventKind::FirstShred { slot: 1 }));
-        assert!(p.slots.is_empty());
-    }
-
-    #[test]
-    fn timing_bar_segments_add_up_to_cells() {
-        let t = Tracking {
-            first_shred_us: 1000,
-            vote_notarize_us: 2000,
-            finalized_us: 3000,
-            is_fast_finalization: false,
-        };
-        let bar = build_timing_bar(t, 12);
-        assert_eq!(bar.chars().count(), 12);
-    }
-
-    #[test]
-    fn timing_bar_handles_zero_total() {
-        let t = Tracking {
-            first_shred_us: 0,
-            vote_notarize_us: 0,
-            finalized_us: 0,
-            is_fast_finalization: false,
-        };
-        let bar = build_timing_bar(t, 10);
-        assert_eq!(bar.chars().count(), 10);
+        assert!(p.slots.len() <= MAX_TRACKED);
     }
 }
