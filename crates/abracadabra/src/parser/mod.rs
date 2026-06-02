@@ -208,6 +208,96 @@ pub enum EventKind {
         highest_super_majority_root: u64,
         highest_confirmed_slot: u64,
     },
+
+    /// Shred-pipeline metric datapoints from `solana_metrics::metrics`.
+    /// Grouped as a sub-enum so the top-level `EventKind` stays compact;
+    /// see [`MetricEvent`] for the per-datapoint variants.
+    Metric(MetricEvent),
+}
+
+/// Shred-pipeline metric datapoints emitted by `solana_metrics::metrics`.
+///
+/// Each variant carries only the fields we plan to surface for the
+/// Live tab and Time Series tab; full datapoints carry many more fields
+/// that are intentionally dropped at parse time to keep memory bounded.
+/// Aggregate (no `slot`) variants are sampled batches; per-slot variants
+/// carry the slot number they correspond to.
+#[derive(Debug, Clone)]
+pub enum MetricEvent {
+    /// Turbine ingress per batch. `shred_count` is the number of new
+    /// shreds observed on the Turbine path in this sample window.
+    ShredFetch { shred_count: u64 },
+
+    /// Repair-path ingress per batch. Mirrors `ShredFetch` for shreds
+    /// arriving via the repair service.
+    ShredFetchRepair { shred_count: u64 },
+
+    /// Signature-verification batch stats.
+    ShredSigverify {
+        num_packets: u64,
+        num_discards: u64,
+        num_duplicates: u64,
+        elapsed_micros: u64,
+    },
+
+    /// Recv-window insertion stats.
+    RecvWindowInsert {
+        num_shreds_received: u64,
+        num_errors: u64,
+    },
+
+    /// Blockstore insertion stats. `num_inserted` is the count of new
+    /// shreds written; `num_repair` came via the repair path;
+    /// `num_recovered` came from FEC reconstruction.
+    BlockstoreInsert {
+        num_shreds: u64,
+        num_inserted: u64,
+        num_repair: u64,
+        num_recovered: u64,
+        total_elapsed_us: u64,
+    },
+
+    /// FEC recovery batch. `merkle_code` / `merkle_data` are the
+    /// `num_shreds_merkle_*_chained` fields from the underlying
+    /// datapoint — what the recovery pass produced.
+    ShredRecovery { merkle_code: u64, merkle_data: u64 },
+
+    /// Slot's shreds are complete and ready for bank assembly.
+    /// `last_index` is the final shred index; `num_repaired` /
+    /// `num_recovered` partition the shred sources for this slot.
+    ShredInsertIsFull {
+        slot: u64,
+        total_time_ms: u64,
+        last_index: u64,
+        num_repaired: u64,
+        num_recovered: u64,
+    },
+
+    /// First shred for a slot has been retransmitted into Turbine.
+    /// One per slot from this validator's perspective.
+    RetransmitFirstShred { slot: u64 },
+
+    /// Per-slot Turbine retransmit aggregate. `num_nodes` is the size
+    /// of the retransmit tree for this slot.
+    RetransmitSlotStats {
+        slot: u64,
+        num_shreds: u64,
+        num_nodes: u64,
+        elapsed_millis: u64,
+    },
+
+    /// Per-slot lifecycle timing in microseconds from the
+    /// `event_handler_slot_tracking` datapoint. `first_shred_us`,
+    /// `vote_notarize_us`, `finalized_us` are stage-to-stage deltas.
+    /// `is_fast_finalization` records whether the slot reached
+    /// finalization via the single-round fast path.
+    SlotTracking {
+        slot: u64,
+        first_shred_us: u64,
+        vote_notarize_us: u64,
+        finalized_us: u64,
+        is_fast_finalization: bool,
+    },
 }
 
 /// Outcome of trying to parse a single log line.

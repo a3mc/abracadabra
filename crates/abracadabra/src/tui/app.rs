@@ -700,12 +700,18 @@ fn event_loop(
         terminal
             .draw(|frame| draw(frame, app))
             .map_err(TuiError::Io)?;
-        // 100ms poll cadence drives the Live tab animation at ~10 Hz.
-        // Other tabs are idempotent under repeated redraws; the extra
-        // wakeups are cheap when nothing has changed (no work done in
-        // the panel render paths when state is unchanged at the model
-        // level).
-        if event::poll(Duration::from_millis(100)).map_err(TuiError::Io)? {
+        // Render cadence: 16ms (~60 FPS) only when the user is
+        // actively watching the Live tab AND following — that's when
+        // animation smoothness matters. Other tabs and idle Live use
+        // 100ms (~10 Hz) to keep CPU near zero. 60 FPS only on demand
+        // mirrors the superseedr approach (target_fps gated on user
+        // intent, not always-on).
+        let poll_ms = if app.current_kind() == TabId::Live && app.tail.is_some() {
+            16
+        } else {
+            100
+        };
+        if event::poll(Duration::from_millis(poll_ms)).map_err(TuiError::Io)? {
             if let Event::Key(key) = event::read().map_err(TuiError::Io)? {
                 if key.kind != KeyEventKind::Press {
                     continue;

@@ -1,177 +1,131 @@
-//! Slot pipeline pane.
+//! Pipeline pane — shred ingress strip.
 //!
-//! Visual layout (one row per active slot, multiple rows concurrent):
+//! Single-strip visualisation of the shred stream flowing from the
+//! cluster (left) into the validator's INPUT (right). Particles ride a
+//! wavy sine line; floating labels mark slot boundaries so the
+//! operator can read both *rate* (particle density) and *identity*
+//! (which slot is currently shredding) without leaving this pane.
+//!
+//! Layout (compact, one of many planned strips):
 //!
 //! ```text
-//!  shreds        bank        vote        cert        final       root
-//!  ·  *           ⌬           ^           ◇           ◆            ▓▓▓▓
-//!  *              ⌬                                                ▓▓▓
-//!  ·                          ^           ◇                        ▓
-//!                                                                  ░░░░  (grave)
-//!  <C-                                                                   (pacman)
+//!  head 2070553   shreds seen 374   7.2/s
+//!
+//!    2070553              2070554
+//!       · ·                  · ·
+//!  cluster ⟫⟫⟫⟫⟫·⟫⟫·⟫·⟫⟫⟫⟫⟫⟫·⟫·⟫⟫⟫⟫⟫⟫·⟫·⟫⟫·⟫⟫ INPUT
+//!
 //! ```
 //!
-//! Each slot is one [`SlotVisual`]: a `Slot` from the engine plus an
-//! assigned row (`y`) and a fractional lane position (`current_lane`)
-//! that interpolates toward the lane index of the current stage. When
-//! the slot reaches the root lane it is removed and the rooted counter
-//! ticks up. When it transitions to `Skipped`, it falls vertically
-//! into the grave pile.
+//! Subsequent strips (voting, bank assembly, ledger, leader window,
+//! cluster info) will stack below this one — each implemented as its
+//! own `Pane`. Keep this strip tight on vertical space so the others
+//! get room.
 //!
-//! Shred glyphs (`*` / `·`) are transient particles in the engine
-//! [`World`] spawned on `FirstShred`; they fall through the shred
-//! lane and despawn on TTL. Pacman is one always-on entity that
-//! walks back and forth at the bottom of the shred lane — fun
-//! mascot, no game mechanics.
+//! Animation comes from:
+//!
+//! - `wave_phase` advances each tick — the wave drifts.
+//! - Jitter re-rolls per frame from `frame_seed` so particles shimmer.
+//! - Buckets roll forward in time, pulling labels along with them.
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use ratatui::Frame;
 
-use crate::live::animation::{Entity, Pane, Slot, SlotStage, World, WORLD_CAPACITY};
+use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind};
 use crate::tui::theme;
 
-/// Lane count (Shred / Bank / Voted / Notarized / Finalized + visual
-/// root sink). The root sink is rendered as a pile rather than a lane
-/// proper, but lane indices 0..=4 use it as their right boundary.
-const LANE_COUNT: usize = 6;
+/// Number of historical buckets kept for the stream. Wider history =
+/// longer comet tail trailing left of the present moment.
+const STREAM_BUCKETS: usize = 240;
 
-/// Pacman moves this many cells per second.
-const PACMAN_SPEED: f32 = 6.0;
+/// Wall-clock duration each bucket spans. At ~60 FPS render and ~50ms
+/// bucket size, the right-most ~5 buckets reflect the freshest data
+/// and the left edge is ~12 seconds in the past.
+const BUCKET_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Slots accelerate between lanes at this many lane-widths per second.
-const SLOT_LANE_SPEED: f32 = 1.5;
+/// Wave amplitude (in chart-y units) applied to the stream's mean line.
+/// Picked to keep the stream visually well within the 0..=6 y-range
+/// chosen for the chart bounds.
+const WAVE_AMPLITUDE: f64 = 1.4;
 
-/// Vertical fall speed for slots transitioning to `Skipped`. Faster
-/// than horizontal so the failure path reads as "dropped".
-const SKIP_FALL_SPEED: f32 = 12.0;
+/// Wave frequency in radians per bucket. Lower = lazier wave.
+const WAVE_FREQUENCY: f64 = 0.18;
 
-/// Maximum slot rows rendered concurrently. Round-robin reused; older
-/// rooted / skipped slots vacate the row.
-const MAX_SLOT_ROWS: u16 = 10;
+/// Y-axis centre for the stream's wave. Sits in the middle of the 0..=6
+/// chart range so the wave has room above and below.
+const WAVE_BASE_Y: f64 = 3.0;
 
-/// TTL for transient shred particles (the falling `*` / `·` glyphs).
-const SHRED_PARTICLE_TTL: Duration = Duration::from_millis(1500);
+/// Maximum dot count per bucket. Caps the visual density during bursts
+/// so a 100-shred bucket does not paint a solid bar. Picked low for a
+/// delicate look — shreds are tiny things, the visual respects that.
+const MAX_DOTS_PER_BUCKET: u32 = 4;
 
-/// Visual state for one slot.
-#[derive(Debug)]
-struct SlotVisual {
-    inner: Slot,
-    /// Assigned terminal row (relative to the pane's inner area).
-    y: u16,
-    /// Fractional lane position. Lane integers 0..=5 are the targets;
-    /// each tick moves this toward `target_lane()` by `SLOT_LANE_SPEED * dt`.
-    current_lane: f32,
-    /// True once the slot has moved past the rightmost lane and should
-    /// be retired into the rooted pile.
-    reached_root: bool,
-    /// Negative until the slot transitions to `Skipped`; once skipped,
-    /// y drifts downward by this value × dt each tick (falling into
-    /// the grave pile).
-    fall_vy: f32,
-    /// True once a skipped slot has descended past the visible area.
-    fell_into_grave: bool,
+/// Minimum cell-distance between two adjacent floating slot labels on
+/// the stream. Adjacent buckets that report the same new slot collapse
+/// to a single label; consecutive *different* slots that land within
+/// this many cells of each other also drop the later one. Prevents
+/// label pile-up during heavy bursts.
+const SLOT_LABEL_MIN_GAP_CELLS: u16 = 10;
+
+/// One historical bucket: how many shreds landed during this
+/// `BUCKET_INTERVAL` window, and which slot's shreds they were. The
+/// slot is the most recent `FirstShred` seen during the window — a
+/// single bucket can in theory observe multiple slots but in practice
+/// FirstShreds for a given slot arrive in tight clusters, so the
+/// "latest seen" is the operationally meaningful one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Bucket {
+    count: u32,
+    latest_slot: Option<u64>,
 }
 
-impl SlotVisual {
-    const fn new(slot: Slot, y: u16) -> Self {
-        Self {
-            inner: slot,
-            y,
-            current_lane: 0.0,
-            reached_root: false,
-            fall_vy: 0.0,
-            fell_into_grave: false,
-        }
-    }
-
-    const fn target_lane(&self) -> f32 {
-        match self.inner.stage {
-            SlotStage::Shred => 0.0,
-            SlotStage::Bank => 1.0,
-            SlotStage::Voted => 2.0,
-            SlotStage::Notarized => 3.0,
-            SlotStage::Finalized => 4.0,
-            SlotStage::Rooted => 5.0,
-            SlotStage::Skipped => self.current_lane,
-        }
-    }
-
-    fn stage_glyph(&self) -> (char, Style) {
-        match self.inner.stage {
-            SlotStage::Shred => ('·', Style::default().fg(Color::White)),
-            SlotStage::Bank => ('o', Style::default().fg(Color::Cyan)),
-            SlotStage::Voted => ('^', Style::default().fg(Color::Blue)),
-            SlotStage::Notarized => ('◇', Style::default().fg(Color::Yellow)),
-            SlotStage::Finalized => ('◆', Style::default().fg(Color::Green)),
-            SlotStage::Rooted => ('▓', Style::default().fg(Color::Green)),
-            SlotStage::Skipped => ('x', Style::default().fg(Color::Red)),
-        }
-    }
-}
-
-/// The pipeline pane. Owns all active slots, the particle world, the
-/// pacman position, and the cumulative outcome counters.
+/// The spike pane. Owns a rolling history of FirstShred counts plus a
+/// wave phase that advances each tick.
 pub struct PipelinePane {
-    slots: BTreeMap<u64, SlotVisual>,
-    /// Row assignment cursor — increments on each new FirstShred,
-    /// wraps at `MAX_SLOT_ROWS`. Crude but predictable.
-    next_row: u16,
-    world: World,
-    pacman_x: f32,
-    pacman_dir: f32,
-    rooted_count: u64,
-    grave_count: u64,
+    /// Newest bucket at the back; oldest at the front.
+    history: VecDeque<Bucket>,
+    /// The bucket currently being filled (not yet pushed to history).
+    /// Rolls into `history` and a fresh one is started every
+    /// `BUCKET_INTERVAL`.
+    current_bucket: Bucket,
+    /// Wall-clock instant when `current_bucket` started accumulating.
+    current_bucket_started: Instant,
+    /// Wave phase in radians; advances each tick at `wave_speed`.
+    wave_phase: f64,
+    /// Wave phase speed in radians per second.
+    wave_speed: f64,
+    /// Monotonic frame counter, used as a seed for per-frame jitter so
+    /// the cluster shimmers without an RNG dependency.
+    frame_seed: u64,
+    /// Most recent shredded slot number, for the headline strip.
+    head_slot: Option<u64>,
+    /// Total events seen since the pane started, for a sanity counter.
+    total_events: u64,
 }
 
 impl PipelinePane {
     pub fn new() -> Self {
+        let mut history = VecDeque::with_capacity(STREAM_BUCKETS);
+        for _ in 0..STREAM_BUCKETS {
+            history.push_back(Bucket::default());
+        }
         Self {
-            slots: BTreeMap::new(),
-            next_row: 0,
-            world: World::new(),
-            pacman_x: 0.0,
-            pacman_dir: 1.0,
-            rooted_count: 0,
-            grave_count: 0,
-        }
-    }
-
-    fn spawn_shred_particles(&mut self, count: u8) {
-        // Particles fall from y=0 toward the bottom of the shred lane.
-        // Random-ish x by hashing the count + a wrapping cursor; no
-        // RNG dependency.
-        for i in 0..count {
-            #[allow(clippy::cast_precision_loss)]
-            let x = ((self.world.len() + i as usize) % 12) as f32;
-            self.world.spawn(
-                Entity::at(x, 0.0, if i % 2 == 0 { '*' } else { '·' }, Color::White)
-                    .with_velocity(0.0, 2.5)
-                    .with_ttl(SHRED_PARTICLE_TTL),
-            );
-        }
-    }
-
-    const fn assign_row(&mut self) -> u16 {
-        let row = self.next_row;
-        self.next_row = (self.next_row + 1) % MAX_SLOT_ROWS;
-        row
-    }
-
-    fn ensure_room_for_new_slot(&mut self) {
-        // Hard cap to keep render cheap. Drop the oldest slot (lowest
-        // slot number) if we have too many — its counters survive on
-        // the rooted / grave tallies if it reached one of those.
-        if self.slots.len() >= WORLD_CAPACITY {
-            if let Some((&first, _)) = self.slots.iter().next() {
-                self.slots.remove(&first);
-            }
+            history,
+            current_bucket: Bucket::default(),
+            current_bucket_started: Instant::now(),
+            wave_phase: 0.0,
+            wave_speed: 1.8,
+            frame_seed: 0,
+            head_slot: None,
+            total_events: 0,
         }
     }
 }
@@ -184,194 +138,281 @@ impl Default for PipelinePane {
 
 impl Pane for PipelinePane {
     fn on_event(&mut self, ev: &Event) {
-        let now = Instant::now();
-        // Birth: FirstShred starts a new slot in this pane's view.
         if let EventKind::FirstShred { slot } = ev.kind {
-            self.ensure_room_for_new_slot();
-            let row = self.assign_row();
-            self.slots
-                .entry(slot)
-                .or_insert_with(|| SlotVisual::new(Slot::new(slot, false, now), row));
-            self.spawn_shred_particles(3);
-            return;
-        }
-        // All other events feed into the existing slot state machine.
-        // Iterate by slot number — the events that target a specific
-        // slot will only match that slot's record.
-        for sv in self.slots.values_mut() {
-            sv.inner.advance(ev, now);
+            self.current_bucket.count = self.current_bucket.count.saturating_add(1);
+            self.current_bucket.latest_slot = Some(slot);
+            self.head_slot = Some(slot);
+            self.total_events = self.total_events.saturating_add(1);
         }
     }
 
     fn tick(&mut self, now: Instant) {
-        // Pacman: bounce in the bottom row of the shred lane. Bounds
-        // are computed at render time against actual area width.
-        // Approximate here with a generous walk range; render clamps.
-        self.pacman_x = (self.pacman_dir * PACMAN_SPEED).mul_add(1.0 / 10.0, self.pacman_x);
-        if self.pacman_x < 0.0 {
-            self.pacman_x = 0.0;
-            self.pacman_dir = 1.0;
-        } else if self.pacman_x > 14.0 {
-            self.pacman_x = 14.0;
-            self.pacman_dir = -1.0;
+        // Wave advances with real wall-clock dt so the visual speed
+        // is independent of frame rate.
+        let dt = now
+            .saturating_duration_since(self.current_bucket_started)
+            .as_secs_f64();
+        self.wave_phase = self.wave_speed.mul_add(1.0 / 60.0, self.wave_phase);
+
+        // Bucket rotation: if the current bucket has been open longer
+        // than BUCKET_INTERVAL, push it to history and start a new one.
+        if now.saturating_duration_since(self.current_bucket_started) >= BUCKET_INTERVAL {
+            self.history.pop_front();
+            self.history.push_back(self.current_bucket);
+            self.current_bucket = Bucket::default();
+            self.current_bucket_started = now;
         }
 
-        // Particles tick on their own world.
-        self.world.tick(now);
+        self.frame_seed = self.frame_seed.wrapping_add(1);
 
-        // Advance each slot toward its lane target.
-        let dt = 1.0 / 10.0; // fixed 10 Hz model; engine drives real cadence
-        for sv in self.slots.values_mut() {
-            let target = sv.target_lane();
-            let delta = target - sv.current_lane;
-            let step = SLOT_LANE_SPEED * dt;
-            sv.current_lane += delta.clamp(-step, step);
-
-            // Skipped: start falling once we register the stage.
-            if sv.inner.stage == SlotStage::Skipped && sv.fall_vy == 0.0 {
-                sv.fall_vy = SKIP_FALL_SPEED;
-            }
-            if sv.fall_vy > 0.0 && !sv.fell_into_grave {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let new_y = sv.fall_vy.mul_add(dt, f32::from(sv.y)) as u16;
-                sv.y = new_y;
-                if sv.y >= MAX_SLOT_ROWS {
-                    sv.fell_into_grave = true;
-                }
-            }
-
-            // Rooted: mark for retirement once lane 5 is reached.
-            if sv.inner.stage == SlotStage::Rooted && sv.current_lane >= 4.9 {
-                sv.reached_root = true;
-            }
-        }
-
-        // Retire slots that completed their visual journey. Counters
-        // tick up here, not on the protocol transition, so the
-        // operator's pile reflects what they actually saw animated.
-        let to_remove: Vec<u64> = self
-            .slots
-            .iter()
-            .filter_map(|(&n, sv)| {
-                if sv.reached_root || sv.fell_into_grave {
-                    Some(n)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for n in to_remove {
-            if let Some(sv) = self.slots.remove(&n) {
-                if sv.reached_root {
-                    self.rooted_count = self.rooted_count.saturating_add(1);
-                } else if sv.fell_into_grave {
-                    self.grave_count = self.grave_count.saturating_add(1);
-                }
-            }
-        }
+        // dt is currently unused outside the bucket check; keeping the
+        // binding makes the intent obvious for the next iteration when
+        // we add velocity-driven background particles.
+        let _ = dt;
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" pipeline ")
+            .title(" cluster ⟫ shreds ⟫ INPUT ")
             .title_style(theme::title_style())
             .border_style(theme::title_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 20 || inner.height < 3 {
-            return; // too small to draw meaningful animation
+        if inner.width < 30 || inner.height < 5 {
+            return;
         }
 
-        // Header line: lane labels evenly spaced.
-        let lane_width = inner.width as f32 / LANE_COUNT as f32;
-        let labels = ["shreds", "bank", "vote", "cert", "final", "root"];
-        for (i, label) in labels.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let x = inner.x + (i as f32 * lane_width) as u16;
-            if x + label.len() as u16 > inner.x + inner.width {
+        // Vertical split: 1-row headline, chart fills the rest.
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(inner);
+
+        self.render_headline(frame, chunks[0]);
+        self.render_stream(frame, chunks[1]);
+    }
+}
+
+impl PipelinePane {
+    /// Single-row headline above the stream. Carries the operationally
+    /// meaningful numbers in plain text so the operator does not need
+    /// to read motion to know the current head slot.
+    fn render_headline(&self, frame: &mut Frame<'_>, area: Rect) {
+        let head = self
+            .head_slot
+            .map_or_else(|| "head —".to_owned(), |s| format!("head {s}"));
+        let total = format!("shreds seen {}", self.total_events);
+        let window = format!(
+            "{:.1}s window",
+            STREAM_BUCKETS as f64 * BUCKET_INTERVAL.as_secs_f64(),
+        );
+        let line = Line::from(vec![
+            Span::styled(head, theme::accent_style().add_modifier(Modifier::BOLD)),
+            Span::styled("   ", theme::label_style()),
+            Span::styled(total, theme::value_style()),
+            Span::styled("   ", theme::label_style()),
+            Span::styled(window, theme::label_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    /// The stream itself: Braille chart of jittered particles plus
+    /// `cluster` / `INPUT` endpoint markers and floating slot labels
+    /// at each detected slot boundary.
+    fn render_stream(&self, frame: &mut Frame<'_>, area: Rect) {
+        // Generate jittered points: per bucket with activity, contribute
+        // `√count` particles centred on the moving sine wave. Jitter is
+        // deterministic from `(frame_seed, bucket_idx, dot_idx)` so it
+        // changes per frame but stays bounded.
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for (i, bucket) in self.history.iter().enumerate() {
+            if bucket.count == 0 {
                 continue;
             }
-            let area = Rect::new(x, inner.y, label.len() as u16, 1);
-            frame.render_widget(
-                Paragraph::new(Span::styled(*label, theme::label_style())),
-                area,
-            );
+            #[allow(clippy::cast_precision_loss)]
+            let x = i as f64;
+            let wave_y = self.wave_at(x);
+            let dots = ((bucket.count as f64).sqrt().ceil() as u32).min(MAX_DOTS_PER_BUCKET);
+            let activity_spread = (f64::from(bucket.count) * 0.05).min(0.6);
+            for dot in 0..dots {
+                let jx = hash_jitter(self.frame_seed, i as u64, u64::from(dot), 0x9E37)
+                    * activity_spread;
+                let jy = hash_jitter(self.frame_seed, i as u64, u64::from(dot), 0xB5AD) * 0.40;
+                points.push((x + jx, wave_y + jy));
+            }
         }
 
-        // Slot rows. Each slot's screen x = current_lane * lane_width +
-        // lane_width / 2 (centered in lane). Row y is its assigned row
-        // offset from the area's first non-header row.
-        for sv in self.slots.values() {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let x = inner.x
-                + lane_width
-                    .mul_add(0.5, sv.current_lane * lane_width)
-                    .min(f32::from(inner.width - 1)) as u16;
-            let y = inner.y + 1 + sv.y;
-            if y >= inner.y + inner.height {
+        let stream_color = Color::Cyan;
+        let datasets = vec![Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(stream_color)
+                    .add_modifier(Modifier::DIM),
+            )
+            .data(&points)];
+
+        #[allow(clippy::cast_precision_loss)]
+        let max_x = STREAM_BUCKETS as f64 - 1.0;
+        let chart = Chart::new(datasets)
+            .x_axis(Axis::default().bounds([0.0, max_x]))
+            .y_axis(Axis::default().bounds([0.0, 6.0]));
+        frame.render_widget(chart, area);
+
+        // Overlays painted *after* the chart so they stack on top of
+        // it. Order: endpoint labels first (anchor the stream
+        // semantically), then per-slot floating labels.
+        Self::render_endpoints(frame, area, max_x);
+        self.render_slot_labels(frame, area, max_x);
+    }
+
+    /// Paint `cluster ⟫` at the left edge and `⟫ INPUT` at the right
+    /// edge, vertically aligned to the wave's mean line. Tells the
+    /// operator at a glance what direction data is flowing.
+    fn render_endpoints(frame: &mut Frame<'_>, area: Rect, max_x: f64) {
+        let mean_y = WAVE_BASE_Y;
+        let sy = data_y_to_screen(mean_y, area);
+
+        let cluster = "cluster ⟫";
+        let input = "⟫ INPUT";
+        let cluster_w = cluster.chars().count() as u16;
+        let input_w = input.chars().count() as u16;
+
+        if area.width <= cluster_w + input_w {
+            return;
+        }
+
+        let cluster_rect = Rect::new(area.x, sy, cluster_w, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                cluster,
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            cluster_rect,
+        );
+
+        let input_rect = Rect::new(area.x + area.width - input_w, sy, input_w, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                input,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            input_rect,
+        );
+
+        let _ = max_x;
+    }
+
+    /// Paint a small slot-number label above the wave at each detected
+    /// slot transition in `history`. A transition is a bucket whose
+    /// `latest_slot` differs from the slot last labelled. Labels too
+    /// close to a previous one are suppressed (`SLOT_LABEL_MIN_GAP_CELLS`)
+    /// to prevent pile-up during bursts.
+    fn render_slot_labels(&self, frame: &mut Frame<'_>, area: Rect, max_x: f64) {
+        let mut last_seen_slot: Option<u64> = None;
+        let mut last_label_screen_x: Option<u16> = None;
+
+        for (i, bucket) in self.history.iter().enumerate() {
+            let Some(slot) = bucket.latest_slot else {
+                continue;
+            };
+            if last_seen_slot == Some(slot) {
                 continue;
             }
-            let (ch, style) = sv.stage_glyph();
-            let cell = Rect::new(x, y, 1, 1);
-            frame.render_widget(Paragraph::new(Span::styled(ch.to_string(), style)), cell);
-        }
+            last_seen_slot = Some(slot);
 
-        // Shred particles from the world. Each entity rendered at its
-        // (x, y) clamped to the shred lane.
-        let shred_lane_width = lane_width;
-        for e in &self.world {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let x = inner.x + (e.x.clamp(0.0, shred_lane_width - 1.0)) as u16;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let y = inner.y + 1 + (e.y as u16).min(inner.height.saturating_sub(2));
-            if x >= inner.x + inner.width || y >= inner.y + inner.height {
+            #[allow(clippy::cast_precision_loss)]
+            let data_x = i as f64;
+            let sx = data_x_to_screen(data_x, max_x, area);
+
+            // Suppress labels that would crowd the previous one.
+            if let Some(prev) = last_label_screen_x {
+                if sx < prev.saturating_add(SLOT_LABEL_MIN_GAP_CELLS) {
+                    continue;
+                }
+            }
+
+            // Render slightly above the wave at this x: take the
+            // wave's current y here, add a small offset upward, map to
+            // screen.
+            let label_data_y = (self.wave_at(data_x) + 1.6).min(5.8);
+            let mut sy = data_y_to_screen(label_data_y, area);
+            // Don't paint above the top row of the chart.
+            sy = sy.max(area.y);
+
+            let label = format!("{slot}");
+            let lw = label.chars().count() as u16;
+            if sx + lw > area.x + area.width {
                 continue;
             }
-            frame.render_widget(
-                Paragraph::new(Span::styled(e.ch.to_string(), Style::default().fg(e.fg))),
-                Rect::new(x, y, 1, 1),
-            );
-        }
-
-        // Pacman: bottom of the shred lane. `<C-` walking right,
-        // `-Cv` walking left.
-        if inner.height > 2 {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pac_x =
-                inner.x + (self.pacman_x.clamp(0.0, (shred_lane_width - 3.0).max(0.0))) as u16;
-            let pac_y = inner.y + inner.height - 2;
-            let glyph = if self.pacman_dir >= 0.0 { "<C-" } else { "-Cv" };
-            let cell = Rect::new(
-                pac_x,
-                pac_y,
-                glyph.len().min((inner.width - (pac_x - inner.x)) as usize) as u16,
-                1,
-            );
+            let rect = Rect::new(sx, sy, lw, 1);
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    glyph,
+                    label,
                     Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                        .fg(Color::White)
+                        .add_modifier(Modifier::DIM),
                 )),
-                cell,
+                rect,
             );
-        }
-
-        // Bottom-right: rooted and grave pile counters + visual.
-        let pile_y = inner.y + inner.height - 1;
-        if pile_y < inner.y + inner.height {
-            let txt = format!("rooted {} · grave {}", self.rooted_count, self.grave_count);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pile_x = inner.x + inner.width.saturating_sub(txt.len() as u16);
-            frame.render_widget(
-                Paragraph::new(Span::styled(txt.clone(), Style::default().fg(Color::Gray))),
-                Rect::new(pile_x, pile_y, txt.len() as u16, 1),
-            );
+            last_label_screen_x = Some(sx);
         }
     }
+
+    fn wave_at(&self, x: f64) -> f64 {
+        WAVE_AMPLITUDE.mul_add(
+            WAVE_FREQUENCY.mul_add(x, self.wave_phase).sin(),
+            WAVE_BASE_Y,
+        )
+    }
+}
+
+/// Map a chart-data x value (range `[0, max_x]`) to a screen column
+/// within `area`. Clamps at the right edge.
+fn data_x_to_screen(data_x: f64, max_x: f64, area: Rect) -> u16 {
+    if max_x <= 0.0 {
+        return area.x;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = (data_x / max_x * f64::from(area.width.saturating_sub(1))) as u16;
+    area.x + raw.min(area.width.saturating_sub(1))
+}
+
+/// Map a chart-data y value (range `[0, 6]`) to a screen row within
+/// `area`. The chart's y-axis runs bottom-up, so y=6 (top of chart)
+/// maps to area.y (top of screen).
+fn data_y_to_screen(data_y: f64, area: Rect) -> u16 {
+    const Y_MAX: f64 = 6.0;
+    let clamped = data_y.clamp(0.0, Y_MAX);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = ((1.0 - clamped / Y_MAX) * f64::from(area.height.saturating_sub(1))) as u16;
+    area.y + raw.min(area.height.saturating_sub(1))
+}
+
+/// Deterministic float in `[-1.0, 1.0]` from a small int seed mix.
+/// Used in place of an RNG so the spike has zero extra dependencies.
+fn hash_jitter(frame: u64, bucket: u64, dot: u64, salt: u64) -> f64 {
+    // xorshift-style mix. Good enough for visual jitter; not a PRNG.
+    let mut h = frame
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(bucket.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add(dot.wrapping_mul(0x94D0_49BB_1331_11EB))
+        .wrapping_add(salt);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = (h as f64) / (u64::MAX as f64);
+    scaled.mul_add(2.0, -1.0)
 }
 
 #[cfg(test)]
@@ -386,99 +427,67 @@ mod tests {
     }
 
     #[test]
-    fn first_shred_spawns_a_slot_and_particles() {
+    fn first_shred_increments_current_bucket() {
         let mut p = PipelinePane::new();
+        assert_eq!(p.current_bucket.count, 0);
         p.on_event(&mk_event(EventKind::FirstShred { slot: 100 }));
-        assert_eq!(p.slots.len(), 1);
-        assert!(p.world.len() >= 3);
-        assert!(p.slots.contains_key(&100));
+        assert_eq!(p.current_bucket.count, 1);
+        p.on_event(&mk_event(EventKind::FirstShred { slot: 101 }));
+        assert_eq!(p.current_bucket.count, 2);
+        assert_eq!(p.head_slot, Some(101));
+        assert_eq!(p.total_events, 2);
     }
 
     #[test]
-    fn duplicate_first_shred_is_idempotent_for_slot_set() {
+    fn non_first_shred_event_ignored() {
         let mut p = PipelinePane::new();
-        p.on_event(&mk_event(EventKind::FirstShred { slot: 100 }));
-        p.on_event(&mk_event(EventKind::FirstShred { slot: 100 }));
-        // Slot count is 1; particles may accumulate.
-        assert_eq!(p.slots.len(), 1);
-    }
-
-    #[test]
-    fn bank_frozen_advances_existing_slot_to_bank_stage() {
-        let mut p = PipelinePane::new();
-        p.on_event(&mk_event(EventKind::FirstShred { slot: 7 }));
+        p.on_event(&mk_event(EventKind::NewRoot { slot: 42 }));
         p.on_event(&mk_event(EventKind::BankFrozen {
-            slot: 7,
+            slot: 42,
             hash: "h".into(),
-            signature_count: 42,
+            signature_count: 1,
         }));
-        let sv = p.slots.get(&7).unwrap();
-        assert_eq!(sv.inner.stage, SlotStage::Bank);
-        assert_eq!(sv.inner.signature_count, Some(42));
+        assert_eq!(p.current_bucket.count, 0);
+        assert_eq!(p.total_events, 0);
+        assert!(p.head_slot.is_none());
     }
 
     #[test]
-    fn skipped_slot_starts_falling_on_tick() {
+    fn bucket_rotates_after_interval_elapses() {
         let mut p = PipelinePane::new();
-        p.on_event(&mk_event(EventKind::FirstShred { slot: 7 }));
-        p.on_event(&mk_event(EventKind::VotingSkip { slot: 7 }));
-        // First tick should set fall_vy > 0.
+        p.on_event(&mk_event(EventKind::FirstShred { slot: 100 }));
+        assert_eq!(p.current_bucket.count, 1);
+        // Force the tick to see ≥BUCKET_INTERVAL of wall-clock by
+        // backdating the bucket start.
+        p.current_bucket_started = Instant::now()
+            .checked_sub(BUCKET_INTERVAL + Duration::from_millis(10))
+            .unwrap();
         p.tick(Instant::now());
-        let sv = p.slots.get(&7).unwrap();
-        assert!(sv.fall_vy > 0.0);
+        assert_eq!(p.current_bucket.count, 0);
+        // Newest history entry should now hold the prior count.
+        assert_eq!(p.history.back().unwrap().count, 1);
     }
 
     #[test]
-    fn rooted_slot_retires_into_pile_after_animation_catches_up() {
+    fn history_length_stable_after_many_rotations() {
         let mut p = PipelinePane::new();
-        p.on_event(&mk_event(EventKind::FirstShred { slot: 7 }));
-        p.on_event(&mk_event(EventKind::NewRoot { slot: 7 }));
-        // Tick enough times that lane animation catches up to root.
-        for _ in 0..100 {
+        let initial_len = p.history.len();
+        for _ in 0..(STREAM_BUCKETS * 3) {
+            p.current_bucket_started = Instant::now()
+                .checked_sub(BUCKET_INTERVAL + Duration::from_millis(10))
+                .unwrap();
             p.tick(Instant::now());
         }
-        // Slot vanished from active map, rooted counter incremented.
-        assert!(!p.slots.contains_key(&7));
-        assert!(p.rooted_count >= 1);
+        assert_eq!(p.history.len(), initial_len);
     }
 
     #[test]
-    fn pacman_walks_and_bounces() {
-        let mut p = PipelinePane::new();
-        let start = p.pacman_x;
-        for _ in 0..10 {
-            p.tick(Instant::now());
-        }
-        assert!(p.pacman_x > start, "pacman did not move");
-        // Tick enough cycles to cross the lane multiple times. Observe
-        // direction flips by sampling `pacman_dir` on each tick and
-        // counting changes from positive to negative or back.
-        let mut prev_dir = p.pacman_dir;
-        let mut flips = 0u32;
-        for _ in 0..400 {
-            p.tick(Instant::now());
-            if p.pacman_dir != prev_dir {
-                flips += 1;
-                prev_dir = p.pacman_dir;
+    fn hash_jitter_in_unit_range() {
+        for f in 0..100u64 {
+            for b in 0..10u64 {
+                let v = hash_jitter(f, b, 0, 0xDEAD);
+                assert!((-1.0..=1.0).contains(&v), "out of range: {v}");
             }
         }
-        assert!(
-            flips >= 2,
-            "pacman direction never flipped (flips = {flips})"
-        );
-    }
-
-    #[test]
-    fn row_assignment_round_robins() {
-        let mut p = PipelinePane::new();
-        for i in 0..(MAX_SLOT_ROWS as u64 + 3) {
-            p.on_event(&mk_event(EventKind::FirstShred { slot: i }));
-        }
-        // Rows for the first MAX_SLOT_ROWS slots are 0..MAX_SLOT_ROWS-1;
-        // wraps after that.
-        let row_for = |n: u64| p.slots.get(&n).map(|s| s.y);
-        assert_eq!(row_for(0), Some(0));
-        assert_eq!(row_for((MAX_SLOT_ROWS as u64) - 1), Some(MAX_SLOT_ROWS - 1));
-        assert_eq!(row_for(MAX_SLOT_ROWS as u64), Some(0));
     }
 }

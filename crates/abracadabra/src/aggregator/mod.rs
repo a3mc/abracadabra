@@ -287,6 +287,12 @@ pub fn ingest(state: &mut State, event: Event) {
         EventKind::EventHandlerStats { .. } | EventKind::BlockCommitmentCache { .. } => {
             // v0.3: parse selective datapoints into model. No-op for v0.1.
         }
+        EventKind::Metric(_) => {
+            // Shred-pipeline metrics are parsed (LIVE-7) but not yet
+            // aggregated into model state. The Live tab consumes them
+            // directly from the event stream; future Time Series cards
+            // can subscribe here once we decide which to surface.
+        }
     }
 }
 

@@ -186,6 +186,7 @@ const fn event_kind_label(kind: &crate::parser::EventKind) -> &'static str {
         E::InvalidClusterSlotsUpdate => "InvalidClusterSlotsUpdate",
         E::EventHandlerStats { .. } => "EventHandlerStats",
         E::BlockCommitmentCache { .. } => "BlockCommitmentCache",
+        E::Metric(_) => "Metric",
     }
 }
 
