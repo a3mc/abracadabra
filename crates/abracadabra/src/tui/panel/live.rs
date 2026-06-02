@@ -48,14 +48,27 @@ struct TailFrame {
 /// in place. Callers pass the activity classification (built once at
 /// startup), the source file path (for the prompt), and the current
 /// tail handle (`None` = not following).
+/// Bundle of live-tab runtime state passed through to the render
+/// path. Wraps the three follow-related fields so the signature does
+/// not grow each time we add a flag.
+pub struct LiveState<'a> {
+    pub tail: Option<&'a TailHandle>,
+    pub engine: Option<&'a SceneEngine>,
+    pub paused: bool,
+}
+
 pub fn render(
     activity: &Activity,
     file_path: &Path,
-    tail: Option<&TailHandle>,
-    engine: Option<&SceneEngine>,
+    live: LiveState<'_>,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
+    let LiveState {
+        tail,
+        engine,
+        paused,
+    } = live;
     let following = tail.is_some();
 
     // Active log + following + engine present → hand the whole inner
@@ -65,6 +78,26 @@ pub fn render(
     if matches!(activity, Activity::Active) && following {
         if let Some(engine) = engine {
             engine.render(frame, area);
+            if paused {
+                // Overlay a small `[PAUSED]` badge in the top-right
+                // corner of the engine area so the operator always
+                // knows the animation is frozen.
+                let label = " [PAUSED] ";
+                let w = label.chars().count() as u16;
+                if area.width > w + 2 {
+                    let rect = Rect::new(area.x + area.width - w - 1, area.y, w, 1);
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            label,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        rect,
+                    );
+                }
+            }
             return;
         }
     }

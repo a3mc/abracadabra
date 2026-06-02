@@ -67,6 +67,8 @@ fn render_left(
         spans.extend([
             Span::styled("SPACE", theme::title_style()),
             Span::styled(" toggle follow  ", theme::label_style()),
+            Span::styled("p", theme::title_style()),
+            Span::styled(" pause  ", theme::label_style()),
         ]);
     }
     // Scroll hints on tabs that carry a scrollable list.

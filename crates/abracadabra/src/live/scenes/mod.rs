@@ -88,6 +88,17 @@ impl SceneEngine {
         }
     }
 
+    /// Advance the cursor to the tail buffer's current `total_events`
+    /// without dispatching any of those events. Used by the pause/
+    /// resume key handler: when the user resumes after a pause, we
+    /// want to start from "now" rather than replay everything that
+    /// happened during the pause window.
+    pub fn skip_to_present(&mut self, tail: &TailHandle) {
+        if let Ok(buf) = tail.buffer.lock() {
+            self.cursor = buf.total_events;
+        }
+    }
+
     /// Drain newly-appeared events from `tail`, dispatch them to every
     /// pane in order, then call `tick(now)` on every pane.
     ///

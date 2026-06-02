@@ -344,6 +344,15 @@ pub struct App<'s> {
     /// following so the event loop can tick it each frame and the
     /// panel render can draw it.
     pub engine: Option<crate::live::scenes::SceneEngine>,
+    /// Live-tab pause flag. When true, the event loop stops ticking
+    /// the `engine` so particles freeze in place and no new events
+    /// are dispatched to panes. The tail thread keeps running; its
+    /// shared buffer is already bounded ([`crate::live::tail::RECENT_CAPACITY`])
+    /// so RAM usage stays flat regardless of pause duration. On
+    /// resume the engine advances its cursor to the buffer's current
+    /// `total_events` (skipping what was missed) so we restart from
+    /// "now" rather than catching up through a backlog.
+    pub paused: bool,
     /// Ordered list of tabs visible in this run. Active logs get
     /// `[Live, Overview, ...]`; static logs omit `Live` for a clean
     /// 6-tab layout. `current_tab` is an index into this vector.
@@ -418,6 +427,7 @@ impl<'s> App<'s> {
             activity,
             tail: None,
             engine: None,
+            paused: false,
         }
     }
 
@@ -691,11 +701,13 @@ fn event_loop(
     loop {
         // Tick the scene engine (drain new events from the tail, then
         // advance pane simulations) once per loop iteration when
-        // following. Render reads pane state immutably immediately
-        // after; the tick + draw pair runs at ~10 Hz courtesy of the
-        // 100ms poll cadence below.
-        if let (Some(tail), Some(engine)) = (app.tail.as_ref(), app.engine.as_mut()) {
-            engine.tick(tail, std::time::Instant::now());
+        // following AND not paused. Render reads pane state immutably
+        // immediately after; the tick + draw pair runs at ~10 Hz
+        // courtesy of the 100ms poll cadence below.
+        if !app.paused {
+            if let (Some(tail), Some(engine)) = (app.tail.as_ref(), app.engine.as_mut()) {
+                engine.tick(tail, std::time::Instant::now());
+            }
         }
         terminal
             .draw(|frame| draw(frame, app))
@@ -751,6 +763,26 @@ fn event_loop(
                             app.tail =
                                 Some(crate::live::tail::spawn(app.state.file_meta.path.clone()));
                             app.engine = Some(crate::live::scenes::SceneEngine::default_layout());
+                        }
+                        // Either start or stop unpauses — neither
+                        // state should carry over a stale pause flag.
+                        app.paused = false;
+                    }
+                    // Live-tab-only: `p` pauses / resumes the
+                    // animation. Tail keeps running in the background
+                    // (its buffer is bounded, no RAM growth); on
+                    // resume the engine fast-forwards past the
+                    // backlog instead of replaying it.
+                    KeyCode::Char('p')
+                        if app.current_kind() == TabId::Live && app.tail.is_some() =>
+                    {
+                        app.paused = !app.paused;
+                        if !app.paused {
+                            if let (Some(tail), Some(engine)) =
+                                (app.tail.as_ref(), app.engine.as_mut())
+                            {
+                                engine.skip_to_present(tail);
+                            }
                         }
                     }
                     KeyCode::Char('j') | KeyCode::Down => app.step_scroll(1),
@@ -840,8 +872,11 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
         TabId::Live => panel::live::render(
             &app.activity,
             &app.state.file_meta.path,
-            app.tail.as_ref(),
-            app.engine.as_ref(),
+            panel::live::LiveState {
+                tail: app.tail.as_ref(),
+                engine: app.engine.as_ref(),
+                paused: app.paused,
+            },
             frame,
             chunks[2],
         ),
@@ -889,7 +924,7 @@ fn render_tabs(app: &App<'_>, frame: &mut Frame<'_>, area: ratatui::layout::Rect
         " navigate  (1-{} · Tab / Shift+Tab{} · q quit) ",
         app.tabs.len(),
         if app.tabs.contains(&TabId::Live) {
-            " · SPACE follow"
+            " · SPACE follow · p pause"
         } else {
             ""
         }

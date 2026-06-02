@@ -189,18 +189,26 @@ impl Pane for ShredIngressPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < 5 {
+        if inner.width < 30 || inner.height < 6 {
             return;
         }
 
-        // Vertical split: streams area (above) + snapshot row (1 row).
+        // Vertical: 1 row top breathing, 4 rows chart (== 4 lanes ==
+        // y bounds [0, 4], so each row corresponds to exactly one
+        // chart unit and labels align cleanly), then leftover gap,
+        // then 1 row snapshot.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(4),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(inner);
 
-        self.render_streams(frame, chunks[0]);
-        self.render_snapshot(frame, chunks[1]);
+        self.render_streams(frame, chunks[1]);
+        self.render_snapshot(frame, chunks[3]);
     }
 }
 

@@ -67,9 +67,12 @@ const COL_FEC: Color = Color::LightBlue;
 const LABEL_COL_WIDTH: u16 = 9;
 
 /// Glyphs for single-event lanes — chosen to read as discrete events,
-/// not as bars carrying a magnitude. FEC alone carries a per-slot
-/// count (`num_recovered`) so it stays as a small Braille dot stream.
-const GLYPH_FAST: &str = "✓";
+/// not as bars carrying a magnitude. All three are symmetric so the
+/// flow reads as consistent shapes with semantic colour, not
+/// inconsistent typography (the `✓` we used before was asymmetric
+/// and stood out wrong). FEC alone carries a per-slot count
+/// (`num_recovered`) so it stays as a small Braille dot stream.
+const GLYPH_FAST: &str = "●";
 const GLYPH_SLOW: &str = "◆";
 const GLYPH_SKIP: &str = "✗";
 
@@ -199,17 +202,22 @@ impl Pane for SlotLifecyclePane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < 5 {
+        if inner.width < 30 || inner.height < 6 {
             return;
         }
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(4),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(inner);
 
-        self.render_streams(frame, chunks[0]);
-        self.render_snapshot(frame, chunks[1]);
+        self.render_streams(frame, chunks[1]);
+        self.render_snapshot(frame, chunks[3]);
     }
 }
 
