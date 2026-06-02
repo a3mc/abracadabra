@@ -1,45 +1,25 @@
-//! Slot outcomes — multi-lane stream of finalization events.
+//! Slot outcomes — bucketed bars.
 //!
-//! Replaces the previous card-flow design. Every visible glyph is one
-//! real event:
+//! Same time-bucketed model as `shred_ingress`: 250ms windows, one
+//! bucket per terminal column, fill height by accumulated value, per
+//! lane scale chosen for visibility. Lanes:
 //!
-//! ```text
-//! ┌─ slot outcomes ─────────────────────────────────────┐
-//! │  fast final  ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓                      │  bright green
-//! │  slow final         ◇                ◇              │  yellow
-//! │  skip                                               │  red (empty when healthy)
-//! │  fec recov    ◆  ◆  ◆  ◆  ◆  ◆                      │  light blue
-//! │                                                     │
-//! │  fast 96%  ·  slow 4%  ·  skip 0  ·  fec/slot 22    │  snapshot row
-//! └─────────────────────────────────────────────────────┘
-//! ```
+//! - **fast**  one Finalized{fast:true}  per slot → cap 3 events/bucket
+//! - **slow**  one Finalized{fast:false} per slot → cap 1 (every slow visible)
+//! - **skip**  one VotingSkip            per slot → cap 1 (any skip full bar)
+//! - **fec**   Σ num_recovered (per-slot)        → cap 50
 //!
-//! Event sources:
-//!
-//! - **fast final** — one particle per `Finalized { fast: true }`
-//!   from votor. Bright green. Calm steady = healthy.
-//! - **slow final** — one particle per `Finalized { fast: false }`.
-//!   Yellow. Slow path is normal but worth flagging when it spikes.
-//! - **skip** — one particle per `VotingSkip { slot }` from votor.
-//!   Red X. Empty stream when healthy; any glyph is operationally
-//!   meaningful (we voted skip on a slot).
-//! - **fec recov** — one particle per `ShredInsertIsFull` with
-//!   `num_recovered > 0`. Light blue diamond. Steady stream = FEC
-//!   doing its job; the higher the count per slot, the more clever
-//!   recovery is saving us from needing repair.
-//!
-//! Snapshot row carries rolling totals (last N seen) so the operator
-//! reads both the stream history (recent flow) and the cumulative
-//! state (current ratios).
+//! Snapshot row carries rolling percentages and counts (last N slots)
+//! so the operator gets both the *flow* (bars sliding left) and the
+//! *aggregate* (numbers below).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::live::animation::Pane;
@@ -48,35 +28,18 @@ use crate::tui::theme;
 
 pub const PANE_HEIGHT: u16 = 9;
 
-const TRAVERSAL_SECS: f64 = 3.0;
-const PARTICLE_CAP: usize = 512;
-const X_MAX: f64 = 100.0;
+const BUCKET_DURATION: Duration = Duration::from_millis(250);
+const LABEL_COL_WIDTH: u16 = 9;
 
-// Lane y-coordinates inside chart bounds [0, 4].
-const Y_FAST: f64 = 3.5;
-const Y_SLOW: f64 = 2.5;
-const Y_SKIP: f64 = 1.5;
-const Y_FEC: f64 = 0.5;
+const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
 const COL_GOOD: Color = Color::Green;
 const COL_WARN: Color = Color::Yellow;
 const COL_BAD: Color = Color::Red;
 const COL_FEC: Color = Color::LightBlue;
 
-/// Width reserved on the left of the pane for lane labels.
-const LABEL_COL_WIDTH: u16 = 9;
-
-/// Glyphs for the *attention* single-event lanes — these read as
-/// discrete bold events when they appear. `fast` finalizations and
-/// `fec` recovery are the calm baseline lanes and render as Braille
-/// DIM streams (like the turbine lane in `shred_ingress`); only the
-/// rare attention events get glyphs so they pop out of the texture.
-const GLYPH_SLOW: &str = "◆";
-const GLYPH_SKIP: &str = "✗";
-
-/// Rolling window for the snapshot row's percentages. 64 slots ≈ ~25s
-/// of cluster activity at ~2.5 slots/sec; long enough to be stable,
-/// short enough to follow real changes.
+/// Rolling window for the snapshot row's percentages. 64 slots ≈ 25 s
+/// of cluster activity at Solana's ~400 ms slot time.
 const ROLLING_WINDOW: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,14 +50,52 @@ enum Lane {
     Fec,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Particle {
-    spawn_at: Instant,
-    lane: Lane,
+impl Lane {
+    const fn cap(self) -> u32 {
+        match self {
+            // ~0.625 fast events per bucket at normal speed; 3 = burst.
+            Self::Fast => 3,
+            // Any slow finalization is operationally meaningful.
+            Self::Slow => 1,
+            // Any skip is a real concern — full bar alarm.
+            Self::Skip => 1,
+            // Per-slot num_recovered runs ~20–50 on this network.
+            Self::Fec => 50,
+        }
+    }
+
+    const fn row(self) -> u16 {
+        match self {
+            Self::Fast => 0,
+            Self::Slow => 1,
+            Self::Skip => 2,
+            Self::Fec => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Slow => "slow",
+            Self::Skip => "skip",
+            Self::Fec => "fec",
+        }
+    }
+
+    const fn colour(self) -> Color {
+        match self {
+            Self::Fast => COL_GOOD,
+            Self::Slow => COL_WARN,
+            Self::Skip => COL_BAD,
+            Self::Fec => COL_FEC,
+        }
+    }
+
+    const fn is_attention(self) -> bool {
+        matches!(self, Self::Slow | Self::Skip)
+    }
 }
 
-/// One slot's outcome category, recorded in the rolling history for
-/// the snapshot ratios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Fast,
@@ -102,35 +103,72 @@ enum Outcome {
     Skip,
 }
 
+#[derive(Debug)]
+struct BucketLane {
+    history: VecDeque<u32>,
+    current: u32,
+    current_started: Instant,
+}
+
+impl BucketLane {
+    fn new(now: Instant) -> Self {
+        Self {
+            history: VecDeque::with_capacity(256),
+            current: 0,
+            current_started: now,
+        }
+    }
+
+    const fn accumulate(&mut self, v: u32) {
+        self.current = self.current.saturating_add(v);
+    }
+
+    fn advance(&mut self, now: Instant, max_history: usize) {
+        while now.saturating_duration_since(self.current_started) >= BUCKET_DURATION {
+            self.history.push_back(self.current);
+            self.current = 0;
+            self.current_started += BUCKET_DURATION;
+            while self.history.len() > max_history {
+                self.history.pop_front();
+            }
+        }
+    }
+}
+
 pub struct SlotLifecyclePane {
-    particles: Vec<Particle>,
-    /// Most recent outcome per slot, used to compute the snapshot
-    /// percentages. Capped at [`ROLLING_WINDOW`].
+    fast: BucketLane,
+    slow: BucketLane,
+    skip: BucketLane,
+    fec: BucketLane,
+    /// Rolling window of recent slot outcomes for the snapshot row.
     history: VecDeque<Outcome>,
-    /// Last seen `num_recovered` per slot — surfaces in the snapshot
-    /// row as `fec/slot` so the operator sees per-slot FEC intensity.
+    /// Last seen `num_recovered` per slot — shown as `fec/slot N` in
+    /// the snapshot row.
     last_fec_per_slot: Option<u64>,
     now: Instant,
 }
 
 impl SlotLifecyclePane {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
-            particles: Vec::new(),
+            fast: BucketLane::new(now),
+            slow: BucketLane::new(now),
+            skip: BucketLane::new(now),
+            fec: BucketLane::new(now),
             history: VecDeque::with_capacity(ROLLING_WINDOW),
             last_fec_per_slot: None,
-            now: Instant::now(),
+            now,
         }
     }
 
-    fn spawn(&mut self, lane: Lane) {
-        if self.particles.len() >= PARTICLE_CAP {
-            self.particles.remove(0);
+    const fn lane_ref(&self, lane: Lane) -> &BucketLane {
+        match lane {
+            Lane::Fast => &self.fast,
+            Lane::Slow => &self.slow,
+            Lane::Skip => &self.skip,
+            Lane::Fec => &self.fec,
         }
-        self.particles.push(Particle {
-            spawn_at: self.now,
-            lane,
-        });
     }
 
     fn record_outcome(&mut self, o: Outcome) {
@@ -163,21 +201,22 @@ impl Pane for SlotLifecyclePane {
     fn on_event(&mut self, ev: &Event) {
         match &ev.kind {
             EventKind::Finalized { fast: true, .. } => {
-                self.spawn(Lane::Fast);
+                self.fast.accumulate(1);
                 self.record_outcome(Outcome::Fast);
             }
             EventKind::Finalized { fast: false, .. } => {
-                self.spawn(Lane::Slow);
+                self.slow.accumulate(1);
                 self.record_outcome(Outcome::Slow);
             }
             EventKind::VotingSkip { .. } => {
-                self.spawn(Lane::Skip);
+                self.skip.accumulate(1);
                 self.record_outcome(Outcome::Skip);
             }
             EventKind::Metric(MetricEvent::ShredInsertIsFull { num_recovered, .. })
                 if *num_recovered > 0 =>
             {
-                self.spawn(Lane::Fec);
+                self.fec
+                    .accumulate(u32::try_from(*num_recovered).unwrap_or(u32::MAX));
                 self.last_fec_per_slot = Some(*num_recovered);
             }
             _ => {}
@@ -186,9 +225,11 @@ impl Pane for SlotLifecyclePane {
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
-        let lifetime = Duration::from_secs_f64(TRAVERSAL_SECS);
-        self.particles
-            .retain(|p| now.saturating_duration_since(p.spawn_at) < lifetime);
+        let cap = 1024;
+        self.fast.advance(now, cap);
+        self.slow.advance(now, cap);
+        self.skip.advance(now, cap);
+        self.fec.advance(now, cap);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -214,15 +255,14 @@ impl Pane for SlotLifecyclePane {
             ])
             .split(inner);
 
-        self.render_streams(frame, chunks[1]);
+        self.render_chart(frame, chunks[1]);
         self.render_snapshot(frame, chunks[3]);
     }
 }
 
 impl SlotLifecyclePane {
-    fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Horizontal split: labels on the left, particle area on right.
-        if area.width <= LABEL_COL_WIDTH + 8 {
+    fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width <= LABEL_COL_WIDTH + 4 {
             return;
         }
         let h_chunks = Layout::default()
@@ -232,69 +272,9 @@ impl SlotLifecyclePane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        // Calm baseline streams (fast, fec) → Braille DIM Chart
-        // datasets; they happen on every slot and form a flowing
-        // texture. Attention events (slow, skip) → bold glyph
-        // overlays so they pop out of the texture.
-        let mut fast: Vec<(f64, f64)> = Vec::new();
-        let mut fec: Vec<(f64, f64)> = Vec::new();
-        let mut glyph_events: Vec<(f64, Lane)> = Vec::new();
-
-        for p in &self.particles {
-            let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
-            if age >= TRAVERSAL_SECS {
-                continue;
-            }
-            let x = (age / TRAVERSAL_SECS) * X_MAX;
-            match p.lane {
-                Lane::Fast => fast.push((x, Y_FAST)),
-                Lane::Fec => fec.push((x, Y_FEC)),
-                Lane::Slow | Lane::Skip => glyph_events.push((x, p.lane)),
-            }
-        }
-
-        // Marker::Dot for the calm baselines so every event renders
-        // at the same cell-centre baseline as the attention glyphs
-        // (`◆` slow, `✗` skip). Marker::Braille gave sub-pixel
-        // positioning (top / middle / bottom of cell), which read
-        // as visual wobble next to the centred glyphs on the rows
-        // between. Dot loses the sub-pixel density but keeps every
-        // event on the same vertical snapline.
-        let datasets = vec![
-            Dataset::default()
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_GOOD).add_modifier(Modifier::DIM))
-                .data(&fast),
-            Dataset::default()
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
-                .data(&fec),
-        ];
-        let chart = Chart::new(datasets)
-            .x_axis(Axis::default().bounds([0.0, X_MAX]))
-            .y_axis(Axis::default().bounds([0.0, 4.0]));
-        frame.render_widget(chart, chart_area);
-
-        // Lane labels in the label column.
-        render_lane_label(frame, label_area, chart_area, "fast", Y_FAST, COL_GOOD);
-        render_lane_label(frame, label_area, chart_area, "slow", Y_SLOW, COL_WARN);
-        render_lane_label(frame, label_area, chart_area, "skip", Y_SKIP, COL_BAD);
-        render_lane_label(frame, label_area, chart_area, "fec", Y_FEC, COL_FEC);
-
-        // Attention glyphs (slow / skip) painted as bold text overlays.
-        for (x_chart, lane) in glyph_events {
-            let (glyph, style) = match lane {
-                Lane::Slow => (GLYPH_SLOW, Style::default().fg(COL_WARN)),
-                Lane::Skip => (
-                    GLYPH_SKIP,
-                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD),
-                ),
-                Lane::Fast | Lane::Fec => continue, // handled by the Chart above
-            };
-            let y_chart = lane_y(lane);
-            render_glyph_at(frame, chart_area, glyph, style, x_chart, y_chart);
+        for lane in [Lane::Fast, Lane::Slow, Lane::Skip, Lane::Fec] {
+            render_lane_label(frame, label_area, chart_area, lane);
+            render_lane_bars(frame, chart_area, lane, self.lane_ref(lane));
         }
     }
 
@@ -311,7 +291,8 @@ impl SlotLifecyclePane {
                 format!(" {fast_pct}%"),
                 Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" fast  ", theme::label_style()),
+            Span::styled(" fast", theme::label_style()),
+            sep(),
             Span::styled(
                 format!("{slow_pct}%"),
                 if slow_pct > 0 {
@@ -320,7 +301,8 @@ impl SlotLifecyclePane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" slow  ", theme::label_style()),
+            Span::styled(" slow", theme::label_style()),
+            sep(),
             Span::styled(
                 format!("{skips}"),
                 if skips > 0 {
@@ -329,15 +311,13 @@ impl SlotLifecyclePane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" skip  ", theme::label_style()),
+            Span::styled(" skip", theme::label_style()),
+            sep(),
             Span::styled(fec, Style::default().fg(COL_FEC)),
-            Span::styled(" fec (last)  ", theme::label_style()),
-            // Window indicator: the rolling ratios above cover the
-            // last N slots. At Solana's ~400ms target slot time this
-            // is ~25s of recent cluster activity. State the source so
-            // operators don't wonder "over what window?".
+            Span::styled(" fec (last)", theme::label_style()),
+            sep(),
             Span::styled(
-                format!("· last {} slots", self.history.len().min(ROLLING_WINDOW)),
+                format!("last {} slots", self.history.len().min(ROLLING_WINDOW)),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -347,61 +327,22 @@ impl SlotLifecyclePane {
     }
 }
 
-/// Map a lane to its chart-y coordinate.
-const fn lane_y(lane: Lane) -> f64 {
-    match lane {
-        Lane::Fast => Y_FAST,
-        Lane::Slow => Y_SLOW,
-        Lane::Skip => Y_SKIP,
-        Lane::Fec => Y_FEC,
-    }
+fn sep() -> Span<'static> {
+    Span::styled(
+        "  ·  ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
 }
 
-/// Paint a single glyph at the cell corresponding to chart-coords
-/// `(x_chart, y_chart)` inside `chart_area`.
-fn render_glyph_at(
-    frame: &mut Frame<'_>,
-    chart_area: Rect,
-    glyph: &str,
-    style: Style,
-    x_chart: f64,
-    y_chart: f64,
-) {
-    const Y_MAX: f64 = 4.0;
-    if chart_area.width == 0 || chart_area.height == 0 {
+fn render_lane_label(frame: &mut Frame<'_>, label_area: Rect, chart_area: Rect, lane: Lane) {
+    let row = lane.row();
+    if row >= chart_area.height {
         return;
     }
-    let x_norm = (x_chart / X_MAX).clamp(0.0, 1.0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let x_off = (x_norm * f64::from(chart_area.width.saturating_sub(1))) as u16;
-    let x = chart_area.x + x_off;
-    let y_clamped = y_chart.clamp(0.0, Y_MAX);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let row = (((Y_MAX - y_clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
-    let y = chart_area.y + row.min(chart_area.height.saturating_sub(1));
-    frame.render_widget(
-        Paragraph::new(Span::styled(glyph.to_owned(), style)),
-        Rect::new(x, y, 1, 1),
-    );
-}
-
-fn render_lane_label(
-    frame: &mut Frame<'_>,
-    label_area: Rect,
-    chart_area: Rect,
-    text: &str,
-    y_chart: f64,
-    fg: Color,
-) {
-    const Y_MAX: f64 = 4.0;
-    if chart_area.height == 0 {
-        return;
-    }
-    let clamped = y_chart.clamp(0.0, Y_MAX);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let row = (((Y_MAX - clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
-    let row = row.min(chart_area.height.saturating_sub(1));
     let y = chart_area.y + row;
+    let text = lane.label();
     let w = text.chars().count() as u16;
     if w + 1 > label_area.width {
         return;
@@ -409,10 +350,59 @@ fn render_lane_label(
     frame.render_widget(
         Paragraph::new(Span::styled(
             text.to_owned(),
-            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(lane.colour())
+                .add_modifier(Modifier::BOLD),
         )),
         Rect::new(label_area.x + 1, y, w, 1),
     );
+}
+
+fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket: &BucketLane) {
+    let row = lane.row();
+    if row >= chart_area.height || chart_area.width == 0 {
+        return;
+    }
+    let y = chart_area.y + row;
+    let cap = lane.cap();
+    let colour = lane.colour();
+    let is_attention = lane.is_attention();
+
+    let total_visible = (chart_area.width as usize).min(bucket.history.len() + 1);
+    let rightmost_x = chart_area.x + chart_area.width - 1;
+
+    for i in 0..total_visible {
+        let value = if i == 0 {
+            bucket.current
+        } else {
+            let idx = bucket.history.len().wrapping_sub(i);
+            bucket.history.get(idx).copied().unwrap_or(0)
+        };
+        let pixels = fill_level(value, cap);
+        if pixels == 0 {
+            continue;
+        }
+        let glyph = FILL_CHARS[pixels];
+        let modifier = if is_attention {
+            Modifier::BOLD
+        } else {
+            Modifier::DIM
+        };
+        let style = Style::default().fg(colour).add_modifier(modifier);
+        let x = rightmost_x - i as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph.to_owned(), style)),
+            Rect::new(x, y, 1, 1),
+        );
+    }
+}
+
+fn fill_level(value: u32, cap: u32) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let level = (u64::from(value) * 8 / u64::from(cap)) as usize;
+    level.min(8)
 }
 
 #[cfg(test)]
@@ -427,55 +417,39 @@ mod tests {
     }
 
     #[test]
-    fn fast_finalize_spawns_fast_lane() {
+    fn fast_finalize_accumulates_fast_bucket_and_records_outcome() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Finalized {
             slot: 1,
             hash: "h".into(),
             fast: true,
         }));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Fast);
+        assert_eq!(p.fast.current, 1);
         assert_eq!(p.history.back(), Some(&Outcome::Fast));
     }
 
     #[test]
-    fn slow_finalize_spawns_slow_lane() {
+    fn slow_finalize_accumulates_slow_bucket() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Finalized {
             slot: 1,
             hash: "h".into(),
             fast: false,
         }));
-        assert_eq!(p.particles[0].lane, Lane::Slow);
+        assert_eq!(p.slow.current, 1);
         assert_eq!(p.history.back(), Some(&Outcome::Slow));
     }
 
     #[test]
-    fn voting_skip_spawns_skip_lane() {
+    fn voting_skip_accumulates_skip_bucket() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::VotingSkip { slot: 1 }));
-        assert_eq!(p.particles[0].lane, Lane::Skip);
+        assert_eq!(p.skip.current, 1);
         assert_eq!(p.history.back(), Some(&Outcome::Skip));
     }
 
     #[test]
-    fn shred_insert_is_full_with_recovery_spawns_fec_lane() {
-        let mut p = SlotLifecyclePane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 1,
-            total_time_ms: 10,
-            last_index: 100,
-            num_repaired: 0,
-            num_recovered: 44,
-        })));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Fec);
-        assert_eq!(p.last_fec_per_slot, Some(44));
-    }
-
-    #[test]
-    fn shred_insert_is_full_with_zero_recovery_does_not_spawn() {
+    fn shred_insert_is_full_accumulates_fec_only_when_nonzero() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
             slot: 1,
@@ -484,20 +458,16 @@ mod tests {
             num_repaired: 0,
             num_recovered: 0,
         })));
-        assert!(p.particles.is_empty());
-    }
-
-    #[test]
-    fn rolling_window_caps_history() {
-        let mut p = SlotLifecyclePane::new();
-        for _ in 0..(ROLLING_WINDOW * 3) {
-            p.on_event(&mk(EventKind::Finalized {
-                slot: 0,
-                hash: "h".into(),
-                fast: true,
-            }));
-        }
-        assert_eq!(p.history.len(), ROLLING_WINDOW);
+        assert_eq!(p.fec.current, 0);
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
+            slot: 1,
+            total_time_ms: 10,
+            last_index: 100,
+            num_repaired: 0,
+            num_recovered: 44,
+        })));
+        assert_eq!(p.fec.current, 44);
+        assert_eq!(p.last_fec_per_slot, Some(44));
     }
 
     #[test]
@@ -516,20 +486,29 @@ mod tests {
     }
 
     #[test]
-    fn particles_drop_after_lifespan() {
+    fn lane_caps_match_documented_values() {
+        assert_eq!(Lane::Fast.cap(), 3);
+        assert_eq!(Lane::Slow.cap(), 1);
+        assert_eq!(Lane::Skip.cap(), 1);
+        assert_eq!(Lane::Fec.cap(), 50);
+    }
+
+    #[test]
+    fn fill_level_at_or_past_cap_saturates() {
+        assert_eq!(fill_level(1, 1), 8);
+        assert_eq!(fill_level(100, 1), 8);
+    }
+
+    #[test]
+    fn rolling_window_caps_history() {
         let mut p = SlotLifecyclePane::new();
-        p.on_event(&mk(EventKind::Finalized {
-            slot: 0,
-            hash: "h".into(),
-            fast: true,
-        }));
-        let past = Instant::now()
-            .checked_sub(Duration::from_secs_f64(TRAVERSAL_SECS + 0.5))
-            .unwrap();
-        for q in &mut p.particles {
-            q.spawn_at = past;
+        for _ in 0..(ROLLING_WINDOW * 3) {
+            p.on_event(&mk(EventKind::Finalized {
+                slot: 0,
+                hash: "h".into(),
+                fast: true,
+            }));
         }
-        p.tick(Instant::now());
-        assert!(p.particles.is_empty());
+        assert_eq!(p.history.len(), ROLLING_WINDOW);
     }
 }

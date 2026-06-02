@@ -1,70 +1,56 @@
-//! Shred streams — multi-lane particle visualization.
+//! Shred streams — bucketed bars.
 //!
-//! Four stacked lanes, each showing one real event source as
-//! particles flowing left → right. Calm = healthy. Yellow / red
-//! particles appearing = look at the snapshot row.
+//! Time is sliced into 250ms buckets. Each bucket = one terminal
+//! column. Each lane's bucket aggregates the relevant metric field
+//! (Σ shred_count, Σ num_discards, etc.), scales against a predefined
+//! per-lane cap, and renders one of nine Unicode block-fill levels.
 //!
 //! ```text
-//! ┌─ shred streams ──────────────────────────────────────┐
-//! │  turbine    ·   ·    · ·   ·    · ·    ·   ·         │  cyan
-//! │  repair         ▪                  ▪                 │  yellow
-//! │  drop                                                │  red (empty when healthy)
-//! │  err                                                 │  red (empty when healthy)
-//! │                                                      │
-//! │  357 shreds  ·  5 repair  ·  0 drop  ·  0 err        │  snapshot row
-//! └──────────────────────────────────────────────────────┘
+//! ┌─ shred streams ───────────────────────────────────────┐
+//! │                                                       │
+//! │ turbine ▅▆▅▇▅▆▆▅▆▆▅▆▆▅▇▆▅▆▆▆▅▆▅▆▆▅▇▆▅▆▆▆▅▆▅▆▆▅      │   cyan, steady
+//! │ repair         ▃                  ▂                   │   yellow, sparse
+//! │ drop                                                  │   magenta, empty (healthy)
+//! │ err                                                   │   red, empty (healthy)
+//! │                                                       │
+//! │ 357 sh  ·  5 rep  ·  0 drop  ·  0 err  ·  per-sample  │   snapshot
+//! └───────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Particle sources:
+//! Newest bucket on the right; older buckets slide left as new ones
+//! complete. The visible time window equals `pane_width × BUCKET_MS`
+//! (~37s at 150-col half-width and 250ms buckets).
 //!
-//! - **turbine** — one particle per `ShredFetch` batch. Always-on
-//!   when the cluster is producing. Marker tier by `shred_count`
-//!   (Small/Medium/Large). Cyan.
-//! - **repair** — one particle per `ShredFetchRepair` batch with
-//!   `shred_count > 0`. Bright yellow Block marker; the lane should
-//!   be visibly louder than turbine because repair is operationally
-//!   meaningful.
-//! - **drop** — one particle per `ShredSigverify` sample with
-//!   `num_discards > 0`. Red. Empty stream = no sigverify drops.
-//! - **err** — one particle per `RecvWindowInsert` sample with
-//!   `num_errors > 0`. Red. Empty stream = no window errors.
-//!
-//! Snapshot row is the *most recent sample value* from each source.
-//! It changes with every datapoint; the streams above show the
-//! *history* so the operator can spot trends and bursts.
+//! Per-lane caps (full-bar threshold) are picked so typical activity
+//! shows in the 4–6 pixel range and bursts saturate to a full bar
+//! `█`. See [`Lane::cap`] for the rationale per lane.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
-/// Pane row height when laid out by [`crate::live::scenes::SceneEngine`].
 pub const PANE_HEIGHT: u16 = 9;
 
-const TRAVERSAL_SECS: f64 = 3.0;
-const PARTICLE_CAP: usize = 512;
-const X_MAX: f64 = 100.0;
+/// Duration of one bucket. Picked so 4 buckets per second feels
+/// "moving" without flickering, and 250ms ≈ half a Solana slot.
+pub const BUCKET_DURATION: Duration = Duration::from_millis(250);
 
-// Lane y-coordinates inside chart bounds [0, 4]. Higher y = higher row
-// in chart coords, which maps to UPPER row on screen.
-const Y_TURBINE: f64 = 3.5;
-const Y_REPAIR: f64 = 2.5;
-const Y_DROP: f64 = 1.5;
-const Y_ERR: f64 = 0.5;
-
-/// Width reserved on the left of each pane for lane labels. Charts
-/// render to the right of this column.
+/// Width reserved on the left for lane labels.
 const LABEL_COL_WIDTH: u16 = 9;
 
-// Semantic palette (shared with [`super::slot_outcomes`]).
+/// Nine block-fill levels. Index 0 = empty space, 8 = full block.
+/// Unicode lower-block-fill characters give a clean bottom-up bar.
+const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
 const COL_TURBINE: Color = Color::Cyan;
 const COL_REPAIR: Color = Color::Yellow;
 const COL_DROP: Color = Color::LightMagenta;
@@ -78,50 +64,61 @@ enum Lane {
     Err,
 }
 
-/// Per-event magnitude for attention lanes. Drives how wide the event
-/// renders so the operator can tell minor jitter from a real burst at
-/// a glance. Turbine ignores this — it's the calm baseline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Magnitude {
-    Small,
-    Medium,
-    Large,
-}
-
-impl Magnitude {
-    /// Bucket a raw event count. Thresholds picked from observed
-    /// `num_repaired` / `num_discards` / `num_errors` distributions:
-    /// most events sit in 1–5 range; a "real" issue is 30+; a flood
-    /// pushes past 100.
-    const fn classify(count: u64) -> Self {
-        match count {
-            0..=5 => Self::Small,
-            6..=30 => Self::Medium,
-            _ => Self::Large,
-        }
-    }
-
-    /// How many adjacent horizontal cells this magnitude spans.
-    /// Larger magnitudes occupy more space so they stand out, without
-    /// distorting the time axis (cells are stacked at the same
-    /// timestamp, not at different times).
-    const fn cell_width(self) -> u32 {
+impl Lane {
+    /// Predefined per-lane cap. The bar is full (`█`) when the
+    /// bucket's accumulated value reaches this. Calibrated so typical
+    /// healthy activity shows in the 4–6 pixel range and bursts
+    /// saturate visibly — see the module doc for the per-lane
+    /// rationale (`turbine` capped at expected Σ shred_count per
+    /// 250ms; attention lanes capped low so a single event lands
+    /// at a visible pixel level).
+    const fn cap(self) -> u32 {
         match self {
-            Self::Small => 1,
-            Self::Medium => 2,
-            Self::Large => 3,
+            // ~350 shreds/batch × ~4 batches per 250ms ≈ 1400.
+            // 2000 saturates only on heavy bursts.
+            Self::Turbine => 2000,
+            // Typical repair batch ≈ 5 shreds; 30 = moderate burst.
+            Self::Repair => 30,
+            // Drops are rare; 10/bucket = sigverify struggling.
+            Self::Drop => 10,
+            // Errors rarer still; 5 = window misbehaving.
+            Self::Err => 5,
         }
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-struct Particle {
-    spawn_at: Instant,
-    lane: Lane,
-    /// `Some` for attention lanes (repair/drop/err); `None` for the
-    /// turbine baseline which renders as a single Braille dot
-    /// regardless of batch size.
-    magnitude: Option<Magnitude>,
+    /// Lane order from top to bottom of the chart area.
+    const fn row(self) -> u16 {
+        match self {
+            Self::Turbine => 0,
+            Self::Repair => 1,
+            Self::Drop => 2,
+            Self::Err => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Turbine => "turbine",
+            Self::Repair => "repair",
+            Self::Drop => "drop",
+            Self::Err => "err",
+        }
+    }
+
+    const fn colour(self) -> Color {
+        match self {
+            Self::Turbine => COL_TURBINE,
+            Self::Repair => COL_REPAIR,
+            Self::Drop => COL_DROP,
+            Self::Err => COL_ERR,
+        }
+    }
+
+    /// Whether the lane is a calm baseline (rendered DIM when filled)
+    /// or an attention lane (rendered BOLD when filled).
+    const fn is_attention(self) -> bool {
+        matches!(self, Self::Repair | Self::Drop | Self::Err)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,30 +129,82 @@ struct LatestNumbers {
     err: Option<u64>,
 }
 
+/// One lane's bucket history. `current` is the in-progress bucket
+/// being accumulated; on bucket roll-over it pushes to `history`.
+#[derive(Debug)]
+struct BucketLane {
+    history: VecDeque<u32>,
+    current: u32,
+    current_started: Instant,
+}
+
+impl BucketLane {
+    fn new(now: Instant) -> Self {
+        Self {
+            history: VecDeque::with_capacity(256),
+            current: 0,
+            current_started: now,
+        }
+    }
+
+    /// Add `v` to the current in-progress bucket.
+    const fn accumulate(&mut self, v: u32) {
+        self.current = self.current.saturating_add(v);
+    }
+
+    /// Advance the bucket clock to `now`. May roll the current bucket
+    /// into history one or more times if multiple bucket windows have
+    /// elapsed since the last call (e.g. after a pause).
+    fn advance(&mut self, now: Instant, max_history: usize) {
+        while now.saturating_duration_since(self.current_started) >= BUCKET_DURATION {
+            self.history.push_back(self.current);
+            self.current = 0;
+            self.current_started += BUCKET_DURATION;
+            while self.history.len() > max_history {
+                self.history.pop_front();
+            }
+        }
+    }
+}
+
 pub struct ShredIngressPane {
-    particles: Vec<Particle>,
+    turbine: BucketLane,
+    repair: BucketLane,
+    drop_lane: BucketLane,
+    err_lane: BucketLane,
     numbers: LatestNumbers,
     now: Instant,
 }
 
 impl ShredIngressPane {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
-            particles: Vec::new(),
+            turbine: BucketLane::new(now),
+            repair: BucketLane::new(now),
+            drop_lane: BucketLane::new(now),
+            err_lane: BucketLane::new(now),
             numbers: LatestNumbers::default(),
-            now: Instant::now(),
+            now,
         }
     }
 
-    fn spawn(&mut self, lane: Lane, magnitude: Option<Magnitude>) {
-        if self.particles.len() >= PARTICLE_CAP {
-            self.particles.remove(0);
+    const fn lane_mut(&mut self, lane: Lane) -> &mut BucketLane {
+        match lane {
+            Lane::Turbine => &mut self.turbine,
+            Lane::Repair => &mut self.repair,
+            Lane::Drop => &mut self.drop_lane,
+            Lane::Err => &mut self.err_lane,
         }
-        self.particles.push(Particle {
-            spawn_at: self.now,
-            lane,
-            magnitude,
-        });
+    }
+
+    const fn lane_ref(&self, lane: Lane) -> &BucketLane {
+        match lane {
+            Lane::Turbine => &self.turbine,
+            Lane::Repair => &self.repair,
+            Lane::Drop => &self.drop_lane,
+            Lane::Err => &self.err_lane,
+        }
     }
 }
 
@@ -173,27 +222,23 @@ impl Pane for ShredIngressPane {
         match m {
             MetricEvent::ShredFetch { shred_count } => {
                 self.numbers.fetch = Some(*shred_count);
-                // Turbine is the calm baseline — single Braille dot
-                // regardless of batch count.
-                self.spawn(Lane::Turbine, None);
+                self.lane_mut(Lane::Turbine)
+                    .accumulate(u32::try_from(*shred_count).unwrap_or(u32::MAX));
             }
             MetricEvent::ShredFetchRepair { shred_count } => {
                 self.numbers.repair = Some(*shred_count);
-                if *shred_count > 0 {
-                    self.spawn(Lane::Repair, Some(Magnitude::classify(*shred_count)));
-                }
+                self.lane_mut(Lane::Repair)
+                    .accumulate(u32::try_from(*shred_count).unwrap_or(u32::MAX));
             }
             MetricEvent::ShredSigverify { num_discards, .. } => {
                 self.numbers.drop = Some(*num_discards);
-                if *num_discards > 0 {
-                    self.spawn(Lane::Drop, Some(Magnitude::classify(*num_discards)));
-                }
+                self.lane_mut(Lane::Drop)
+                    .accumulate(u32::try_from(*num_discards).unwrap_or(u32::MAX));
             }
             MetricEvent::RecvWindowInsert { num_errors, .. } => {
                 self.numbers.err = Some(*num_errors);
-                if *num_errors > 0 {
-                    self.spawn(Lane::Err, Some(Magnitude::classify(*num_errors)));
-                }
+                self.lane_mut(Lane::Err)
+                    .accumulate(u32::try_from(*num_errors).unwrap_or(u32::MAX));
             }
             _ => {}
         }
@@ -201,9 +246,14 @@ impl Pane for ShredIngressPane {
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
-        let lifetime = Duration::from_secs_f64(TRAVERSAL_SECS);
-        self.particles
-            .retain(|p| now.saturating_duration_since(p.spawn_at) < lifetime);
+        // History capacity is generous; the render loop only paints
+        // what fits in the chart area, so we cap once at the upper
+        // limit and let the renderer slice.
+        let cap = 1024;
+        self.turbine.advance(now, cap);
+        self.repair.advance(now, cap);
+        self.drop_lane.advance(now, cap);
+        self.err_lane.advance(now, cap);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -219,10 +269,6 @@ impl Pane for ShredIngressPane {
             return;
         }
 
-        // Vertical: 1 row top breathing, 4 rows chart (== 4 lanes ==
-        // y bounds [0, 4], so each row corresponds to exactly one
-        // chart unit and labels align cleanly), then leftover gap,
-        // then 1 row snapshot.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -233,17 +279,14 @@ impl Pane for ShredIngressPane {
             ])
             .split(inner);
 
-        self.render_streams(frame, chunks[1]);
+        self.render_chart(frame, chunks[1]);
         self.render_snapshot(frame, chunks[3]);
     }
 }
 
 impl ShredIngressPane {
-    fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Horizontal split: leftmost LABEL_COL_WIDTH cells for lane
-        // labels, rest for the particle chart. Labels render
-        // separately so they never overlay the moving particles.
-        if area.width <= LABEL_COL_WIDTH + 8 {
+    fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width <= LABEL_COL_WIDTH + 4 {
             return;
         }
         let h_chunks = Layout::default()
@@ -253,109 +296,10 @@ impl ShredIngressPane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        // Visual hierarchy:
-        //   turbine        → Braille DIM (calm noise floor)
-        //   repair/drop/err → Block BOLD coloured, with WIDTH
-        //                     proportional to event magnitude. A
-        //                     small repair (1-5 shreds) is 1 cell
-        //                     wide; a flood (100+) is 3 cells. Lets
-        //                     the operator tell minor jitter from a
-        //                     real burst at a glance.
-        let mut turbine: Vec<(f64, f64)> = Vec::new();
-        let mut repair: Vec<(f64, f64)> = Vec::new();
-        let mut drop: Vec<(f64, f64)> = Vec::new();
-        let mut err: Vec<(f64, f64)> = Vec::new();
-
-        // Estimate the chart's data-x units per terminal cell so we
-        // can space the magnitude-driven extra particles by ONE cell
-        // each. This keeps the burst centred on the event's time and
-        // grows it horizontally rather than smearing it across time.
-        let dx_per_cell = if chart_area.width > 0 {
-            X_MAX / f64::from(chart_area.width)
-        } else {
-            1.0
-        };
-
-        for p in &self.particles {
-            let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
-            if age >= TRAVERSAL_SECS {
-                continue;
-            }
-            let x = (age / TRAVERSAL_SECS) * X_MAX;
-            match p.lane {
-                Lane::Turbine => turbine.push((x, Y_TURBINE)),
-                Lane::Repair | Lane::Drop | Lane::Err => {
-                    let cells = p.magnitude.map_or(1, Magnitude::cell_width);
-                    let dest = match p.lane {
-                        Lane::Repair => &mut repair,
-                        Lane::Drop => &mut drop,
-                        Lane::Err => &mut err,
-                        Lane::Turbine => unreachable!(),
-                    };
-                    let y = match p.lane {
-                        Lane::Repair => Y_REPAIR,
-                        Lane::Drop => Y_DROP,
-                        Lane::Err => Y_ERR,
-                        Lane::Turbine => unreachable!(),
-                    };
-                    for i in 0..cells {
-                        dest.push((f64::from(i).mul_add(dx_per_cell, x), y));
-                    }
-                }
-            }
+        for lane in [Lane::Turbine, Lane::Repair, Lane::Drop, Lane::Err] {
+            render_lane_label(frame, label_area, chart_area, lane);
+            render_lane_bars(frame, chart_area, lane, self.lane_ref(lane));
         }
-
-        // Marker::Dot puts every calm-baseline event at the cell
-        // centre; Marker::Block does the same for attention events.
-        // All four lanes therefore share one vertical snapline:
-        // turbine `•`, repair `█`, drop `█`, err `█` all read as
-        // centred-in-cell glyphs. Braille gave sub-pixel positioning
-        // which was perceived as misalignment versus the Block rows
-        // below it.
-        let datasets = vec![
-            Dataset::default()
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_TURBINE).add_modifier(Modifier::DIM))
-                .data(&turbine),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD))
-                .data(&repair),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_DROP).add_modifier(Modifier::BOLD))
-                .data(&drop),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_ERR).add_modifier(Modifier::BOLD))
-                .data(&err),
-        ];
-
-        let chart = Chart::new(datasets)
-            .x_axis(Axis::default().bounds([0.0, X_MAX]))
-            .y_axis(Axis::default().bounds([0.0, 4.0]));
-        frame.render_widget(chart, chart_area);
-
-        // Lane labels in their dedicated column — same row mapping as
-        // the chart uses for particles, so labels sit at the start of
-        // their lane.
-        render_lane_label(
-            frame,
-            label_area,
-            chart_area,
-            "turbine",
-            Y_TURBINE,
-            COL_TURBINE,
-        );
-        render_lane_label(
-            frame, label_area, chart_area, "repair", Y_REPAIR, COL_REPAIR,
-        );
-        render_lane_label(frame, label_area, chart_area, "drop", Y_DROP, COL_DROP);
-        render_lane_label(frame, label_area, chart_area, "err", Y_ERR, COL_ERR);
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -399,7 +343,7 @@ impl ShredIngressPane {
             Span::styled(" err", theme::label_style()),
             sep(),
             Span::styled(
-                "per-sample (~1/s)",
+                format!("buckets {}ms", BUCKET_DURATION.as_millis()),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -409,9 +353,10 @@ impl ShredIngressPane {
     }
 }
 
-/// Inline separator span used between metric groups on the snapshot
-/// row. Picks a visible-but-quiet glyph so the eye can find groups
-/// without the colour itself becoming noise.
+fn fmt_opt(v: Option<u64>) -> String {
+    v.map_or_else(|| "—".to_owned(), |n| format!("{n}"))
+}
+
 fn sep() -> Span<'static> {
     Span::styled(
         "  ·  ",
@@ -421,34 +366,13 @@ fn sep() -> Span<'static> {
     )
 }
 
-fn fmt_opt(v: Option<u64>) -> String {
-    v.map_or_else(|| "—".to_owned(), |n| format!("{n}"))
-}
-
-/// Paint a small label `text` at the left edge of `area` on the row
-/// corresponding to chart-y `y` (chart bounds [0, 4], screen flipped).
-/// Paint a small lane label inside `label_area`, at the row that
-/// corresponds to chart-y `y_chart` in `chart_area`. The row mapping
-/// quantises the chart's [0, Y_MAX] range across the chart area's
-/// row count so the label and the particles share the same line.
-fn render_lane_label(
-    frame: &mut Frame<'_>,
-    label_area: Rect,
-    chart_area: Rect,
-    text: &str,
-    y_chart: f64,
-    fg: Color,
-) {
-    const Y_MAX: f64 = 4.0;
-    if chart_area.height == 0 {
+fn render_lane_label(frame: &mut Frame<'_>, label_area: Rect, chart_area: Rect, lane: Lane) {
+    let row = lane.row();
+    if row >= chart_area.height {
         return;
     }
-    let clamped = y_chart.clamp(0.0, Y_MAX);
-    // Row index inside the chart area: 0 = top row.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let row = (((Y_MAX - clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
-    let row = row.min(chart_area.height.saturating_sub(1));
     let y = chart_area.y + row;
+    let text = lane.label();
     let w = text.chars().count() as u16;
     if w + 1 > label_area.width {
         return;
@@ -456,10 +380,69 @@ fn render_lane_label(
     frame.render_widget(
         Paragraph::new(Span::styled(
             text.to_owned(),
-            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(lane.colour())
+                .add_modifier(Modifier::BOLD),
         )),
         Rect::new(label_area.x + 1, y, w, 1),
     );
+}
+
+fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket: &BucketLane) {
+    let row = lane.row();
+    if row >= chart_area.height || chart_area.width == 0 {
+        return;
+    }
+    let y = chart_area.y + row;
+    let cap = lane.cap();
+    let colour = lane.colour();
+    let is_attention = lane.is_attention();
+
+    // Visible buckets: the in-progress one at the rightmost column,
+    // then committed history extending leftward. Older history that
+    // would fall off the left edge is simply not rendered.
+    let total_visible = (chart_area.width as usize).min(bucket.history.len() + 1);
+    let rightmost_x = chart_area.x + chart_area.width - 1;
+
+    for i in 0..total_visible {
+        // i = 0 is the current (rightmost) bucket; i = 1 is the most
+        // recent committed bucket; i = N-1 is the oldest visible.
+        let value = if i == 0 {
+            bucket.current
+        } else {
+            let idx = bucket.history.len().wrapping_sub(i);
+            bucket.history.get(idx).copied().unwrap_or(0)
+        };
+        let pixels = fill_level(value, cap);
+        let glyph = FILL_CHARS[pixels];
+        let modifier = if pixels == 0 {
+            // Empty cell — paint nothing so the row stays quiet.
+            continue;
+        } else if is_attention {
+            Modifier::BOLD
+        } else {
+            Modifier::DIM
+        };
+        let style = Style::default().fg(colour).add_modifier(modifier);
+        let x = rightmost_x - i as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph.to_owned(), style)),
+            Rect::new(x, y, 1, 1),
+        );
+    }
+}
+
+/// Map a bucket value to a fill level (0..=8).
+///
+/// `value / cap * 8`, clamped to `[0, 8]`. Values past `cap` saturate
+/// at full bar (`█`) so a heavy burst doesn't disappear into
+/// numerical territory that the visual cannot represent.
+fn fill_level(value: u32, cap: u32) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let level = (u64::from(value) * 8 / u64::from(cap)) as usize;
+    level.min(8)
 }
 
 #[cfg(test)]
@@ -474,86 +457,107 @@ mod tests {
     }
 
     #[test]
-    fn turbine_lane_fires_on_every_fetch() {
+    fn fill_level_zero_is_empty() {
+        assert_eq!(fill_level(0, 100), 0);
+    }
+
+    #[test]
+    fn fill_level_at_cap_is_full() {
+        assert_eq!(fill_level(100, 100), 8);
+    }
+
+    #[test]
+    fn fill_level_past_cap_saturates() {
+        assert_eq!(fill_level(1000, 100), 8);
+    }
+
+    #[test]
+    fn fill_level_proportional() {
+        // 50 % of 100 → 4 pixels (half block).
+        assert_eq!(fill_level(50, 100), 4);
+        // 25 % → 2 pixels.
+        assert_eq!(fill_level(25, 100), 2);
+    }
+
+    #[test]
+    fn shred_fetch_accumulates_into_turbine_current() {
+        let mut p = ShredIngressPane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
+            shred_count: 350,
+        })));
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
+            shred_count: 400,
+        })));
+        assert_eq!(p.turbine.current, 750);
+        assert_eq!(p.numbers.fetch, Some(400));
+    }
+
+    #[test]
+    fn tick_rolls_current_bucket_into_history_after_duration() {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
             shred_count: 100,
         })));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Turbine);
-        assert_eq!(p.numbers.fetch, Some(100));
+        // Force the elapsed time past one bucket window.
+        p.turbine.current_started = Instant::now()
+            .checked_sub(BUCKET_DURATION + Duration::from_millis(10))
+            .unwrap();
+        p.tick(Instant::now());
+        assert_eq!(p.turbine.current, 0);
+        assert_eq!(p.turbine.history.back().copied(), Some(100));
     }
 
     #[test]
-    fn repair_lane_only_fires_when_count_nonzero() {
+    fn repair_only_accumulates_when_shred_count_present() {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
             shred_count: 0,
         })));
-        assert!(p.particles.is_empty());
+        // Accumulation of 0 is allowed (history will show empty), but
+        // the field updates regardless.
+        assert_eq!(p.repair.current, 0);
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
             shred_count: 5,
         })));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Repair);
+        assert_eq!(p.repair.current, 5);
     }
 
     #[test]
-    fn drop_lane_only_fires_when_discards_nonzero() {
+    fn drop_lane_accumulates_discards() {
         let mut p = ShredIngressPane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredSigverify {
-            num_packets: 100,
-            num_discards: 0,
-            num_duplicates: 0,
-            elapsed_micros: 1,
-        })));
-        assert!(p.particles.is_empty());
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredSigverify {
             num_packets: 100,
             num_discards: 8,
             num_duplicates: 0,
             elapsed_micros: 1,
         })));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Drop);
+        assert_eq!(p.drop_lane.current, 8);
     }
 
     #[test]
-    fn err_lane_only_fires_when_errors_nonzero() {
+    fn err_lane_accumulates_errors() {
         let mut p = ShredIngressPane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::RecvWindowInsert {
-            num_shreds_received: 100,
-            num_errors: 0,
-        })));
-        assert!(p.particles.is_empty());
         p.on_event(&mk(EventKind::Metric(MetricEvent::RecvWindowInsert {
             num_shreds_received: 100,
             num_errors: 3,
         })));
-        assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, Lane::Err);
-    }
-
-    #[test]
-    fn particles_drop_after_lifespan() {
-        let mut p = ShredIngressPane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
-            shred_count: 10,
-        })));
-        let past = Instant::now()
-            .checked_sub(Duration::from_secs_f64(TRAVERSAL_SECS + 0.5))
-            .unwrap();
-        for q in &mut p.particles {
-            q.spawn_at = past;
-        }
-        p.tick(Instant::now());
-        assert!(p.particles.is_empty());
+        assert_eq!(p.err_lane.current, 3);
     }
 
     #[test]
     fn non_metric_events_ignored() {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::FirstShred { slot: 1 }));
-        assert!(p.particles.is_empty());
+        assert_eq!(p.turbine.current, 0);
+    }
+
+    #[test]
+    fn lane_caps_match_documented_values() {
+        // Pins the per-lane caps so a future tweak shows up as a
+        // failing test rather than a silently shifted scale.
+        assert_eq!(Lane::Turbine.cap(), 2000);
+        assert_eq!(Lane::Repair.cap(), 30);
+        assert_eq!(Lane::Drop.cap(), 10);
+        assert_eq!(Lane::Err.cap(), 5);
     }
 }
