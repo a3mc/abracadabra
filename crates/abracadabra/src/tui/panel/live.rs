@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::live::detect::{Activity, StaticReason};
+use crate::live::scenes::SceneEngine;
 use crate::live::tail::TailHandle;
 use crate::tui::theme;
 
@@ -51,10 +52,23 @@ pub fn render(
     activity: &Activity,
     file_path: &Path,
     tail: Option<&TailHandle>,
+    engine: Option<&SceneEngine>,
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
     let following = tail.is_some();
+
+    // Active log + following + engine present → hand the whole inner
+    // area to the scene engine. The placeholder counter view below is
+    // only shown in the transient state where following just started
+    // (engine == None) and in the idle / static states.
+    if matches!(activity, Activity::Active) && following {
+        if let Some(engine) = engine {
+            engine.render(frame, area);
+            return;
+        }
+    }
+
     let title = match (activity, following) {
         (Activity::Active, true) => " Live · following ",
         (Activity::Active, false) => " Live · ready ",
@@ -217,10 +231,7 @@ fn lines_for_state(
                             theme::value_style(),
                         ),
                         Span::styled(" · ", theme::label_style()),
-                        Span::styled(
-                            format!("{} lines", snap.total_lines),
-                            theme::value_style(),
-                        ),
+                        Span::styled(format!("{} lines", snap.total_lines), theme::value_style()),
                         Span::styled(" · last ", theme::label_style()),
                         Span::styled(age, theme::value_style()),
                     ])
@@ -228,9 +239,7 @@ fn lines_for_state(
                 |err| {
                     Line::from(Span::styled(
                         err.clone(),
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ))
                 },
             );

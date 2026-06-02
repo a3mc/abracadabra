@@ -369,9 +369,7 @@ mod tests {
         let mut w = World::new();
         w.spawn(Entity::at(0.0, 0.0, '*', Color::White).with_velocity(2.0, -1.0));
         // Stamp last_tick to a known past value so dt is precise.
-        w.last_tick = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap();
+        w.last_tick = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         w.tick(Instant::now());
         let e = w.iter().next().unwrap();
         // Allow small floating-point slack.

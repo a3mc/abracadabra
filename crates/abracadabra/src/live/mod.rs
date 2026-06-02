@@ -12,4 +12,5 @@
 
 pub mod animation;
 pub mod detect;
+pub mod scenes;
 pub mod tail;

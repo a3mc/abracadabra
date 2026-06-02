@@ -339,6 +339,11 @@ pub struct App<'s> {
     /// means a background thread is reading appends from the input
     /// file. Dropping the handle stops the thread (see `TailHandle::Drop`).
     pub tail: Option<crate::live::tail::TailHandle>,
+    /// Composite scene engine for the Live tab. Spawned and dropped in
+    /// lockstep with `tail`. `None` when not following; `Some` when
+    /// following so the event loop can tick it each frame and the
+    /// panel render can draw it.
+    pub engine: Option<crate::live::scenes::SceneEngine>,
     /// Ordered list of tabs visible in this run. Active logs get
     /// `[Live, Overview, ...]`; static logs omit `Live` for a clean
     /// 6-tab layout. `current_tab` is an index into this vector.
@@ -412,6 +417,7 @@ impl<'s> App<'s> {
             tabs: tab_layout(&activity),
             activity,
             tail: None,
+            engine: None,
         }
     }
 
@@ -683,6 +689,14 @@ fn event_loop(
     app: &mut App<'_>,
 ) -> Result<(), TuiError> {
     loop {
+        // Tick the scene engine (drain new events from the tail, then
+        // advance pane simulations) once per loop iteration when
+        // following. Render reads pane state immutably immediately
+        // after; the tick + draw pair runs at ~10 Hz courtesy of the
+        // 100ms poll cadence below.
+        if let (Some(tail), Some(engine)) = (app.tail.as_ref(), app.engine.as_mut()) {
+            engine.tick(tail, std::time::Instant::now());
+        }
         terminal
             .draw(|frame| draw(frame, app))
             .map_err(TuiError::Io)?;
@@ -715,19 +729,22 @@ fn event_loop(
                     KeyCode::Tab => app.next_tab(),
                     KeyCode::BackTab => app.prev_tab(),
                     // Live-tab-only: SPACEBAR starts or stops the tail
-                    // thread. `app.tail.is_some()` is the single source
-                    // of truth for "are we following?". Static-log runs
-                    // do not see this binding because Live is not in
-                    // the layout.
+                    // thread *and* the scene engine in lockstep. The
+                    // two are conceptually one thing — "following"
+                    // means both the producer (tail) and the consumer
+                    // (engine) are alive. Static-log runs do not see
+                    // this binding because Live is not in the layout.
                     KeyCode::Char(' ') if app.current_kind() == TabId::Live => {
                         if app.tail.is_some() {
-                            // Replacing with None drops the handle,
-                            // which signals shutdown and joins the
-                            // thread via TailHandle::Drop.
+                            // Dropping the handle signals shutdown and
+                            // joins the thread via TailHandle::Drop.
+                            // Dropping the engine releases pane state.
                             app.tail = None;
+                            app.engine = None;
                         } else {
                             app.tail =
                                 Some(crate::live::tail::spawn(app.state.file_meta.path.clone()));
+                            app.engine = Some(crate::live::scenes::SceneEngine::default_layout());
                         }
                     }
                     KeyCode::Char('j') | KeyCode::Down => app.step_scroll(1),
@@ -818,6 +835,7 @@ fn draw(frame: &mut Frame<'_>, app: &App<'_>) {
             &app.activity,
             &app.state.file_meta.path,
             app.tail.as_ref(),
+            app.engine.as_ref(),
             frame,
             chunks[2],
         ),
