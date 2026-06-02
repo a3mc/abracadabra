@@ -686,7 +686,12 @@ fn event_loop(
         terminal
             .draw(|frame| draw(frame, app))
             .map_err(TuiError::Io)?;
-        if event::poll(Duration::from_millis(200)).map_err(TuiError::Io)? {
+        // 100ms poll cadence drives the Live tab animation at ~10 Hz.
+        // Other tabs are idempotent under repeated redraws; the extra
+        // wakeups are cheap when nothing has changed (no work done in
+        // the panel render paths when state is unchanged at the model
+        // level).
+        if event::poll(Duration::from_millis(100)).map_err(TuiError::Io)? {
             if let Event::Key(key) = event::read().map_err(TuiError::Io)? {
                 if key.kind != KeyEventKind::Press {
                     continue;

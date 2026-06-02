@@ -10,5 +10,6 @@
 //! unchanged by anything in this module — the Live tab is an additive
 //! surface, not a refactor of existing behaviour.
 
+pub mod animation;
 pub mod detect;
 pub mod tail;
