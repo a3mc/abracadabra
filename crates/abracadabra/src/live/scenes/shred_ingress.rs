@@ -40,12 +40,25 @@ use crate::tui::theme;
 
 pub const PANE_HEIGHT: u16 = 9;
 
-/// Duration of one bucket. Picked so 4 buckets per second feels
-/// "moving" without flickering, and 250ms ≈ half a Solana slot.
-pub const BUCKET_DURATION: Duration = Duration::from_millis(250);
+/// Duration of one bucket.
+///
+/// One second feels readable: updates once per second (slow enough
+/// to track each change), aligns with most per-sample metric
+/// cadences. With 10 buckets per card (below) each card spans
+/// exactly 10 seconds.
+pub const BUCKET_DURATION: Duration = Duration::from_secs(1);
+
+/// Buckets per mini-card. Cards are the larger visual unit: 10
+/// buckets × 1s = 10 seconds per card. Cards are separated by a
+/// dim divider so the operator sees discrete "packets" of time
+/// sliding leftward as new ones populate on the right.
+const CARD_BUCKETS: u16 = 10;
 
 /// Width reserved on the left for lane labels.
 const LABEL_COL_WIDTH: u16 = 9;
+
+/// Divider rendered between cards.
+const CARD_DIVIDER: &str = "┊";
 
 /// Nine block-fill levels. Index 0 = empty space, 8 = full block.
 /// Unicode lower-block-fill characters give a clean bottom-up bar.
@@ -65,24 +78,25 @@ enum Lane {
 }
 
 impl Lane {
-    /// Predefined per-lane cap. The bar is full (`█`) when the
-    /// bucket's accumulated value reaches this. Calibrated so typical
-    /// healthy activity shows in the 4–6 pixel range and bursts
-    /// saturate visibly — see the module doc for the per-lane
-    /// rationale (`turbine` capped at expected Σ shred_count per
-    /// 250ms; attention lanes capped low so a single event lands
-    /// at a visible pixel level).
+    /// Predefined per-lane cap (full bar at this Σ value per 1-s
+    /// bucket). Caps were rechosen for the 1-second bucket size and
+    /// to tolerate the 5× replay-log testing path:
+    ///
+    /// - Turbine: ~10 shred_fetch batches/s × ~350 sh = ~3500 sh/s
+    ///   at real time; ~17 500 at 5× replay. Cap = 20000 keeps both
+    ///   in the 1–6 px range with no saturation.
+    /// - Repair: ~5 sh per repair fetch, ~0.5 fetches/s = ~2 sh/s
+    ///   real time. 5× replay can reach ~30 sh/s. Cap = 50 gives
+    ///   1 px for typical real-time, ~5 px for replay bursts.
+    /// - Drop: bursts can hit 40 discards/sample × ~1 sample/s =
+    ///   ~40 real, ~200 replay. Cap = 200 prevents wall-of-full.
+    /// - Err: rarer; 1–3 per event × 0–1 events/s. Cap = 10.
     const fn cap(self) -> u32 {
         match self {
-            // ~350 shreds/batch × ~4 batches per 250ms ≈ 1400.
-            // 2000 saturates only on heavy bursts.
-            Self::Turbine => 2000,
-            // Typical repair batch ≈ 5 shreds; 30 = moderate burst.
-            Self::Repair => 30,
-            // Drops are rare; 10/bucket = sigverify struggling.
-            Self::Drop => 10,
-            // Errors rarer still; 5 = window misbehaving.
-            Self::Err => 5,
+            Self::Turbine => 20_000,
+            Self::Repair => 50,
+            Self::Drop => 200,
+            Self::Err => 10,
         }
     }
 
@@ -343,7 +357,12 @@ impl ShredIngressPane {
             Span::styled(" err", theme::label_style()),
             sep(),
             Span::styled(
-                format!("buckets {}ms", BUCKET_DURATION.as_millis()),
+                format!(
+                    "cards {}s ({}×{}s)",
+                    CARD_BUCKETS as u64 * BUCKET_DURATION.as_secs(),
+                    CARD_BUCKETS,
+                    BUCKET_DURATION.as_secs()
+                ),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -398,33 +417,55 @@ fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket:
     let colour = lane.colour();
     let is_attention = lane.is_attention();
 
-    // Visible buckets: the in-progress one at the rightmost column,
-    // then committed history extending leftward. Older history that
-    // would fall off the left edge is simply not rendered.
-    let total_visible = (chart_area.width as usize).min(bucket.history.len() + 1);
+    // Each card occupies `CARD_BUCKETS` bucket columns followed by one
+    // separator column. The rightmost card holds the in-progress
+    // bucket at its rightmost cell. Older cards drift left, separated
+    // by dim dividers so the visual reads as discrete "packs" of
+    // 10 seconds each.
+    let card_stride = CARD_BUCKETS + 1;
+    let total_visible_cells = chart_area.width;
     let rightmost_x = chart_area.x + chart_area.width - 1;
 
-    for i in 0..total_visible {
-        // i = 0 is the current (rightmost) bucket; i = 1 is the most
-        // recent committed bucket; i = N-1 is the oldest visible.
-        let value = if i == 0 {
+    // Walk visible cells from right to left.
+    for cell in 0..total_visible_cells {
+        let position_in_card = cell % card_stride;
+        let x = rightmost_x - cell;
+        if position_in_card == CARD_BUCKETS {
+            // Divider column between cards.
+            let style = Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM);
+            frame.render_widget(
+                Paragraph::new(Span::styled(CARD_DIVIDER.to_owned(), style)),
+                Rect::new(x, y, 1, 1),
+            );
+            continue;
+        }
+        // Map this cell back to a bucket index. Within the rightmost
+        // card, the rightmost cell (cell=0) is the in-progress bucket.
+        // For older cards, subtract the dividers we've crossed.
+        let dividers_crossed = cell / card_stride;
+        let bucket_index_from_right = cell - dividers_crossed;
+        let value = if bucket_index_from_right == 0 {
             bucket.current
         } else {
-            let idx = bucket.history.len().wrapping_sub(i);
+            let idx = bucket
+                .history
+                .len()
+                .wrapping_sub(bucket_index_from_right as usize);
             bucket.history.get(idx).copied().unwrap_or(0)
         };
         let pixels = fill_level(value, cap);
-        let glyph = FILL_CHARS[pixels];
-        let modifier = if pixels == 0 {
-            // Empty cell — paint nothing so the row stays quiet.
+        if pixels == 0 {
             continue;
-        } else if is_attention {
+        }
+        let glyph = FILL_CHARS[pixels];
+        let modifier = if is_attention {
             Modifier::BOLD
         } else {
             Modifier::DIM
         };
         let style = Style::default().fg(colour).add_modifier(modifier);
-        let x = rightmost_x - i as u16;
         frame.render_widget(
             Paragraph::new(Span::styled(glyph.to_owned(), style)),
             Rect::new(x, y, 1, 1),
@@ -555,9 +596,9 @@ mod tests {
     fn lane_caps_match_documented_values() {
         // Pins the per-lane caps so a future tweak shows up as a
         // failing test rather than a silently shifted scale.
-        assert_eq!(Lane::Turbine.cap(), 2000);
-        assert_eq!(Lane::Repair.cap(), 30);
-        assert_eq!(Lane::Drop.cap(), 10);
-        assert_eq!(Lane::Err.cap(), 5);
+        assert_eq!(Lane::Turbine.cap(), 20_000);
+        assert_eq!(Lane::Repair.cap(), 50);
+        assert_eq!(Lane::Drop.cap(), 200);
+        assert_eq!(Lane::Err.cap(), 10);
     }
 }

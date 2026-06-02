@@ -28,8 +28,10 @@ use crate::tui::theme;
 
 pub const PANE_HEIGHT: u16 = 9;
 
-const BUCKET_DURATION: Duration = Duration::from_millis(250);
+const BUCKET_DURATION: Duration = Duration::from_secs(1);
+const CARD_BUCKETS: u16 = 10;
 const LABEL_COL_WIDTH: u16 = 9;
+const CARD_DIVIDER: &str = "┊";
 
 const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
@@ -51,16 +53,25 @@ enum Lane {
 }
 
 impl Lane {
+    /// Per-lane cap (full bar at this Σ value per 1-s bucket). Caps
+    /// rechosen for the 1-second bucket size and 5× replay tolerance.
+    /// Skip / slow now have non-trivial gradation so 1 event reads as
+    /// a small bar, 4+ saturate (was cap=1 → every event a full bar,
+    /// which hid burst magnitude).
     const fn cap(self) -> u32 {
         match self {
-            // ~0.625 fast events per bucket at normal speed; 3 = burst.
-            Self::Fast => 3,
-            // Any slow finalization is operationally meaningful.
-            Self::Slow => 1,
-            // Any skip is a real concern — full bar alarm.
-            Self::Skip => 1,
-            // Per-slot num_recovered runs ~20–50 on this network.
-            Self::Fec => 50,
+            // ~2.5 slots/s × 1 fast = ~2.5/s real, ~12.5 at 5× replay.
+            // Cap 15 keeps replay near full without clipping.
+            Self::Fast => 15,
+            // Slow finalizations are rare; cap 3 gives clear gradation
+            // for bursts of 1, 2, 3.
+            Self::Slow => 3,
+            // Skip: cap 4 turns "1 skip" into a small bar, "4+" into
+            // a full bar. Operator can read burst size at a glance.
+            Self::Skip => 4,
+            // Per-slot num_recovered ~30 × 2.5 slots/s = ~75/s real,
+            // ~375/s replay. Cap 500 prevents wall-of-full.
+            Self::Fec => 500,
         }
     }
 
@@ -317,7 +328,11 @@ impl SlotLifecyclePane {
             Span::styled(" fec (last)", theme::label_style()),
             sep(),
             Span::styled(
-                format!("last {} slots", self.history.len().min(ROLLING_WINDOW)),
+                format!(
+                    "last {} slots · cards {}s",
+                    self.history.len().min(ROLLING_WINDOW),
+                    CARD_BUCKETS as u64 * BUCKET_DURATION.as_secs(),
+                ),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -368,14 +383,32 @@ fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket:
     let colour = lane.colour();
     let is_attention = lane.is_attention();
 
-    let total_visible = (chart_area.width as usize).min(bucket.history.len() + 1);
+    let card_stride = CARD_BUCKETS + 1;
+    let total_visible_cells = chart_area.width;
     let rightmost_x = chart_area.x + chart_area.width - 1;
 
-    for i in 0..total_visible {
-        let value = if i == 0 {
+    for cell in 0..total_visible_cells {
+        let position_in_card = cell % card_stride;
+        let x = rightmost_x - cell;
+        if position_in_card == CARD_BUCKETS {
+            let style = Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM);
+            frame.render_widget(
+                Paragraph::new(Span::styled(CARD_DIVIDER.to_owned(), style)),
+                Rect::new(x, y, 1, 1),
+            );
+            continue;
+        }
+        let dividers_crossed = cell / card_stride;
+        let bucket_index_from_right = cell - dividers_crossed;
+        let value = if bucket_index_from_right == 0 {
             bucket.current
         } else {
-            let idx = bucket.history.len().wrapping_sub(i);
+            let idx = bucket
+                .history
+                .len()
+                .wrapping_sub(bucket_index_from_right as usize);
             bucket.history.get(idx).copied().unwrap_or(0)
         };
         let pixels = fill_level(value, cap);
@@ -389,7 +422,6 @@ fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket:
             Modifier::DIM
         };
         let style = Style::default().fg(colour).add_modifier(modifier);
-        let x = rightmost_x - i as u16;
         frame.render_widget(
             Paragraph::new(Span::styled(glyph.to_owned(), style)),
             Rect::new(x, y, 1, 1),
@@ -487,10 +519,10 @@ mod tests {
 
     #[test]
     fn lane_caps_match_documented_values() {
-        assert_eq!(Lane::Fast.cap(), 3);
-        assert_eq!(Lane::Slow.cap(), 1);
-        assert_eq!(Lane::Skip.cap(), 1);
-        assert_eq!(Lane::Fec.cap(), 50);
+        assert_eq!(Lane::Fast.cap(), 15);
+        assert_eq!(Lane::Slow.cap(), 3);
+        assert_eq!(Lane::Skip.cap(), 4);
+        assert_eq!(Lane::Fec.cap(), 500);
     }
 
     #[test]
