@@ -60,10 +60,15 @@ const Y_REPAIR: f64 = 2.5;
 const Y_DROP: f64 = 1.5;
 const Y_ERR: f64 = 0.5;
 
+/// Width reserved on the left of each pane for lane labels. Charts
+/// render to the right of this column.
+const LABEL_COL_WIDTH: u16 = 9;
+
 // Semantic palette (shared with [`super::slot_outcomes`]).
 const COL_TURBINE: Color = Color::Cyan;
 const COL_REPAIR: Color = Color::Yellow;
-const COL_BAD: Color = Color::Red;
+const COL_DROP: Color = Color::LightMagenta;
+const COL_ERR: Color = Color::Red;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -201,6 +206,19 @@ impl Pane for ShredIngressPane {
 
 impl ShredIngressPane {
     fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
+        // Horizontal split: leftmost LABEL_COL_WIDTH cells for lane
+        // labels, rest for the particle chart. Labels render
+        // separately so they never overlay the moving particles.
+        if area.width <= LABEL_COL_WIDTH + 8 {
+            return;
+        }
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(LABEL_COL_WIDTH), Constraint::Min(8)])
+            .split(area);
+        let label_area = h_chunks[0];
+        let chart_area = h_chunks[1];
+
         // Partition by (lane × intensity). Bigger intensity = bigger marker.
         let mut turbine_s: Vec<(f64, f64)> = Vec::new();
         let mut turbine_m: Vec<(f64, f64)> = Vec::new();
@@ -259,25 +277,36 @@ impl ShredIngressPane {
             Dataset::default()
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(COL_DROP).add_modifier(Modifier::BOLD))
                 .data(&drop),
             Dataset::default()
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(COL_ERR).add_modifier(Modifier::BOLD))
                 .data(&err),
         ];
 
         let chart = Chart::new(datasets)
             .x_axis(Axis::default().bounds([0.0, X_MAX]))
             .y_axis(Axis::default().bounds([0.0, 4.0]));
-        frame.render_widget(chart, area);
+        frame.render_widget(chart, chart_area);
 
-        // Lane labels overlaid on the left edge — one per lane.
-        render_lane_label(frame, area, "turbine", Y_TURBINE, COL_TURBINE);
-        render_lane_label(frame, area, "repair", Y_REPAIR, COL_REPAIR);
-        render_lane_label(frame, area, "drop", Y_DROP, COL_BAD);
-        render_lane_label(frame, area, "err", Y_ERR, COL_BAD);
+        // Lane labels in their dedicated column — same row mapping as
+        // the chart uses for particles, so labels sit at the start of
+        // their lane.
+        render_lane_label(
+            frame,
+            label_area,
+            chart_area,
+            "turbine",
+            Y_TURBINE,
+            COL_TURBINE,
+        );
+        render_lane_label(
+            frame, label_area, chart_area, "repair", Y_REPAIR, COL_REPAIR,
+        );
+        render_lane_label(frame, label_area, chart_area, "drop", Y_DROP, COL_DROP);
+        render_lane_label(frame, label_area, chart_area, "err", Y_ERR, COL_ERR);
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -301,7 +330,7 @@ impl ShredIngressPane {
             Span::styled(
                 drop,
                 if self.numbers.drop.unwrap_or(0) > 0 {
-                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                    Style::default().fg(COL_DROP).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
@@ -310,12 +339,18 @@ impl ShredIngressPane {
             Span::styled(
                 err,
                 if self.numbers.err.unwrap_or(0) > 0 {
-                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                    Style::default().fg(COL_ERR).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" err", theme::label_style()),
+            Span::styled(" err  ", theme::label_style()),
+            Span::styled(
+                "·  per-sample (~1/s)",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -327,14 +362,30 @@ fn fmt_opt(v: Option<u64>) -> String {
 
 /// Paint a small label `text` at the left edge of `area` on the row
 /// corresponding to chart-y `y` (chart bounds [0, 4], screen flipped).
-fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64, fg: Color) {
+/// Paint a small lane label inside `label_area`, at the row that
+/// corresponds to chart-y `y_chart` in `chart_area`. The row mapping
+/// quantises the chart's [0, Y_MAX] range across the chart area's
+/// row count so the label and the particles share the same line.
+fn render_lane_label(
+    frame: &mut Frame<'_>,
+    label_area: Rect,
+    chart_area: Rect,
+    text: &str,
+    y_chart: f64,
+    fg: Color,
+) {
     const Y_MAX: f64 = 4.0;
+    if chart_area.height == 0 {
+        return;
+    }
     let clamped = y_chart.clamp(0.0, Y_MAX);
+    // Row index inside the chart area: 0 = top row.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let raw = ((1.0 - clamped / Y_MAX) * f64::from(area.height.saturating_sub(1))) as u16;
-    let y = area.y + raw.min(area.height.saturating_sub(1));
+    let row = (((Y_MAX - clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
+    let row = row.min(chart_area.height.saturating_sub(1));
+    let y = chart_area.y + row;
     let w = text.chars().count() as u16;
-    if w + 1 > area.width {
+    if w + 1 > label_area.width {
         return;
     }
     frame.render_widget(
@@ -342,7 +393,7 @@ fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64
             text.to_owned(),
             Style::default().fg(fg).add_modifier(Modifier::BOLD),
         )),
-        Rect::new(area.x + 1, y, w, 1),
+        Rect::new(label_area.x + 1, y, w, 1),
     );
 }
 

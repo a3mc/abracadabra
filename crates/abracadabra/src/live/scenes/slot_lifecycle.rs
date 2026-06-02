@@ -63,6 +63,16 @@ const COL_WARN: Color = Color::Yellow;
 const COL_BAD: Color = Color::Red;
 const COL_FEC: Color = Color::LightBlue;
 
+/// Width reserved on the left of the pane for lane labels.
+const LABEL_COL_WIDTH: u16 = 9;
+
+/// Glyphs for single-event lanes — chosen to read as discrete events,
+/// not as bars carrying a magnitude. FEC alone carries a per-slot
+/// count (`num_recovered`) so it stays as a small Braille dot stream.
+const GLYPH_FAST: &str = "✓";
+const GLYPH_SLOW: &str = "◆";
+const GLYPH_SKIP: &str = "✗";
+
 /// Rolling window for the snapshot row's percentages. 64 slots ≈ ~25s
 /// of cluster activity at ~2.5 slots/sec; long enough to be stable,
 /// short enough to follow real changes.
@@ -205,10 +215,23 @@ impl Pane for SlotLifecyclePane {
 
 impl SlotLifecyclePane {
     fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut fast: Vec<(f64, f64)> = Vec::new();
-        let mut slow: Vec<(f64, f64)> = Vec::new();
-        let mut skip: Vec<(f64, f64)> = Vec::new();
+        // Horizontal split: labels on the left, particle area on right.
+        if area.width <= LABEL_COL_WIDTH + 8 {
+            return;
+        }
+        let h_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(LABEL_COL_WIDTH), Constraint::Min(8)])
+            .split(area);
+        let label_area = h_chunks[0];
+        let chart_area = h_chunks[1];
+
+        // FEC particles render through a Chart (low-noise Braille) —
+        // they have a per-slot count and read as "density of recovery".
         let mut fec: Vec<(f64, f64)> = Vec::new();
+        // Fast / slow / skip render as discrete glyphs at computed
+        // (x, y) screen positions — each is one event, not a quantity.
+        let mut glyph_events: Vec<(f64, Lane)> = Vec::new();
 
         for p in &self.particles {
             let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
@@ -217,45 +240,45 @@ impl SlotLifecyclePane {
             }
             let x = (age / TRAVERSAL_SECS) * X_MAX;
             match p.lane {
-                Lane::Fast => fast.push((x, Y_FAST)),
-                Lane::Slow => slow.push((x, Y_SLOW)),
-                Lane::Skip => skip.push((x, Y_SKIP)),
                 Lane::Fec => fec.push((x, Y_FEC)),
+                _ => glyph_events.push((x, p.lane)),
             }
         }
 
-        let datasets = vec![
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD))
-                .data(&fast),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_WARN))
-                .data(&slow),
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
-                .data(&skip),
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
-                .data(&fec),
-        ];
-
+        // FEC stream as a Chart (Braille = subtle).
+        let datasets = vec![Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
+            .data(&fec)];
         let chart = Chart::new(datasets)
             .x_axis(Axis::default().bounds([0.0, X_MAX]))
             .y_axis(Axis::default().bounds([0.0, 4.0]));
-        frame.render_widget(chart, area);
+        frame.render_widget(chart, chart_area);
 
-        render_lane_label(frame, area, "fast", Y_FAST, COL_GOOD);
-        render_lane_label(frame, area, "slow", Y_SLOW, COL_WARN);
-        render_lane_label(frame, area, "skip", Y_SKIP, COL_BAD);
-        render_lane_label(frame, area, "fec", Y_FEC, COL_FEC);
+        // Lane labels in the label column.
+        render_lane_label(frame, label_area, chart_area, "fast", Y_FAST, COL_GOOD);
+        render_lane_label(frame, label_area, chart_area, "slow", Y_SLOW, COL_WARN);
+        render_lane_label(frame, label_area, chart_area, "skip", Y_SKIP, COL_BAD);
+        render_lane_label(frame, label_area, chart_area, "fec", Y_FEC, COL_FEC);
+
+        // Discrete glyph events painted as text at chart-derived cells.
+        for (x_chart, lane) in glyph_events {
+            let (glyph, style) = match lane {
+                Lane::Fast => (
+                    GLYPH_FAST,
+                    Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD),
+                ),
+                Lane::Slow => (GLYPH_SLOW, Style::default().fg(COL_WARN)),
+                Lane::Skip => (
+                    GLYPH_SKIP,
+                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD),
+                ),
+                Lane::Fec => continue, // handled by the Chart above
+            };
+            let y_chart = lane_y(lane);
+            render_glyph_at(frame, chart_area, glyph, style, x_chart, y_chart);
+        }
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -291,20 +314,79 @@ impl SlotLifecyclePane {
             ),
             Span::styled(" skip  ", theme::label_style()),
             Span::styled(fec, Style::default().fg(COL_FEC)),
-            Span::styled(" fec/slot", theme::label_style()),
+            Span::styled(" fec (last)  ", theme::label_style()),
+            // Window indicator: the rolling ratios above cover the
+            // last N slots. At Solana's ~400ms target slot time this
+            // is ~25s of recent cluster activity. State the source so
+            // operators don't wonder "over what window?".
+            Span::styled(
+                format!("· last {} slots", self.history.len().min(ROLLING_WINDOW)),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
 }
 
-fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64, fg: Color) {
+/// Map a lane to its chart-y coordinate.
+const fn lane_y(lane: Lane) -> f64 {
+    match lane {
+        Lane::Fast => Y_FAST,
+        Lane::Slow => Y_SLOW,
+        Lane::Skip => Y_SKIP,
+        Lane::Fec => Y_FEC,
+    }
+}
+
+/// Paint a single glyph at the cell corresponding to chart-coords
+/// `(x_chart, y_chart)` inside `chart_area`.
+fn render_glyph_at(
+    frame: &mut Frame<'_>,
+    chart_area: Rect,
+    glyph: &str,
+    style: Style,
+    x_chart: f64,
+    y_chart: f64,
+) {
     const Y_MAX: f64 = 4.0;
+    if chart_area.width == 0 || chart_area.height == 0 {
+        return;
+    }
+    let x_norm = (x_chart / X_MAX).clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let x_off = (x_norm * f64::from(chart_area.width.saturating_sub(1))) as u16;
+    let x = chart_area.x + x_off;
+    let y_clamped = y_chart.clamp(0.0, Y_MAX);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let row = (((Y_MAX - y_clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
+    let y = chart_area.y + row.min(chart_area.height.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Span::styled(glyph.to_owned(), style)),
+        Rect::new(x, y, 1, 1),
+    );
+}
+
+fn render_lane_label(
+    frame: &mut Frame<'_>,
+    label_area: Rect,
+    chart_area: Rect,
+    text: &str,
+    y_chart: f64,
+    fg: Color,
+) {
+    const Y_MAX: f64 = 4.0;
+    if chart_area.height == 0 {
+        return;
+    }
     let clamped = y_chart.clamp(0.0, Y_MAX);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let raw = ((1.0 - clamped / Y_MAX) * f64::from(area.height.saturating_sub(1))) as u16;
-    let y = area.y + raw.min(area.height.saturating_sub(1));
+    let row = (((Y_MAX - clamped) / Y_MAX) * f64::from(chart_area.height)) as u16;
+    let row = row.min(chart_area.height.saturating_sub(1));
+    let y = chart_area.y + row;
     let w = text.chars().count() as u16;
-    if w + 1 > area.width {
+    if w + 1 > label_area.width {
         return;
     }
     frame.render_widget(
@@ -312,7 +394,7 @@ fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64
             text.to_owned(),
             Style::default().fg(fg).add_modifier(Modifier::BOLD),
         )),
-        Rect::new(area.x + 1, y, w, 1),
+        Rect::new(label_area.x + 1, y, w, 1),
     );
 }
 
