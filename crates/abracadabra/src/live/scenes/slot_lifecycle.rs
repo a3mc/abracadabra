@@ -28,10 +28,12 @@ use crate::tui::theme;
 
 pub const PANE_HEIGHT: u16 = 9;
 
-const BUCKET_DURATION: Duration = Duration::from_secs(1);
-const CARD_BUCKETS: u16 = 10;
+const BUCKET_DURATION: Duration = Duration::from_secs(10);
+const LANES_PER_CARD: u16 = 4;
+const CARD_SLOT_WIDTH: u16 = LANES_PER_CARD + 1;
+const CARD_BAR_ROWS: u16 = 4;
 const LABEL_COL_WIDTH: u16 = 9;
-const CARD_DIVIDER: &str = "┊";
+const CARD_DIVIDER: &str = "│";
 
 const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
@@ -53,29 +55,24 @@ enum Lane {
 }
 
 impl Lane {
-    /// Per-lane cap (full bar at this Σ value per 1-s bucket). Caps
-    /// rechosen for the 1-second bucket size and 5× replay tolerance.
-    /// Skip / slow now have non-trivial gradation so 1 event reads as
-    /// a small bar, 4+ saturate (was cap=1 → every event a full bar,
-    /// which hid burst magnitude).
+    /// Cap = Σ value over the 10-second card window at which the bar
+    /// fills the full bar height. Tuned for 5× replay.
     const fn cap(self) -> u32 {
         match self {
-            // ~2.5 slots/s × 1 fast = ~2.5/s real, ~12.5 at 5× replay.
-            // Cap 15 keeps replay near full without clipping.
-            Self::Fast => 15,
-            // Slow finalizations are rare; cap 3 gives clear gradation
-            // for bursts of 1, 2, 3.
-            Self::Slow => 3,
-            // Skip: cap 4 turns "1 skip" into a small bar, "4+" into
-            // a full bar. Operator can read burst size at a glance.
-            Self::Skip => 4,
-            // Per-slot num_recovered ~30 × 2.5 slots/s = ~75/s real,
-            // ~375/s replay. Cap 500 prevents wall-of-full.
-            Self::Fec => 500,
+            // ~25 fast finalizations per 10s real-time, ~125 at 5×.
+            Self::Fast => 150,
+            // Slow rare; cap 5 keeps single events visible, 5 fills.
+            Self::Slow => 5,
+            // Skip rare; same gradation as slow.
+            Self::Skip => 5,
+            // Per-slot num_recovered ~30 × 25 slots = ~750 real-time,
+            // ~3750 at 5×. Cap 4000 prevents wall-of-full.
+            Self::Fec => 4_000,
         }
     }
 
-    const fn row(self) -> u16 {
+    /// Position of this lane within a card (column 0..LANES_PER_CARD).
+    const fn card_col(self) -> u16 {
         match self {
             Self::Fast => 0,
             Self::Slow => 1,
@@ -252,7 +249,7 @@ impl Pane for SlotLifecyclePane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < 6 {
+        if inner.width < 30 || inner.height < CARD_BAR_ROWS + 2 {
             return;
         }
 
@@ -260,7 +257,7 @@ impl Pane for SlotLifecyclePane {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(4),
+                Constraint::Length(CARD_BAR_ROWS),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -273,7 +270,7 @@ impl Pane for SlotLifecyclePane {
 
 impl SlotLifecyclePane {
     fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width <= LABEL_COL_WIDTH + 4 {
+        if area.width <= LABEL_COL_WIDTH + CARD_SLOT_WIDTH {
             return;
         }
         let h_chunks = Layout::default()
@@ -283,10 +280,17 @@ impl SlotLifecyclePane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        for lane in [Lane::Fast, Lane::Slow, Lane::Skip, Lane::Fec] {
-            render_lane_label(frame, label_area, chart_area, lane);
-            render_lane_bars(frame, chart_area, lane, self.lane_ref(lane));
-        }
+        render_legend(frame, label_area);
+        render_card_flow(
+            frame,
+            chart_area,
+            &[
+                (Lane::Fast, self.lane_ref(Lane::Fast)),
+                (Lane::Slow, self.lane_ref(Lane::Slow)),
+                (Lane::Skip, self.lane_ref(Lane::Skip)),
+                (Lane::Fec, self.lane_ref(Lane::Fec)),
+            ],
+        );
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -329,9 +333,10 @@ impl SlotLifecyclePane {
             sep(),
             Span::styled(
                 format!(
-                    "last {} slots · cards {}s",
+                    "last {} slots · card {}s × {} lanes",
                     self.history.len().min(ROLLING_WINDOW),
-                    CARD_BUCKETS as u64 * BUCKET_DURATION.as_secs(),
+                    BUCKET_DURATION.as_secs(),
+                    LANES_PER_CARD,
                 ),
                 Style::default()
                     .fg(Color::DarkGray)
@@ -351,90 +356,114 @@ fn sep() -> Span<'static> {
     )
 }
 
-fn render_lane_label(frame: &mut Frame<'_>, label_area: Rect, chart_area: Rect, lane: Lane) {
-    let row = lane.row();
-    if row >= chart_area.height {
+fn render_legend(frame: &mut Frame<'_>, label_area: Rect) {
+    if label_area.height < CARD_BAR_ROWS || label_area.width < 4 {
         return;
     }
-    let y = chart_area.y + row;
-    let text = lane.label();
-    let w = text.chars().count() as u16;
-    if w + 1 > label_area.width {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            text.to_owned(),
-            Style::default()
-                .fg(lane.colour())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect::new(label_area.x + 1, y, w, 1),
-    );
-}
-
-fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket: &BucketLane) {
-    let row = lane.row();
-    if row >= chart_area.height || chart_area.width == 0 {
-        return;
-    }
-    let y = chart_area.y + row;
-    let cap = lane.cap();
-    let colour = lane.colour();
-    let is_attention = lane.is_attention();
-
-    let card_stride = CARD_BUCKETS + 1;
-    let total_visible_cells = chart_area.width;
-    let rightmost_x = chart_area.x + chart_area.width - 1;
-
-    for cell in 0..total_visible_cells {
-        let position_in_card = cell % card_stride;
-        let x = rightmost_x - cell;
-        if position_in_card == CARD_BUCKETS {
-            let style = Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM);
-            frame.render_widget(
-                Paragraph::new(Span::styled(CARD_DIVIDER.to_owned(), style)),
-                Rect::new(x, y, 1, 1),
-            );
-            continue;
-        }
-        let dividers_crossed = cell / card_stride;
-        let bucket_index_from_right = cell - dividers_crossed;
-        let value = if bucket_index_from_right == 0 {
-            bucket.current
-        } else {
-            let idx = bucket
-                .history
-                .len()
-                .wrapping_sub(bucket_index_from_right as usize);
-            bucket.history.get(idx).copied().unwrap_or(0)
-        };
-        let pixels = fill_level(value, cap);
-        if pixels == 0 {
-            continue;
-        }
-        let glyph = FILL_CHARS[pixels];
-        let modifier = if is_attention {
-            Modifier::BOLD
-        } else {
-            Modifier::DIM
-        };
-        let style = Style::default().fg(colour).add_modifier(modifier);
+    let lanes = [Lane::Fast, Lane::Slow, Lane::Skip, Lane::Fec];
+    for (row, lane) in lanes.iter().enumerate() {
+        let y = label_area.y + row as u16;
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {}", lane.label()),
+                Style::default()
+                    .fg(lane.colour())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ●",
+                Style::default()
+                    .fg(lane.colour())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
         frame.render_widget(
-            Paragraph::new(Span::styled(glyph.to_owned(), style)),
-            Rect::new(x, y, 1, 1),
+            Paragraph::new(line),
+            Rect::new(label_area.x, y, label_area.width, 1),
         );
     }
 }
 
-fn fill_level(value: u32, cap: u32) -> usize {
-    if cap == 0 {
-        return 0;
+type LaneBuckets<'a> = [(Lane, &'a BucketLane); LANES_PER_CARD as usize];
+
+fn render_card_flow(frame: &mut Frame<'_>, chart_area: Rect, lanes: &LaneBuckets<'_>) {
+    if chart_area.width == 0 || chart_area.height < CARD_BAR_ROWS {
+        return;
     }
-    let level = (u64::from(value) * 8 / u64::from(cap)) as usize;
-    level.min(8)
+    let rightmost_x = chart_area.x + chart_area.width - 1;
+    let stride = CARD_SLOT_WIDTH;
+    let n_cards = chart_area.width / stride;
+
+    for card_index in 0..n_cards {
+        let card_right_x = rightmost_x - card_index * stride;
+        let bars_left_x = card_right_x.saturating_sub(LANES_PER_CARD - 1);
+
+        if card_index + 1 < n_cards && bars_left_x > 0 {
+            let div_x = bars_left_x - 1;
+            for row in 0..CARD_BAR_ROWS {
+                let y = chart_area.y + row;
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        CARD_DIVIDER.to_owned(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    Rect::new(div_x, y, 1, 1),
+                );
+            }
+        }
+
+        for (lane, bucket) in lanes {
+            let value = lookup_bucket_value(bucket, card_index as usize);
+            let cap = lane.cap();
+            let col_x = bars_left_x + lane.card_col();
+            render_vertical_bar(frame, col_x, chart_area.y, value, cap, *lane);
+        }
+    }
+}
+
+fn lookup_bucket_value(bucket: &BucketLane, n_back: usize) -> u32 {
+    if n_back == 0 {
+        return bucket.current;
+    }
+    let idx = bucket.history.len().wrapping_sub(n_back);
+    bucket.history.get(idx).copied().unwrap_or(0)
+}
+
+fn render_vertical_bar(
+    frame: &mut Frame<'_>,
+    col_x: u16,
+    top_y: u16,
+    value: u32,
+    cap: u32,
+    lane: Lane,
+) {
+    if cap == 0 {
+        return;
+    }
+    let total_subpixels = u32::from(CARD_BAR_ROWS) * 8;
+    let filled = (u64::from(value) * u64::from(total_subpixels) / u64::from(cap))
+        .min(u64::from(total_subpixels)) as u32;
+    let modifier = if lane.is_attention() {
+        Modifier::BOLD
+    } else {
+        Modifier::DIM
+    };
+    let style = Style::default().fg(lane.colour()).add_modifier(modifier);
+    for row_from_bottom in 0..CARD_BAR_ROWS {
+        let consumed_below = u32::from(row_from_bottom) * 8;
+        let in_this_row = filled.saturating_sub(consumed_below).min(8) as usize;
+        if in_this_row == 0 {
+            continue;
+        }
+        let glyph = FILL_CHARS[in_this_row];
+        let y = top_y + (CARD_BAR_ROWS - 1 - row_from_bottom);
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph.to_owned(), style)),
+            Rect::new(col_x, y, 1, 1),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -519,16 +548,18 @@ mod tests {
 
     #[test]
     fn lane_caps_match_documented_values() {
-        assert_eq!(Lane::Fast.cap(), 15);
-        assert_eq!(Lane::Slow.cap(), 3);
-        assert_eq!(Lane::Skip.cap(), 4);
-        assert_eq!(Lane::Fec.cap(), 500);
+        assert_eq!(Lane::Fast.cap(), 150);
+        assert_eq!(Lane::Slow.cap(), 5);
+        assert_eq!(Lane::Skip.cap(), 5);
+        assert_eq!(Lane::Fec.cap(), 4_000);
     }
 
     #[test]
-    fn fill_level_at_or_past_cap_saturates() {
-        assert_eq!(fill_level(1, 1), 8);
-        assert_eq!(fill_level(100, 1), 8);
+    fn card_col_assignment_unique_per_lane() {
+        assert_eq!(Lane::Fast.card_col(), 0);
+        assert_eq!(Lane::Slow.card_col(), 1);
+        assert_eq!(Lane::Skip.card_col(), 2);
+        assert_eq!(Lane::Fec.card_col(), 3);
     }
 
     #[test]

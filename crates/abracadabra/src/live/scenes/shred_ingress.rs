@@ -40,25 +40,30 @@ use crate::tui::theme;
 
 pub const PANE_HEIGHT: u16 = 9;
 
-/// Duration of one bucket.
+/// Duration of one bucket = one full mini-card.
 ///
-/// One second feels readable: updates once per second (slow enough
-/// to track each change), aligns with most per-sample metric
-/// cadences. With 10 buckets per card (below) each card spans
-/// exactly 10 seconds.
-pub const BUCKET_DURATION: Duration = Duration::from_secs(1);
+/// The current (rightmost) card actively populates as events arrive;
+/// once 10 seconds elapse it "departs" leftward (becomes a static
+/// snapshot) and a fresh empty card starts populating on the right.
+pub const BUCKET_DURATION: Duration = Duration::from_secs(10);
 
-/// Buckets per mini-card. Cards are the larger visual unit: 10
-/// buckets × 1s = 10 seconds per card. Cards are separated by a
-/// dim divider so the operator sees discrete "packets" of time
-/// sliding leftward as new ones populate on the right.
-const CARD_BUCKETS: u16 = 10;
+/// Number of lanes shown side-by-side inside one card.
+const LANES_PER_CARD: u16 = 4;
+
+/// Total width of one card slot in cells, including the gap between
+/// cards. `LANES_PER_CARD` vertical bars + 1 divider column.
+const CARD_SLOT_WIDTH: u16 = LANES_PER_CARD + 1;
+
+/// Bar rows inside each card. Each row holds one terminal cell whose
+/// sub-pixel fill is taken from `FILL_CHARS`. Total levels per bar =
+/// `CARD_BAR_ROWS * 8`.
+const CARD_BAR_ROWS: u16 = 4;
 
 /// Width reserved on the left for lane labels.
 const LABEL_COL_WIDTH: u16 = 9;
 
-/// Divider rendered between cards.
-const CARD_DIVIDER: &str = "┊";
+/// Vertical divider rendered between cards.
+const CARD_DIVIDER: &str = "│";
 
 /// Nine block-fill levels. Index 0 = empty space, 8 = full block.
 /// Unicode lower-block-fill characters give a clean bottom-up bar.
@@ -78,30 +83,28 @@ enum Lane {
 }
 
 impl Lane {
-    /// Predefined per-lane cap (full bar at this Σ value per 1-s
-    /// bucket). Caps were rechosen for the 1-second bucket size and
-    /// to tolerate the 5× replay-log testing path:
+    /// Cap = Σ value over the 10-second card window at which the
+    /// lane's bar fills the full bar height (CARD_BAR_ROWS × 8 = 32
+    /// sub-pixel levels). Tuned for 5× replay-log testing so typical
+    /// activity fills ~30–60 % of the bar and bursts saturate.
     ///
-    /// - Turbine: ~10 shred_fetch batches/s × ~350 sh = ~3500 sh/s
-    ///   at real time; ~17 500 at 5× replay. Cap = 20000 keeps both
-    ///   in the 1–6 px range with no saturation.
-    /// - Repair: ~5 sh per repair fetch, ~0.5 fetches/s = ~2 sh/s
-    ///   real time. 5× replay can reach ~30 sh/s. Cap = 50 gives
-    ///   1 px for typical real-time, ~5 px for replay bursts.
-    /// - Drop: bursts can hit 40 discards/sample × ~1 sample/s =
-    ///   ~40 real, ~200 replay. Cap = 200 prevents wall-of-full.
-    /// - Err: rarer; 1–3 per event × 0–1 events/s. Cap = 10.
+    /// - Turbine: ~3 500 sh/s real-time × 10 s = ~35 000 per card;
+    ///   ~175 000 at 5× replay. Cap = 200 000 prevents saturation.
+    /// - Repair: ~2 sh/s real-time × 10 s = ~20; ~100 replay.
+    ///   Cap = 150 keeps replay bursts visible.
+    /// - Drop: ~40/s replay × 10 = ~400. Cap = 1 000 for headroom.
+    /// - Err: ~1/s × 10 s = ~10. Cap = 50.
     const fn cap(self) -> u32 {
         match self {
-            Self::Turbine => 20_000,
-            Self::Repair => 50,
-            Self::Drop => 200,
-            Self::Err => 10,
+            Self::Turbine => 200_000,
+            Self::Repair => 150,
+            Self::Drop => 1_000,
+            Self::Err => 50,
         }
     }
 
-    /// Lane order from top to bottom of the chart area.
-    const fn row(self) -> u16 {
+    /// Position of this lane within a card (column 0..LANES_PER_CARD).
+    const fn card_col(self) -> u16 {
         match self {
             Self::Turbine => 0,
             Self::Repair => 1,
@@ -279,7 +282,9 @@ impl Pane for ShredIngressPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < 6 {
+        // Need enough height for the 4 bar rows + 1 row breathing
+        // above + 1 snapshot row at bottom.
+        if inner.width < 30 || inner.height < CARD_BAR_ROWS + 2 {
             return;
         }
 
@@ -287,7 +292,7 @@ impl Pane for ShredIngressPane {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(4),
+                Constraint::Length(CARD_BAR_ROWS),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -300,7 +305,7 @@ impl Pane for ShredIngressPane {
 
 impl ShredIngressPane {
     fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width <= LABEL_COL_WIDTH + 4 {
+        if area.width <= LABEL_COL_WIDTH + CARD_SLOT_WIDTH {
             return;
         }
         let h_chunks = Layout::default()
@@ -310,10 +315,17 @@ impl ShredIngressPane {
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        for lane in [Lane::Turbine, Lane::Repair, Lane::Drop, Lane::Err] {
-            render_lane_label(frame, label_area, chart_area, lane);
-            render_lane_bars(frame, chart_area, lane, self.lane_ref(lane));
-        }
+        render_legend(frame, label_area);
+        render_card_flow(
+            frame,
+            chart_area,
+            &[
+                (Lane::Turbine, self.lane_ref(Lane::Turbine)),
+                (Lane::Repair, self.lane_ref(Lane::Repair)),
+                (Lane::Drop, self.lane_ref(Lane::Drop)),
+                (Lane::Err, self.lane_ref(Lane::Err)),
+            ],
+        );
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -358,10 +370,9 @@ impl ShredIngressPane {
             sep(),
             Span::styled(
                 format!(
-                    "cards {}s ({}×{}s)",
-                    CARD_BUCKETS as u64 * BUCKET_DURATION.as_secs(),
-                    CARD_BUCKETS,
-                    BUCKET_DURATION.as_secs()
+                    "card {}s × {} lanes",
+                    BUCKET_DURATION.as_secs(),
+                    LANES_PER_CARD,
                 ),
                 Style::default()
                     .fg(Color::DarkGray)
@@ -385,105 +396,136 @@ fn sep() -> Span<'static> {
     )
 }
 
-fn render_lane_label(frame: &mut Frame<'_>, label_area: Rect, chart_area: Rect, lane: Lane) {
-    let row = lane.row();
-    if row >= chart_area.height {
+/// Paint the legend in the label column: one row per lane showing
+/// `name ●` with the lane's colour, so the operator knows which
+/// vertical bar inside each card maps to which lane.
+fn render_legend(frame: &mut Frame<'_>, label_area: Rect) {
+    if label_area.height < CARD_BAR_ROWS || label_area.width < 4 {
         return;
     }
-    let y = chart_area.y + row;
-    let text = lane.label();
-    let w = text.chars().count() as u16;
-    if w + 1 > label_area.width {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            text.to_owned(),
-            Style::default()
-                .fg(lane.colour())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Rect::new(label_area.x + 1, y, w, 1),
-    );
-}
-
-fn render_lane_bars(frame: &mut Frame<'_>, chart_area: Rect, lane: Lane, bucket: &BucketLane) {
-    let row = lane.row();
-    if row >= chart_area.height || chart_area.width == 0 {
-        return;
-    }
-    let y = chart_area.y + row;
-    let cap = lane.cap();
-    let colour = lane.colour();
-    let is_attention = lane.is_attention();
-
-    // Each card occupies `CARD_BUCKETS` bucket columns followed by one
-    // separator column. The rightmost card holds the in-progress
-    // bucket at its rightmost cell. Older cards drift left, separated
-    // by dim dividers so the visual reads as discrete "packs" of
-    // 10 seconds each.
-    let card_stride = CARD_BUCKETS + 1;
-    let total_visible_cells = chart_area.width;
-    let rightmost_x = chart_area.x + chart_area.width - 1;
-
-    // Walk visible cells from right to left.
-    for cell in 0..total_visible_cells {
-        let position_in_card = cell % card_stride;
-        let x = rightmost_x - cell;
-        if position_in_card == CARD_BUCKETS {
-            // Divider column between cards.
-            let style = Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM);
-            frame.render_widget(
-                Paragraph::new(Span::styled(CARD_DIVIDER.to_owned(), style)),
-                Rect::new(x, y, 1, 1),
-            );
-            continue;
-        }
-        // Map this cell back to a bucket index. Within the rightmost
-        // card, the rightmost cell (cell=0) is the in-progress bucket.
-        // For older cards, subtract the dividers we've crossed.
-        let dividers_crossed = cell / card_stride;
-        let bucket_index_from_right = cell - dividers_crossed;
-        let value = if bucket_index_from_right == 0 {
-            bucket.current
-        } else {
-            let idx = bucket
-                .history
-                .len()
-                .wrapping_sub(bucket_index_from_right as usize);
-            bucket.history.get(idx).copied().unwrap_or(0)
-        };
-        let pixels = fill_level(value, cap);
-        if pixels == 0 {
-            continue;
-        }
-        let glyph = FILL_CHARS[pixels];
-        let modifier = if is_attention {
-            Modifier::BOLD
-        } else {
-            Modifier::DIM
-        };
-        let style = Style::default().fg(colour).add_modifier(modifier);
+    let lanes = [Lane::Turbine, Lane::Repair, Lane::Drop, Lane::Err];
+    for (row, lane) in lanes.iter().enumerate() {
+        let y = label_area.y + row as u16;
+        let label = lane.label();
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {label}"),
+                Style::default()
+                    .fg(lane.colour())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ●",
+                Style::default()
+                    .fg(lane.colour())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
         frame.render_widget(
-            Paragraph::new(Span::styled(glyph.to_owned(), style)),
-            Rect::new(x, y, 1, 1),
+            Paragraph::new(line),
+            Rect::new(label_area.x, y, label_area.width, 1),
         );
     }
 }
 
-/// Map a bucket value to a fill level (0..=8).
-///
-/// `value / cap * 8`, clamped to `[0, 8]`. Values past `cap` saturate
-/// at full bar (`█`) so a heavy burst doesn't disappear into
-/// numerical territory that the visual cannot represent.
-fn fill_level(value: u32, cap: u32) -> usize {
-    if cap == 0 {
-        return 0;
+type LaneBuckets<'a> = [(Lane, &'a BucketLane); LANES_PER_CARD as usize];
+
+/// Paint the card flow. Cards line up right-to-left across the chart
+/// area; each card has LANES_PER_CARD vertical bars (one per lane)
+/// followed by one divider column. The rightmost card is the in-
+/// progress (current) bucket — its bars grow as new events arrive.
+fn render_card_flow(frame: &mut Frame<'_>, chart_area: Rect, lanes: &LaneBuckets<'_>) {
+    if chart_area.width == 0 || chart_area.height < CARD_BAR_ROWS {
+        return;
     }
-    let level = (u64::from(value) * 8 / u64::from(cap)) as usize;
-    level.min(8)
+    let rightmost_x = chart_area.x + chart_area.width - 1;
+    let stride = CARD_SLOT_WIDTH;
+    let n_cards = chart_area.width / stride;
+
+    for card_index in 0..n_cards {
+        // card_index 0 = rightmost (current); higher = older.
+        let card_right_x = rightmost_x - card_index * stride;
+        // The card slot is [card_left_x, card_right_x] where
+        // card_left_x = card_right_x - (LANES_PER_CARD - 1). The
+        // divider column sits at card_left_x - 1.
+        let bars_left_x = card_right_x.saturating_sub(LANES_PER_CARD - 1);
+
+        // Divider column (between THIS card and the OLDER one to its
+        // left). Skip if the older card slot wouldn't exist.
+        if card_index + 1 < n_cards && bars_left_x > 0 {
+            let div_x = bars_left_x - 1;
+            for row in 0..CARD_BAR_ROWS {
+                let y = chart_area.y + row;
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        CARD_DIVIDER.to_owned(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )),
+                    Rect::new(div_x, y, 1, 1),
+                );
+            }
+        }
+
+        // Each lane within the card gets its own column.
+        for (lane, bucket) in lanes {
+            let value = lookup_bucket_value(bucket, card_index as usize);
+            let cap = lane.cap();
+            let col_x = bars_left_x + lane.card_col();
+            render_vertical_bar(frame, col_x, chart_area.y, value, cap, *lane);
+        }
+    }
+}
+
+/// Look up the bucket value `n_back` cards from the present.
+/// `n_back == 0` returns the current (in-progress) bucket;
+/// `n_back == 1` returns the most recently committed bucket; etc.
+fn lookup_bucket_value(bucket: &BucketLane, n_back: usize) -> u32 {
+    if n_back == 0 {
+        return bucket.current;
+    }
+    let idx = bucket.history.len().wrapping_sub(n_back);
+    bucket.history.get(idx).copied().unwrap_or(0)
+}
+
+/// Render one vertical bar at column `col_x`, starting at `top_y`,
+/// spanning [`CARD_BAR_ROWS`] rows. Value/cap is mapped to a total
+/// fill of `CARD_BAR_ROWS × 8` sub-pixels, distributed bottom-up.
+fn render_vertical_bar(
+    frame: &mut Frame<'_>,
+    col_x: u16,
+    top_y: u16,
+    value: u32,
+    cap: u32,
+    lane: Lane,
+) {
+    if cap == 0 {
+        return;
+    }
+    let total_subpixels = u32::from(CARD_BAR_ROWS) * 8;
+    let filled = (u64::from(value) * u64::from(total_subpixels) / u64::from(cap))
+        .min(u64::from(total_subpixels)) as u32;
+    let modifier = if lane.is_attention() {
+        Modifier::BOLD
+    } else {
+        Modifier::DIM
+    };
+    let style = Style::default().fg(lane.colour()).add_modifier(modifier);
+    // Bottom-up: the bottom row of the bar fills first.
+    for row_from_bottom in 0..CARD_BAR_ROWS {
+        let consumed_below = u32::from(row_from_bottom) * 8;
+        let in_this_row = filled.saturating_sub(consumed_below).min(8) as usize;
+        if in_this_row == 0 {
+            continue;
+        }
+        let glyph = FILL_CHARS[in_this_row];
+        let y = top_y + (CARD_BAR_ROWS - 1 - row_from_bottom);
+        frame.render_widget(
+            Paragraph::new(Span::styled(glyph.to_owned(), style)),
+            Rect::new(col_x, y, 1, 1),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -495,29 +537,6 @@ mod tests {
             ts: time::OffsetDateTime::UNIX_EPOCH,
             kind,
         }
-    }
-
-    #[test]
-    fn fill_level_zero_is_empty() {
-        assert_eq!(fill_level(0, 100), 0);
-    }
-
-    #[test]
-    fn fill_level_at_cap_is_full() {
-        assert_eq!(fill_level(100, 100), 8);
-    }
-
-    #[test]
-    fn fill_level_past_cap_saturates() {
-        assert_eq!(fill_level(1000, 100), 8);
-    }
-
-    #[test]
-    fn fill_level_proportional() {
-        // 50 % of 100 → 4 pixels (half block).
-        assert_eq!(fill_level(50, 100), 4);
-        // 25 % → 2 pixels.
-        assert_eq!(fill_level(25, 100), 2);
     }
 
     #[test]
@@ -594,11 +613,17 @@ mod tests {
 
     #[test]
     fn lane_caps_match_documented_values() {
-        // Pins the per-lane caps so a future tweak shows up as a
-        // failing test rather than a silently shifted scale.
-        assert_eq!(Lane::Turbine.cap(), 20_000);
-        assert_eq!(Lane::Repair.cap(), 50);
-        assert_eq!(Lane::Drop.cap(), 200);
-        assert_eq!(Lane::Err.cap(), 10);
+        assert_eq!(Lane::Turbine.cap(), 200_000);
+        assert_eq!(Lane::Repair.cap(), 150);
+        assert_eq!(Lane::Drop.cap(), 1_000);
+        assert_eq!(Lane::Err.cap(), 50);
+    }
+
+    #[test]
+    fn card_col_assignment_unique_per_lane() {
+        assert_eq!(Lane::Turbine.card_col(), 0);
+        assert_eq!(Lane::Repair.card_col(), 1);
+        assert_eq!(Lane::Drop.card_col(), 2);
+        assert_eq!(Lane::Err.card_col(), 3);
     }
 }
