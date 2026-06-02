@@ -1,40 +1,37 @@
-//! Shred ingress strip — mindmap with arrows, variable-size particles,
-//! and semantic colour coding.
+//! Shred streams — multi-lane particle visualization.
 //!
-//! Layout (half-width pane, ~12 rows tall):
+//! Four stacked lanes, each showing one real event source as
+//! particles flowing left → right. Calm = healthy. Yellow / red
+//! particles appearing = look at the snapshot row.
 //!
 //! ```text
-//! ┌─ shred ingress ──────────────────────────┐
-//! │                                          │
-//! │  network ──→  turbine  357 ●● ─┐         │
-//! │                                ├→ verify 877 (8 drop)
-//! │  network ──→  repair     5  · ─┘         │
-//! │                                          │
-//! │              window  771  (3 err)        │
-//! │                  │                       │
-//! │                  ▼                       │
-//! │  blockstore  inserted 601 · 184 FEC · 0 repair
-//! │                                          │
-//! └──────────────────────────────────────────┘
+//! ┌─ shred streams ──────────────────────────────────────┐
+//! │  turbine    ·   ·    · ·   ·    · ·    ·   ·         │  cyan
+//! │  repair         ▪                  ▪                 │  yellow
+//! │  drop                                                │  red (empty when healthy)
+//! │  err                                                 │  red (empty when healthy)
+//! │                                                      │
+//! │  357 shreds  ·  5 repair  ·  0 drop  ·  0 err        │  snapshot row
+//! └──────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Semantic colours (used everywhere — the entire Live tab will adopt
-//! the same palette):
+//! Particle sources:
 //!
-//! - **Turbine flow** — `Color::Cyan`. Cool, steady, normal.
-//! - **Repair flow** — `Color::Yellow`. Warm, attention. Repair means
-//!   "Turbine didn't deliver, we had to ask for it." Small amounts
-//!   are normal; persistent yellow means an upstream issue.
-//! - **FEC recovery** — `Color::LightBlue`. Clever reconstruction.
-//! - **Drops / errors** — `Color::Red`. Bad. Any non-zero is loud.
-//! - **Successful insert** — `Color::Green`. The shred made it home.
+//! - **turbine** — one particle per `ShredFetch` batch. Always-on
+//!   when the cluster is producing. Marker tier by `shred_count`
+//!   (Small/Medium/Large). Cyan.
+//! - **repair** — one particle per `ShredFetchRepair` batch with
+//!   `shred_count > 0`. Bright yellow Block marker; the lane should
+//!   be visibly louder than turbine because repair is operationally
+//!   meaningful.
+//! - **drop** — one particle per `ShredSigverify` sample with
+//!   `num_discards > 0`. Red. Empty stream = no sigverify drops.
+//! - **err** — one particle per `RecvWindowInsert` sample with
+//!   `num_errors > 0`. Red. Empty stream = no window errors.
 //!
-//! Visual differentiation between Turbine and Repair is the central
-//! design point: they used to be mirrored Braille streams, which made
-//! the operational asymmetry invisible. Now Turbine is a calm dense
-//! stream (`Marker::Braille`, dim cyan); Repair is a few prominent
-//! pulses (`Marker::Block`, bright yellow). They look *different*
-//! because they *are* different.
+//! Snapshot row is the *most recent sample value* from each source.
+//! It changes with every datapoint; the streams above show the
+//! *history* so the operator can spot trends and bursts.
 
 use std::time::{Duration, Instant};
 
@@ -50,63 +47,52 @@ use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
 /// Pane row height when laid out by [`crate::live::scenes::SceneEngine`].
-pub const PANE_HEIGHT: u16 = 12;
+pub const PANE_HEIGHT: u16 = 9;
 
-/// Particle lifespan from spawn (left) to blockstore (right) in seconds.
-const TRAVERSAL_SECS: f64 = 2.5;
-
-/// Soft cap on total particles. Excess dropped oldest-first.
-const PARTICLE_CAP: usize = 384;
-
-/// Chart x-axis upper bound. Particle x grows from 0 to this across
-/// the lifespan.
+const TRAVERSAL_SECS: f64 = 3.0;
+const PARTICLE_CAP: usize = 512;
 const X_MAX: f64 = 100.0;
 
-// Semantic palette. Reused by future strips so the whole Live tab
-// reads as one connected mindmap.
+// Lane y-coordinates inside chart bounds [0, 4]. Higher y = higher row
+// in chart coords, which maps to UPPER row on screen.
+const Y_TURBINE: f64 = 3.5;
+const Y_REPAIR: f64 = 2.5;
+const Y_DROP: f64 = 1.5;
+const Y_ERR: f64 = 0.5;
+
+// Semantic palette (shared with [`super::slot_outcomes`]).
 const COL_TURBINE: Color = Color::Cyan;
 const COL_REPAIR: Color = Color::Yellow;
-const COL_FEC: Color = Color::LightBlue;
-const COL_INSERTED: Color = Color::Green;
-const COL_ERROR: Color = Color::Red;
+const COL_BAD: Color = Color::Red;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaneKind {
+enum Lane {
     Turbine,
     Repair,
+    Drop,
+    Err,
 }
 
-/// Particle intensity tier, derived from the source event's count.
-/// Drives marker style and visual emphasis so the operator can tell
-/// "small steady" from "big burst" at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Intensity {
-    /// `< 50` shreds. Single Braille dot. Most common.
     Small,
-    /// `50..=200`. Slightly brighter / larger marker.
     Medium,
-    /// `> 200`. Most prominent. Bursts read as "big payload arrived".
     Large,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Particle {
     spawn_at: Instant,
-    lane: LaneKind,
+    lane: Lane,
     intensity: Intensity,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct LatestNumbers {
     fetch: Option<u64>,
-    repair_fetch: Option<u64>,
-    sigverify_packets: Option<u64>,
-    sigverify_discards: u64,
-    window_received: Option<u64>,
-    window_errors: u64,
-    blockstore_inserted: Option<u64>,
-    blockstore_recovered: u64,
-    blockstore_repair: u64,
+    repair: Option<u64>,
+    drop: Option<u64>,
+    err: Option<u64>,
 }
 
 pub struct ShredIngressPane {
@@ -124,26 +110,22 @@ impl ShredIngressPane {
         }
     }
 
-    const fn classify(shred_count: u64) -> Intensity {
-        match shred_count {
-            0..=49 => Intensity::Small,
-            50..=200 => Intensity::Medium,
+    const fn classify(count: u64) -> Intensity {
+        match count {
+            0..=20 => Intensity::Small,
+            21..=100 => Intensity::Medium,
             _ => Intensity::Large,
         }
     }
 
-    /// Spawn one particle representing this whole batch. Batches are
-    /// already discrete events in the metrics stream; we honour that
-    /// 1:1 instead of fragmenting one batch into many same-frame
-    /// particles. Intensity carries the magnitude visually.
-    fn spawn_batch(&mut self, lane: LaneKind, shred_count: u64) {
+    fn spawn(&mut self, lane: Lane, intensity: Intensity) {
         if self.particles.len() >= PARTICLE_CAP {
             self.particles.remove(0);
         }
         self.particles.push(Particle {
             spawn_at: self.now,
             lane,
-            intensity: Self::classify(shred_count),
+            intensity,
         });
     }
 }
@@ -162,36 +144,25 @@ impl Pane for ShredIngressPane {
         match m {
             MetricEvent::ShredFetch { shred_count } => {
                 self.numbers.fetch = Some(*shred_count);
-                self.spawn_batch(LaneKind::Turbine, *shred_count);
+                self.spawn(Lane::Turbine, Self::classify(*shred_count));
             }
             MetricEvent::ShredFetchRepair { shred_count } => {
-                self.numbers.repair_fetch = Some(*shred_count);
-                self.spawn_batch(LaneKind::Repair, *shred_count);
+                self.numbers.repair = Some(*shred_count);
+                if *shred_count > 0 {
+                    self.spawn(Lane::Repair, Self::classify(*shred_count));
+                }
             }
-            MetricEvent::ShredSigverify {
-                num_packets,
-                num_discards,
-                ..
-            } => {
-                self.numbers.sigverify_packets = Some(*num_packets);
-                self.numbers.sigverify_discards = *num_discards;
+            MetricEvent::ShredSigverify { num_discards, .. } => {
+                self.numbers.drop = Some(*num_discards);
+                if *num_discards > 0 {
+                    self.spawn(Lane::Drop, Self::classify(*num_discards));
+                }
             }
-            MetricEvent::RecvWindowInsert {
-                num_shreds_received,
-                num_errors,
-            } => {
-                self.numbers.window_received = Some(*num_shreds_received);
-                self.numbers.window_errors = *num_errors;
-            }
-            MetricEvent::BlockstoreInsert {
-                num_inserted,
-                num_recovered,
-                num_repair,
-                ..
-            } => {
-                self.numbers.blockstore_inserted = Some(*num_inserted);
-                self.numbers.blockstore_recovered = *num_recovered;
-                self.numbers.blockstore_repair = *num_repair;
+            MetricEvent::RecvWindowInsert { num_errors, .. } => {
+                self.numbers.err = Some(*num_errors);
+                if *num_errors > 0 {
+                    self.spawn(Lane::Err, Self::classify(*num_errors));
+                }
             }
             _ => {}
         }
@@ -207,71 +178,70 @@ impl Pane for ShredIngressPane {
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" shred ingress ")
+            .title(" shred streams ")
             .title_style(theme::title_style())
             .border_style(theme::title_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < 6 {
+        if inner.width < 30 || inner.height < 5 {
             return;
         }
 
-        // Vertical split: chart on top (the particle highway),
-        // mindmap text below.
-        let chart_rows = inner.height.saturating_sub(7).max(2);
+        // Vertical split: streams area (above) + snapshot row (1 row).
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(chart_rows), Constraint::Min(6)])
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
             .split(inner);
 
-        self.render_chart(frame, chunks[0]);
-        self.render_mindmap(frame, chunks[1]);
+        self.render_streams(frame, chunks[0]);
+        self.render_snapshot(frame, chunks[1]);
     }
 }
 
 impl ShredIngressPane {
-    fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Turbine lane sits at y=1.5; Repair lane at y=0.5 — same as
-        // before but the visual treatment now differs strongly.
-        const Y_TURBINE: f64 = 1.5;
-        const Y_REPAIR: f64 = 0.5;
-        const LIFESPAN: f64 = TRAVERSAL_SECS;
-
-        // Partition particles by lane × intensity. Each combination
-        // gets its own dataset so the marker + colour can differ.
-        let mut turbine_small: Vec<(f64, f64)> = Vec::new();
-        let mut turbine_med: Vec<(f64, f64)> = Vec::new();
-        let mut turbine_large: Vec<(f64, f64)> = Vec::new();
-        let mut repair_all: Vec<(f64, f64)> = Vec::new();
+    fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
+        // Partition by (lane × intensity). Bigger intensity = bigger marker.
+        let mut turbine_s: Vec<(f64, f64)> = Vec::new();
+        let mut turbine_m: Vec<(f64, f64)> = Vec::new();
+        let mut turbine_l: Vec<(f64, f64)> = Vec::new();
+        let mut repair: Vec<(f64, f64)> = Vec::new();
+        let mut drop: Vec<(f64, f64)> = Vec::new();
+        let mut err: Vec<(f64, f64)> = Vec::new();
 
         for p in &self.particles {
             let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
-            if age >= LIFESPAN {
+            if age >= TRAVERSAL_SECS {
                 continue;
             }
-            let x = (age / LIFESPAN) * X_MAX;
+            let x = (age / TRAVERSAL_SECS) * X_MAX;
+            let y = match p.lane {
+                Lane::Turbine => Y_TURBINE,
+                Lane::Repair => Y_REPAIR,
+                Lane::Drop => Y_DROP,
+                Lane::Err => Y_ERR,
+            };
             match (p.lane, p.intensity) {
-                (LaneKind::Turbine, Intensity::Small) => turbine_small.push((x, Y_TURBINE)),
-                (LaneKind::Turbine, Intensity::Medium) => turbine_med.push((x, Y_TURBINE)),
-                (LaneKind::Turbine, Intensity::Large) => turbine_large.push((x, Y_TURBINE)),
-                (LaneKind::Repair, _) => repair_all.push((x, Y_REPAIR)),
+                (Lane::Turbine, Intensity::Small) => turbine_s.push((x, y)),
+                (Lane::Turbine, Intensity::Medium) => turbine_m.push((x, y)),
+                (Lane::Turbine, Intensity::Large) => turbine_l.push((x, y)),
+                (Lane::Repair, _) => repair.push((x, y)),
+                (Lane::Drop, _) => drop.push((x, y)),
+                (Lane::Err, _) => err.push((x, y)),
             }
         }
 
         let datasets = vec![
-            // Turbine: Braille for fine motion + DIM for restraint.
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_TURBINE).add_modifier(Modifier::DIM))
-                .data(&turbine_small),
+                .data(&turbine_s),
             Dataset::default()
                 .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_TURBINE))
-                .data(&turbine_med),
-            // Large Turbine bursts: brighter, bold.
+                .data(&turbine_m),
             Dataset::default()
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
@@ -280,100 +250,74 @@ impl ShredIngressPane {
                         .fg(COL_TURBINE)
                         .add_modifier(Modifier::BOLD),
                 )
-                .data(&turbine_large),
-            // Repair: Block marker, bold yellow. Each repair pulse is
-            // visually loud; you can spot one from across the room.
+                .data(&turbine_l),
             Dataset::default()
                 .marker(Marker::Block)
                 .graph_type(GraphType::Scatter)
                 .style(Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD))
-                .data(&repair_all),
+                .data(&repair),
+            Dataset::default()
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
+                .data(&drop),
+            Dataset::default()
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
+                .data(&err),
         ];
 
         let chart = Chart::new(datasets)
             .x_axis(Axis::default().bounds([0.0, X_MAX]))
-            .y_axis(Axis::default().bounds([0.0, 2.0]));
+            .y_axis(Axis::default().bounds([0.0, 4.0]));
         frame.render_widget(chart, area);
+
+        // Lane labels overlaid on the left edge — one per lane.
+        render_lane_label(frame, area, "turbine", Y_TURBINE, COL_TURBINE);
+        render_lane_label(frame, area, "repair", Y_REPAIR, COL_REPAIR);
+        render_lane_label(frame, area, "drop", Y_DROP, COL_BAD);
+        render_lane_label(frame, area, "err", Y_ERR, COL_BAD);
     }
 
-    /// Mindmap-style text block below the particle highway. Boxes
-    /// connected with arrows; each box carries its most recent
-    /// numeric value; colours track the semantic palette.
-    fn render_mindmap(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.height < 5 {
-            return;
-        }
+    fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
+        let fetch = fmt_opt(self.numbers.fetch);
+        let repair = fmt_opt(self.numbers.repair);
+        let drop = fmt_opt(self.numbers.drop);
+        let err = fmt_opt(self.numbers.err);
 
-        let fetch_text = fmt_opt(self.numbers.fetch);
-        let repair_text = fmt_opt(self.numbers.repair_fetch);
-        let verify_text = fmt_opt(self.numbers.sigverify_packets);
-        let window_text = fmt_opt(self.numbers.window_received);
-        let inserted_text = fmt_opt(self.numbers.blockstore_inserted);
-
-        // Lines explicitly laid out so the arrow joins line up.
-        let line1 = Line::from(vec![
-            Span::styled("  turbine  ", theme::label_style()),
-            Span::styled(fetch_text, Style::default().fg(COL_TURBINE)),
-            Span::styled("  ──→ ╮", Style::default().fg(Color::Gray)),
-        ]);
-        let line2 = Line::from(vec![
-            Span::styled("                    ", theme::label_style()),
-            Span::styled("├──→ verify ", Style::default().fg(Color::Gray)),
-            Span::styled(verify_text, Style::default().fg(COL_TURBINE)),
-            discards_span(self.numbers.sigverify_discards),
-        ]);
-        let line3 = Line::from(vec![
-            Span::styled("  repair   ", theme::label_style()),
-            Span::styled(repair_text, Style::default().fg(COL_REPAIR)),
-            Span::styled("  ──→ ╯", Style::default().fg(Color::Gray)),
-        ]);
-        let line4 = Line::from(vec![
-            Span::styled("                              ", theme::label_style()),
-            Span::styled("│", Style::default().fg(Color::Gray)),
-        ]);
-        let line5 = Line::from(vec![
-            Span::styled("              window ", theme::label_style()),
-            Span::styled(window_text, theme::value_style()),
-            errors_span(self.numbers.window_errors),
-            Span::styled("  ←──┘", Style::default().fg(Color::Gray)),
-        ]);
-        let line6 = Line::from(vec![
-            Span::styled("                ", theme::label_style()),
-            Span::styled("▼", Style::default().fg(Color::Gray)),
-        ]);
-        let line7 = Line::from(vec![
-            Span::styled("  blockstore  ", theme::label_style()),
+        let line = Line::from(vec![
+            Span::styled(format!(" {fetch}"), Style::default().fg(COL_TURBINE)),
+            Span::styled(" sh  ", theme::label_style()),
             Span::styled(
-                inserted_text,
-                Style::default()
-                    .fg(COL_INSERTED)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" turbine  ", theme::label_style()),
-            Span::styled(
-                format!("{}", self.numbers.blockstore_recovered),
-                Style::default().fg(COL_FEC),
-            ),
-            Span::styled(" FEC  ", theme::label_style()),
-            Span::styled(
-                format!("{}", self.numbers.blockstore_repair),
-                if self.numbers.blockstore_repair > 0 {
+                repair,
+                if self.numbers.repair.unwrap_or(0) > 0 {
                     Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" repair", theme::label_style()),
+            Span::styled(" rep  ", theme::label_style()),
+            Span::styled(
+                drop,
+                if self.numbers.drop.unwrap_or(0) > 0 {
+                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(" drop  ", theme::label_style()),
+            Span::styled(
+                err,
+                if self.numbers.err.unwrap_or(0) > 0 {
+                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(" err", theme::label_style()),
         ]);
-
-        let lines = [line1, line2, line3, line4, line5, line6, line7];
-        for (i, line) in lines.into_iter().take(area.height as usize).enumerate() {
-            let y = area.y + i as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
-        }
+        frame.render_widget(Paragraph::new(line), area);
     }
 }
 
@@ -381,26 +325,25 @@ fn fmt_opt(v: Option<u64>) -> String {
     v.map_or_else(|| "—".to_owned(), |n| format!("{n}"))
 }
 
-fn discards_span(discards: u64) -> Span<'static> {
-    if discards == 0 {
-        Span::raw("")
-    } else {
-        Span::styled(
-            format!(" · {discards} drop"),
-            Style::default().fg(COL_ERROR).add_modifier(Modifier::BOLD),
-        )
+/// Paint a small label `text` at the left edge of `area` on the row
+/// corresponding to chart-y `y` (chart bounds [0, 4], screen flipped).
+fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64, fg: Color) {
+    const Y_MAX: f64 = 4.0;
+    let clamped = y_chart.clamp(0.0, Y_MAX);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = ((1.0 - clamped / Y_MAX) * f64::from(area.height.saturating_sub(1))) as u16;
+    let y = area.y + raw.min(area.height.saturating_sub(1));
+    let w = text.chars().count() as u16;
+    if w + 1 > area.width {
+        return;
     }
-}
-
-fn errors_span(errors: u64) -> Span<'static> {
-    if errors == 0 {
-        Span::raw("")
-    } else {
-        Span::styled(
-            format!(" · {errors} err"),
-            Style::default().fg(COL_ERROR).add_modifier(Modifier::BOLD),
-        )
-    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_owned(),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x + 1, y, w, 1),
+    );
 }
 
 #[cfg(test)]
@@ -415,33 +358,64 @@ mod tests {
     }
 
     #[test]
-    fn intensity_classifies_by_count() {
-        assert_eq!(ShredIngressPane::classify(10), Intensity::Small);
-        assert_eq!(ShredIngressPane::classify(75), Intensity::Medium);
-        assert_eq!(ShredIngressPane::classify(500), Intensity::Large);
-    }
-
-    #[test]
-    fn shred_fetch_spawns_one_particle_per_batch() {
+    fn turbine_lane_fires_on_every_fetch() {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
             shred_count: 100,
         })));
-        // ONE particle per batch (we no longer fragment), intensity Medium.
         assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, LaneKind::Turbine);
-        assert_eq!(p.particles[0].intensity, Intensity::Medium);
+        assert_eq!(p.particles[0].lane, Lane::Turbine);
+        assert_eq!(p.numbers.fetch, Some(100));
     }
 
     #[test]
-    fn shred_fetch_repair_spawns_repair_particle() {
+    fn repair_lane_only_fires_when_count_nonzero() {
         let mut p = ShredIngressPane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
+            shred_count: 0,
+        })));
+        assert!(p.particles.is_empty());
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
             shred_count: 5,
         })));
         assert_eq!(p.particles.len(), 1);
-        assert_eq!(p.particles[0].lane, LaneKind::Repair);
-        assert_eq!(p.numbers.repair_fetch, Some(5));
+        assert_eq!(p.particles[0].lane, Lane::Repair);
+    }
+
+    #[test]
+    fn drop_lane_only_fires_when_discards_nonzero() {
+        let mut p = ShredIngressPane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredSigverify {
+            num_packets: 100,
+            num_discards: 0,
+            num_duplicates: 0,
+            elapsed_micros: 1,
+        })));
+        assert!(p.particles.is_empty());
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredSigverify {
+            num_packets: 100,
+            num_discards: 8,
+            num_duplicates: 0,
+            elapsed_micros: 1,
+        })));
+        assert_eq!(p.particles.len(), 1);
+        assert_eq!(p.particles[0].lane, Lane::Drop);
+    }
+
+    #[test]
+    fn err_lane_only_fires_when_errors_nonzero() {
+        let mut p = ShredIngressPane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::RecvWindowInsert {
+            num_shreds_received: 100,
+            num_errors: 0,
+        })));
+        assert!(p.particles.is_empty());
+        p.on_event(&mk(EventKind::Metric(MetricEvent::RecvWindowInsert {
+            num_shreds_received: 100,
+            num_errors: 3,
+        })));
+        assert_eq!(p.particles.len(), 1);
+        assert_eq!(p.particles[0].lane, Lane::Err);
     }
 
     #[test]
@@ -461,31 +435,10 @@ mod tests {
     }
 
     #[test]
-    fn blockstore_insert_partition_recorded() {
-        let mut p = ShredIngressPane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::BlockstoreInsert {
-            num_shreds: 771,
-            num_inserted: 601,
-            num_repair: 12,
-            num_recovered: 184,
-            total_elapsed_us: 11_832,
-        })));
-        assert_eq!(p.numbers.blockstore_inserted, Some(601));
-        assert_eq!(p.numbers.blockstore_repair, 12);
-        assert_eq!(p.numbers.blockstore_recovered, 184);
-    }
-
-    #[test]
-    fn discards_span_empty_when_zero() {
-        let s = discards_span(0);
-        assert!(s.content.is_empty());
-    }
-
-    #[test]
-    fn discards_span_loud_when_nonzero() {
-        let s = discards_span(8);
-        assert!(s.content.contains("8 drop"));
-        assert_eq!(s.style.fg, Some(COL_ERROR));
+    fn intensity_tiering() {
+        assert_eq!(ShredIngressPane::classify(5), Intensity::Small);
+        assert_eq!(ShredIngressPane::classify(50), Intensity::Medium);
+        assert_eq!(ShredIngressPane::classify(500), Intensity::Large);
     }
 
     #[test]
@@ -493,16 +446,5 @@ mod tests {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::FirstShred { slot: 1 }));
         assert!(p.particles.is_empty());
-    }
-
-    #[test]
-    fn particle_cap_evicts_oldest() {
-        let mut p = ShredIngressPane::new();
-        for _ in 0..(PARTICLE_CAP + 10) {
-            p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
-                shred_count: 10,
-            })));
-        }
-        assert!(p.particles.len() <= PARTICLE_CAP);
     }
 }

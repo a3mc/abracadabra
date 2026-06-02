@@ -1,140 +1,144 @@
-//! Slot lifecycle strip — cards drifting horizontally.
+//! Slot outcomes — multi-lane stream of finalization events.
 //!
-//! Layout (half-width pane, ~12 rows tall):
+//! Replaces the previous card-flow design. Every visible glyph is one
+//! real event:
 //!
 //! ```text
-//! ┌─ recent slots ─────────────────────────────────────┐
-//! │                                                    │
-//! │   ┌─ 2070551 ─┐  ┌─ 2070552 ─┐  ┌─ 2070553 ─┐      │
-//! │   │ 137ms  ⚡ │  │  92ms  ⚡ │  │ 144ms  ⚡ │      │
-//! │   │ 96 shr    │  │ 94 shr    │  │ 95 shr    │      │
-//! │   │ ▰▰▰▰▰▰▰░░│  │ ▰▰▰▰▰░░░░│  │ ▰▰▰▰▰▰░░░│      │
-//! │   │ T96 R0 F44│  │ T72 R0 F22│  │ T51 R0 F44│      │
-//! │   └───────────┘  └───────────┘  └───────────┘      │
-//! │                                                    │
-//! │           ←  newer slots push from the right       │
-//! └────────────────────────────────────────────────────┘
+//! ┌─ slot outcomes ─────────────────────────────────────┐
+//! │  fast final  ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓                      │  bright green
+//! │  slow final         ◇                ◇              │  yellow
+//! │  skip                                               │  red (empty when healthy)
+//! │  fec recov    ◆  ◆  ◆  ◆  ◆  ◆                      │  light blue
+//! │                                                     │
+//! │  fast 96%  ·  slow 4%  ·  skip 0  ·  fec/slot 22    │  snapshot row
+//! └─────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Each card shows ONE finalized slot. New cards spawn on the right;
-//! existing cards drift left as new ones push in; cards exit off the
-//! left edge after ~30s. Visible card count adapts to the pane width
-//! (roughly `width / 16`).
+//! Event sources:
 //!
-//! Data per card:
+//! - **fast final** — one particle per `Finalized { fast: true }`
+//!   from votor. Bright green. Calm steady = healthy.
+//! - **slow final** — one particle per `Finalized { fast: false }`.
+//!   Yellow. Slow path is normal but worth flagging when it spikes.
+//! - **skip** — one particle per `VotingSkip { slot }` from votor.
+//!   Red X. Empty stream when healthy; any glyph is operationally
+//!   meaningful (we voted skip on a slot).
+//! - **fec recov** — one particle per `ShredInsertIsFull` with
+//!   `num_recovered > 0`. Light blue diamond. Steady stream = FEC
+//!   doing its job; the higher the count per slot, the more clever
+//!   recovery is saving us from needing repair.
 //!
-//! - `<slot>` — the slot number.
-//! - `<total>ms` — `first_shred_us + vote_notarize_us + finalized_us`
-//!   from `event_handler_slot_tracking`, divided by 1000.
-//! - `⚡` if `is_fast_finalization == true` (NotarizeFast path);
-//!   blank otherwise (slow Notarize+Finalize path).
-//! - `N shr` — total shred count for the slot (`last_index + 1`
-//!   from `shred_insert_is_full`).
-//! - T/R/F bar — proportional split of shreds by source:
-//!   - `T` (Turbine, green) = inserted shreds (this is what we want
-//!     to see fill the bar)
-//!   - `R` (Repair, yellow) = `num_repaired` (any yellow = upstream
-//!     Turbine had gaps for this slot)
-//!   - `F` (FEC, light blue) = `num_recovered` (clever reconstruction)
+//! Snapshot row carries rolling totals (last N seen) so the operator
+//! reads both the stream history (recent flow) and the cumulative
+//! state (current ratios).
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use ratatui::Frame;
 
 use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
-/// Pane row height when laid out by [`crate::live::scenes::SceneEngine`].
-pub const PANE_HEIGHT: u16 = 12;
+pub const PANE_HEIGHT: u16 = 9;
 
-/// Cell width of one card (incl. its borders). 13 inner + 2 borders = 15
-/// reads as ~3 cards on a 50-col half-width pane.
-const CARD_WIDTH: u16 = 15;
+const TRAVERSAL_SECS: f64 = 3.0;
+const PARTICLE_CAP: usize = 512;
+const X_MAX: f64 = 100.0;
 
-/// Horizontal gap between cards.
-const CARD_GAP: u16 = 1;
+// Lane y-coordinates inside chart bounds [0, 4].
+const Y_FAST: f64 = 3.5;
+const Y_SLOW: f64 = 2.5;
+const Y_SKIP: f64 = 1.5;
+const Y_FEC: f64 = 0.5;
 
-/// How long a card stays visible after the slot's data lands. Old cards
-/// drift left and exit off the left edge.
-const CARD_LIFESPAN: Duration = Duration::from_secs(30);
-
-/// Cells per second the cards drift leftward.
-const DRIFT_CELLS_PER_SEC: f64 = 1.0;
-
-/// Maximum slots we track in `slots`. Older entries evict regardless of
-/// readiness so growth is bounded even if one metric never arrives.
-const MAX_TRACKED: usize = 64;
-
-// Semantic palette — shared with [`crate::live::scenes::shred_ingress`].
-// Turbine colour is exported via the bar's "T" label which is the
-// `inserted` count (everything that wasn't repair or FEC came via
-// Turbine, by construction).
-const COL_REPAIR: Color = Color::Yellow;
+const COL_GOOD: Color = Color::Green;
+const COL_WARN: Color = Color::Yellow;
+const COL_BAD: Color = Color::Red;
 const COL_FEC: Color = Color::LightBlue;
-const COL_INSERTED: Color = Color::Green;
 
-#[derive(Debug, Default, Clone, Copy)]
-struct SlotRow {
-    tracking: Option<Tracking>,
-    insert_full: Option<InsertFull>,
-    ready_at: Option<Instant>,
+/// Rolling window for the snapshot row's percentages. 64 slots ≈ ~25s
+/// of cluster activity at ~2.5 slots/sec; long enough to be stable,
+/// short enough to follow real changes.
+const ROLLING_WINDOW: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Fast,
+    Slow,
+    Skip,
+    Fec,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Tracking {
-    first_shred_us: u64,
-    vote_notarize_us: u64,
-    finalized_us: u64,
-    is_fast_finalization: bool,
+struct Particle {
+    spawn_at: Instant,
+    lane: Lane,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct InsertFull {
-    last_index: u64,
-    num_repaired: u64,
-    num_recovered: u64,
-}
-
-impl SlotRow {
-    const fn is_ready(&self) -> bool {
-        self.tracking.is_some() && self.insert_full.is_some()
-    }
+/// One slot's outcome category, recorded in the rolling history for
+/// the snapshot ratios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Fast,
+    Slow,
+    Skip,
 }
 
 pub struct SlotLifecyclePane {
-    /// All currently-tracked slots, ordered by slot number. Capped at
-    /// [`MAX_TRACKED`] to bound growth.
-    slots: BTreeMap<u64, SlotRow>,
+    particles: Vec<Particle>,
+    /// Most recent outcome per slot, used to compute the snapshot
+    /// percentages. Capped at [`ROLLING_WINDOW`].
+    history: VecDeque<Outcome>,
+    /// Last seen `num_recovered` per slot — surfaces in the snapshot
+    /// row as `fec/slot` so the operator sees per-slot FEC intensity.
+    last_fec_per_slot: Option<u64>,
     now: Instant,
 }
 
 impl SlotLifecyclePane {
     pub fn new() -> Self {
         Self {
-            slots: BTreeMap::new(),
+            particles: Vec::new(),
+            history: VecDeque::with_capacity(ROLLING_WINDOW),
+            last_fec_per_slot: None,
             now: Instant::now(),
         }
     }
 
-    const fn ready_now_if_needed(row: &mut SlotRow, now: Instant) {
-        if row.is_ready() && row.ready_at.is_none() {
-            row.ready_at = Some(now);
+    fn spawn(&mut self, lane: Lane) {
+        if self.particles.len() >= PARTICLE_CAP {
+            self.particles.remove(0);
         }
+        self.particles.push(Particle {
+            spawn_at: self.now,
+            lane,
+        });
     }
 
-    fn evict_old(&mut self) {
-        while self.slots.len() > MAX_TRACKED {
-            let Some((&oldest, _)) = self.slots.iter().next() else {
-                break;
-            };
-            self.slots.remove(&oldest);
+    fn record_outcome(&mut self, o: Outcome) {
+        if self.history.len() == ROLLING_WINDOW {
+            self.history.pop_front();
         }
+        self.history.push_back(o);
+    }
+
+    fn ratio_pct(&self, want: Outcome) -> u64 {
+        if self.history.is_empty() {
+            return 0;
+        }
+        let hits = self.history.iter().filter(|o| **o == want).count();
+        (hits as u64 * 100) / self.history.len() as u64
+    }
+
+    fn skip_count(&self) -> u64 {
+        self.history.iter().filter(|o| **o == Outcome::Skip).count() as u64
     }
 }
 
@@ -146,42 +150,24 @@ impl Default for SlotLifecyclePane {
 
 impl Pane for SlotLifecyclePane {
     fn on_event(&mut self, ev: &Event) {
-        let EventKind::Metric(m) = &ev.kind else {
-            return;
-        };
-        match m {
-            MetricEvent::SlotTracking {
-                slot,
-                first_shred_us,
-                vote_notarize_us,
-                finalized_us,
-                is_fast_finalization,
-            } => {
-                let row = self.slots.entry(*slot).or_default();
-                row.tracking = Some(Tracking {
-                    first_shred_us: *first_shred_us,
-                    vote_notarize_us: *vote_notarize_us,
-                    finalized_us: *finalized_us,
-                    is_fast_finalization: *is_fast_finalization,
-                });
-                Self::ready_now_if_needed(row, self.now);
-                self.evict_old();
+        match &ev.kind {
+            EventKind::Finalized { fast: true, .. } => {
+                self.spawn(Lane::Fast);
+                self.record_outcome(Outcome::Fast);
             }
-            MetricEvent::ShredInsertIsFull {
-                slot,
-                last_index,
-                num_repaired,
-                num_recovered,
-                ..
-            } => {
-                let row = self.slots.entry(*slot).or_default();
-                row.insert_full = Some(InsertFull {
-                    last_index: *last_index,
-                    num_repaired: *num_repaired,
-                    num_recovered: *num_recovered,
-                });
-                Self::ready_now_if_needed(row, self.now);
-                self.evict_old();
+            EventKind::Finalized { fast: false, .. } => {
+                self.spawn(Lane::Slow);
+                self.record_outcome(Outcome::Slow);
+            }
+            EventKind::VotingSkip { .. } => {
+                self.spawn(Lane::Skip);
+                self.record_outcome(Outcome::Skip);
+            }
+            EventKind::Metric(MetricEvent::ShredInsertIsFull { num_recovered, .. })
+                if *num_recovered > 0 =>
+            {
+                self.spawn(Lane::Fec);
+                self.last_fec_per_slot = Some(*num_recovered);
             }
             _ => {}
         }
@@ -189,224 +175,145 @@ impl Pane for SlotLifecyclePane {
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
-        // Drop cards whose ready_at is older than CARD_LIFESPAN; they
-        // have already drifted off the visible area.
-        self.slots.retain(|_, r| {
-            r.ready_at
-                .is_none_or(|t| now.saturating_duration_since(t) < CARD_LIFESPAN)
-        });
+        let lifetime = Duration::from_secs_f64(TRAVERSAL_SECS);
+        self.particles
+            .retain(|p| now.saturating_duration_since(p.spawn_at) < lifetime);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" recent slots · ←  newer push from right ")
+            .title(" slot outcomes ")
             .title_style(theme::title_style())
             .border_style(theme::title_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < CARD_WIDTH + 4 || inner.height < 6 {
+        if inner.width < 30 || inner.height < 5 {
             return;
         }
 
-        // Compute card positions: newest card hugs the right inner
-        // edge; each older card sits CARD_WIDTH + CARD_GAP to its left,
-        // shifted further left by its drift age * DRIFT_CELLS_PER_SEC.
-        let visible: Vec<(u64, SlotRow, Instant)> = self
-            .slots
-            .iter()
-            .filter_map(|(&s, r)| r.ready_at.map(|t| (s, *r, t)))
-            .collect();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(inner);
 
-        // Sort newest first by ready_at.
-        let mut sorted = visible;
-        sorted.sort_by_key(|x| std::cmp::Reverse(x.2));
-
-        for (rank, (slot, row, ready_at)) in sorted.iter().enumerate() {
-            let age_secs = self.now.saturating_duration_since(*ready_at).as_secs_f64();
-            let drift = (age_secs * DRIFT_CELLS_PER_SEC) as u16;
-            let stride = CARD_WIDTH + CARD_GAP;
-            #[allow(clippy::cast_possible_truncation)]
-            let rank_u16 = rank as u16;
-            // Position from the right: rightmost card at inner.right - CARD_WIDTH.
-            let from_right = stride.saturating_mul(rank_u16).saturating_add(drift);
-            if from_right + CARD_WIDTH > inner.width {
-                break; // ran off the left edge
-            }
-            let x = inner.x + inner.width - CARD_WIDTH - from_right;
-            let y = inner.y;
-            if y + 6 > inner.y + inner.height {
-                break;
-            }
-            render_card(frame, Rect::new(x, y, CARD_WIDTH, 6), *slot, row);
-        }
-
-        // Caption row.
-        let cap_y = inner.y + inner.height.saturating_sub(1);
-        let caption = "  T=turbine · R=repair · F=fec";
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                caption,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            )),
-            Rect::new(inner.x, cap_y, inner.width, 1),
-        );
+        self.render_streams(frame, chunks[0]);
+        self.render_snapshot(frame, chunks[1]);
     }
 }
 
-/// Render one slot card at `rect` (assumes 15 wide × 6 tall).
-fn render_card(frame: &mut Frame<'_>, rect: Rect, slot: u64, row: &SlotRow) {
-    let (Some(tracking), Some(insert_full)) = (row.tracking, row.insert_full) else {
-        return;
-    };
+impl SlotLifecyclePane {
+    fn render_streams(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut fast: Vec<(f64, f64)> = Vec::new();
+        let mut slow: Vec<(f64, f64)> = Vec::new();
+        let mut skip: Vec<(f64, f64)> = Vec::new();
+        let mut fec: Vec<(f64, f64)> = Vec::new();
 
-    let total_us = tracking
-        .first_shred_us
-        .saturating_add(tracking.vote_notarize_us)
-        .saturating_add(tracking.finalized_us);
-    let total_ms = total_us / 1000;
+        for p in &self.particles {
+            let age = self.now.saturating_duration_since(p.spawn_at).as_secs_f64();
+            if age >= TRAVERSAL_SECS {
+                continue;
+            }
+            let x = (age / TRAVERSAL_SECS) * X_MAX;
+            match p.lane {
+                Lane::Fast => fast.push((x, Y_FAST)),
+                Lane::Slow => slow.push((x, Y_SLOW)),
+                Lane::Skip => skip.push((x, Y_SKIP)),
+                Lane::Fec => fec.push((x, Y_FEC)),
+            }
+        }
 
-    let total_shreds = insert_full.last_index.saturating_add(1);
-    let inserted = total_shreds
-        .saturating_sub(insert_full.num_repaired)
-        .saturating_sub(insert_full.num_recovered);
+        let datasets = vec![
+            Dataset::default()
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD))
+                .data(&fast),
+            Dataset::default()
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_WARN))
+                .data(&slow),
+            Dataset::default()
+                .marker(Marker::Block)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD))
+                .data(&skip),
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(COL_FEC).add_modifier(Modifier::DIM))
+                .data(&fec),
+        ];
 
-    let bar = trf_bar(
-        inserted,
-        insert_full.num_repaired,
-        insert_full.num_recovered,
-        11,
-    );
+        let chart = Chart::new(datasets)
+            .x_axis(Axis::default().bounds([0.0, X_MAX]))
+            .y_axis(Axis::default().bounds([0.0, 4.0]));
+        frame.render_widget(chart, area);
 
-    // Border style: warmer (yellow) when repair is non-zero so the
-    // card pulls the operator's eye to itself.
-    let border_style = if insert_full.num_repaired > 0 {
-        Style::default().fg(COL_REPAIR)
-    } else if tracking.is_fast_finalization {
-        Style::default().fg(COL_INSERTED)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {slot} "))
-        .title_style(theme::title_style())
-        .border_style(border_style);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    // Row 1: total ms + fast flag
-    let ms_line = Line::from(vec![
-        Span::styled(
-            format!(" {total_ms:>4}ms"),
-            theme::value_style().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if tracking.is_fast_finalization {
-                "  ⚡"
-            } else {
-                "    "
-            },
-            Style::default()
-                .fg(if tracking.is_fast_finalization {
-                    COL_INSERTED
-                } else {
-                    Color::DarkGray
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    if inner.height > 0 {
-        frame.render_widget(
-            Paragraph::new(ms_line),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
+        render_lane_label(frame, area, "fast", Y_FAST, COL_GOOD);
+        render_lane_label(frame, area, "slow", Y_SLOW, COL_WARN);
+        render_lane_label(frame, area, "skip", Y_SKIP, COL_BAD);
+        render_lane_label(frame, area, "fec", Y_FEC, COL_FEC);
     }
 
-    // Row 2: total shreds
-    if inner.height > 1 {
+    fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
+        let fast_pct = self.ratio_pct(Outcome::Fast);
+        let slow_pct = self.ratio_pct(Outcome::Slow);
+        let skips = self.skip_count();
+        let fec = self
+            .last_fec_per_slot
+            .map_or_else(|| "—".to_owned(), |n| format!("{n}"));
+
         let line = Line::from(vec![
-            Span::styled(" ", theme::label_style()),
-            Span::styled(format!("{total_shreds}"), theme::value_style()),
-            Span::styled(" shreds", theme::label_style()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
-        );
-    }
-
-    // Row 3: T/R/F bar
-    if inner.height > 2 {
-        frame.render_widget(
-            Paragraph::new(Line::from(bar)),
-            Rect::new(inner.x, inner.y + 2, inner.width, 1),
-        );
-    }
-
-    // Row 4: T/R/F numerics
-    if inner.height > 3 {
-        let line = Line::from(vec![
-            Span::styled(" T", Style::default().fg(COL_INSERTED)),
             Span::styled(
-                format!("{inserted}"),
-                Style::default()
-                    .fg(COL_INSERTED)
-                    .add_modifier(Modifier::BOLD),
+                format!(" {fast_pct}%"),
+                Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" R", Style::default().fg(COL_REPAIR)),
+            Span::styled(" fast  ", theme::label_style()),
             Span::styled(
-                format!("{}", insert_full.num_repaired),
-                if insert_full.num_repaired > 0 {
-                    Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD)
+                format!("{slow_pct}%"),
+                if slow_pct > 0 {
+                    Style::default().fg(COL_WARN)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" F", Style::default().fg(COL_FEC)),
+            Span::styled(" slow  ", theme::label_style()),
             Span::styled(
-                format!("{}", insert_full.num_recovered),
-                Style::default().fg(COL_FEC),
+                format!("{skips}"),
+                if skips > 0 {
+                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
             ),
+            Span::styled(" skip  ", theme::label_style()),
+            Span::styled(fec, Style::default().fg(COL_FEC)),
+            Span::styled(" fec/slot", theme::label_style()),
         ]);
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(inner.x, inner.y + 3, inner.width, 1),
-        );
+        frame.render_widget(Paragraph::new(line), area);
     }
 }
 
-/// Build the T/R/F partition bar as a `Vec<Span>` so each segment
-/// carries its own colour. Total cells fixed at `cells`. Segments are
-/// proportional to their share of `t + r + f`.
-fn trf_bar(t: u64, r: u64, f: u64, cells: u64) -> Vec<Span<'static>> {
-    let total = t.saturating_add(r).saturating_add(f).max(1);
-    let t_cells = t.saturating_mul(cells) / total;
-    let r_cells = r.saturating_mul(cells) / total;
-    let f_cells = cells.saturating_sub(t_cells).saturating_sub(r_cells);
-    let mut spans = Vec::with_capacity(4);
-    if t_cells > 0 {
-        spans.push(Span::styled(
-            "▰".repeat(t_cells as usize),
-            Style::default().fg(COL_INSERTED),
-        ));
+fn render_lane_label(frame: &mut Frame<'_>, area: Rect, text: &str, y_chart: f64, fg: Color) {
+    const Y_MAX: f64 = 4.0;
+    let clamped = y_chart.clamp(0.0, Y_MAX);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = ((1.0 - clamped / Y_MAX) * f64::from(area.height.saturating_sub(1))) as u16;
+    let y = area.y + raw.min(area.height.saturating_sub(1));
+    let w = text.chars().count() as u16;
+    if w + 1 > area.width {
+        return;
     }
-    if r_cells > 0 {
-        spans.push(Span::styled(
-            "▰".repeat(r_cells as usize),
-            Style::default().fg(COL_REPAIR).add_modifier(Modifier::BOLD),
-        ));
-    }
-    if f_cells > 0 {
-        spans.push(Span::styled(
-            "▰".repeat(f_cells as usize),
-            Style::default().fg(COL_FEC),
-        ));
-    }
-    spans
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_owned(),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        )),
+        Rect::new(area.x + 1, y, w, 1),
+    );
 }
 
 #[cfg(test)]
@@ -421,96 +328,109 @@ mod tests {
     }
 
     #[test]
-    fn slot_becomes_ready_when_both_metrics_arrive() {
+    fn fast_finalize_spawns_fast_lane() {
         let mut p = SlotLifecyclePane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
+        p.on_event(&mk(EventKind::Finalized {
             slot: 1,
-            first_shred_us: 100,
-            vote_notarize_us: 200,
-            finalized_us: 300,
-            is_fast_finalization: true,
-        })));
-        assert!(p.slots.get(&1).unwrap().ready_at.is_none());
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 1,
-            total_time_ms: 5,
-            last_index: 50,
-            num_repaired: 0,
-            num_recovered: 5,
-        })));
-        assert!(p.slots.get(&1).unwrap().ready_at.is_some());
+            hash: "h".into(),
+            fast: true,
+        }));
+        assert_eq!(p.particles.len(), 1);
+        assert_eq!(p.particles[0].lane, Lane::Fast);
+        assert_eq!(p.history.back(), Some(&Outcome::Fast));
     }
 
     #[test]
-    fn order_independent_join() {
+    fn slow_finalize_spawns_slow_lane() {
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 1,
+            hash: "h".into(),
+            fast: false,
+        }));
+        assert_eq!(p.particles[0].lane, Lane::Slow);
+        assert_eq!(p.history.back(), Some(&Outcome::Slow));
+    }
+
+    #[test]
+    fn voting_skip_spawns_skip_lane() {
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::VotingSkip { slot: 1 }));
+        assert_eq!(p.particles[0].lane, Lane::Skip);
+        assert_eq!(p.history.back(), Some(&Outcome::Skip));
+    }
+
+    #[test]
+    fn shred_insert_is_full_with_recovery_spawns_fec_lane() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 2,
-            total_time_ms: 5,
-            last_index: 50,
-            num_repaired: 1,
+            slot: 1,
+            total_time_ms: 10,
+            last_index: 100,
+            num_repaired: 0,
+            num_recovered: 44,
+        })));
+        assert_eq!(p.particles.len(), 1);
+        assert_eq!(p.particles[0].lane, Lane::Fec);
+        assert_eq!(p.last_fec_per_slot, Some(44));
+    }
+
+    #[test]
+    fn shred_insert_is_full_with_zero_recovery_does_not_spawn() {
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
+            slot: 1,
+            total_time_ms: 10,
+            last_index: 100,
+            num_repaired: 0,
             num_recovered: 0,
         })));
-        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
-            slot: 2,
-            first_shred_us: 1,
-            vote_notarize_us: 2,
-            finalized_us: 3,
-            is_fast_finalization: false,
-        })));
-        assert!(p.slots.get(&2).unwrap().ready_at.is_some());
+        assert!(p.particles.is_empty());
     }
 
     #[test]
-    fn lifespan_drops_old_cards_on_tick() {
+    fn rolling_window_caps_history() {
         let mut p = SlotLifecyclePane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
-            slot: 3,
-            first_shred_us: 1,
-            vote_notarize_us: 1,
-            finalized_us: 1,
-            is_fast_finalization: false,
-        })));
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredInsertIsFull {
-            slot: 3,
-            total_time_ms: 1,
-            last_index: 1,
-            num_repaired: 0,
-            num_recovered: 0,
-        })));
-        // Backdate ready_at past CARD_LIFESPAN.
-        let row = p.slots.get_mut(&3).unwrap();
-        row.ready_at = Instant::now().checked_sub(CARD_LIFESPAN + Duration::from_secs(1));
-        p.tick(Instant::now());
-        assert!(!p.slots.contains_key(&3));
-    }
-
-    #[test]
-    fn trf_bar_segments_sum_to_cells() {
-        let spans = trf_bar(10, 0, 5, 10);
-        let total_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(total_chars, 10);
-    }
-
-    #[test]
-    fn trf_bar_handles_zeros() {
-        let spans = trf_bar(0, 0, 0, 10);
-        let total_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(total_chars, 10);
-    }
-
-    #[test]
-    fn tracked_count_capped() {
-        let mut p = SlotLifecyclePane::new();
-        for s in 0..(MAX_TRACKED * 3) as u64 {
-            p.on_event(&mk(EventKind::Metric(MetricEvent::SlotTracking {
-                slot: s,
-                first_shred_us: 1,
-                vote_notarize_us: 1,
-                finalized_us: 1,
-                is_fast_finalization: false,
-            })));
+        for _ in 0..(ROLLING_WINDOW * 3) {
+            p.on_event(&mk(EventKind::Finalized {
+                slot: 0,
+                hash: "h".into(),
+                fast: true,
+            }));
         }
-        assert!(p.slots.len() <= MAX_TRACKED);
+        assert_eq!(p.history.len(), ROLLING_WINDOW);
+    }
+
+    #[test]
+    fn ratio_reflects_history_mix() {
+        let mut p = SlotLifecyclePane::new();
+        for _ in 0..3 {
+            p.on_event(&mk(EventKind::Finalized {
+                slot: 0,
+                hash: "h".into(),
+                fast: true,
+            }));
+        }
+        p.on_event(&mk(EventKind::VotingSkip { slot: 0 }));
+        assert_eq!(p.ratio_pct(Outcome::Fast), 75);
+        assert_eq!(p.skip_count(), 1);
+    }
+
+    #[test]
+    fn particles_drop_after_lifespan() {
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 0,
+            hash: "h".into(),
+            fast: true,
+        }));
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs_f64(TRAVERSAL_SECS + 0.5))
+            .unwrap();
+        for q in &mut p.particles {
+            q.spawn_at = past;
+        }
+        p.tick(Instant::now());
+        assert!(p.particles.is_empty());
     }
 }
