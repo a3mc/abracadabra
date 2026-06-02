@@ -14,7 +14,8 @@
 //! stream exactly once per pane per event.
 
 pub mod decorations;
-pub mod pipeline;
+pub mod shred_ingress;
+pub mod slot_lifecycle;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -38,6 +39,17 @@ struct PaneSlot {
 /// Constructed alongside the [`TailHandle`] on SPACEBAR-start; dropped
 /// alongside it on SPACEBAR-stop. Single-threaded, lives on the render
 /// thread.
+/// No-op pane used as a layout filler so the breathing strip between
+/// the named panes and the decorations strip is allocated explicitly.
+/// Future strips (voting, leader window, etc.) will replace this slot.
+struct EmptyPane;
+
+impl crate::live::animation::Pane for EmptyPane {
+    fn on_event(&mut self, _ev: &crate::parser::Event) {}
+    fn tick(&mut self, _now: Instant) {}
+    fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
+}
+
 pub struct SceneEngine {
     slots: Vec<PaneSlot>,
     /// `LiveBuffer::total_events` value as of the last successful drain.
@@ -49,14 +61,23 @@ pub struct SceneEngine {
 }
 
 impl SceneEngine {
-    /// Build the default Live-tab composite: pipeline pane on top,
-    /// decorations strip at the bottom.
+    /// Build the default Live-tab composite: two compact strips at the
+    /// top (shred ingress, slot lifecycle), breathing room reserved
+    /// below for future strips, decorations at the bottom.
     pub fn default_layout() -> Self {
         Self {
             slots: vec![
                 PaneSlot {
-                    pane: Box::new(pipeline::PipelinePane::new()),
-                    constraint: Constraint::Min(8),
+                    pane: Box::new(shred_ingress::ShredIngressPane::new()),
+                    constraint: Constraint::Length(shred_ingress::PANE_HEIGHT),
+                },
+                PaneSlot {
+                    pane: Box::new(slot_lifecycle::SlotLifecyclePane::new()),
+                    constraint: Constraint::Length(slot_lifecycle::PANE_HEIGHT),
+                },
+                PaneSlot {
+                    pane: Box::new(EmptyPane),
+                    constraint: Constraint::Min(0),
                 },
                 PaneSlot {
                     pane: Box::new(decorations::DecorationsPane::new()),
