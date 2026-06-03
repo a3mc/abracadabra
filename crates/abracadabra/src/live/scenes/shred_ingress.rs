@@ -72,10 +72,12 @@ const SUBPIXEL_DURATION: Duration = Duration::from_millis(125);
 const SUBPIXELS_PER_CELL: usize = 2;
 const Y_PER_ROW: u8 = 4;
 
-/// How long a particle is visible. Tuned so a particle drifts the
-/// width of a typical chart (~100 cells) before being pruned:
-/// 100 × 2 sub-pixels × 125 ms = 25 s.
-const PARTICLE_LIFETIME: Duration = Duration::from_secs(25);
+/// How long a particle is visible. Sized so a particle drifts the
+/// width of any reasonable terminal before being pruned:
+/// 120 s × 8 sub-pixels/s = 960 sub-pixels = 480 cells. At 2 sub-
+/// pixels per Braille cell, this covers fullscreen on any terminal
+/// up to ~480 columns wide.
+const PARTICLE_LIFETIME: Duration = Duration::from_secs(120);
 /// Each particle represents this many shreds. Big events become
 /// dense bursts; small events become single particles.
 const SHREDS_PER_PARTICLE: u32 = 16;
@@ -85,9 +87,11 @@ const MAX_PARTICLES_PER_EVENT: u32 = 48;
 /// particles horizontally so a burst looks like a comet, not a
 /// single bright column.
 const PARTICLE_STAGGER: Duration = Duration::from_millis(30);
-/// Upper bound on retained particles to keep memory bounded under
-/// pathological burst patterns.
-const MAX_RETAINED_PARTICLES: usize = 4096;
+/// Upper bound on retained bursts. Each burst expands to up to
+/// `MAX_PARTICLES_PER_EVENT` particles at render time. 2048 ≈ 17 s
+/// of bursts at one burst per 8 ms, well past pathological replay
+/// rates.
+const MAX_RETAINED_BURSTS: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -119,18 +123,12 @@ impl Lane {
     const fn is_attention(self) -> bool {
         matches!(self, Self::Repair | Self::Drop | Self::Err)
     }
-
-    /// Label marker shown right after the lane name. Turbine uses a
-    /// flow arrow `▶` because it's the animated particle stream;
-    /// other lanes use a `●` bullet because they're static-by-tick
-    /// event indicators.
-    const fn marker(self) -> &'static str {
-        match self {
-            Self::Turbine => "▶",
-            _ => "●",
-        }
-    }
 }
+
+/// Flow-arrow marker shown right after every lane name. Uniform
+/// across all lanes (both panes) so the markers line up in a single
+/// label column for a calm visual rhythm.
+const LANE_MARKER: &str = "▶";
 
 const SPARK_LANE_LIST: [Lane; SPARK_LANES] = [Lane::Repair, Lane::Drop, Lane::Err];
 
@@ -174,27 +172,35 @@ impl LaneSpark {
     }
 }
 
-/// One drifting particle. `spawn_ts` may be slightly in the future
-/// relative to the event that produced it (intra-burst stagger);
-/// rendering treats not-yet-spawned particles as off-screen.
+/// One emitted `ShredFetch` event, stored as a single record. At
+/// render time each burst is expanded into [`Self::particle_count`]
+/// particles whose Y positions come from `y_seed`; particle X
+/// positions are derived from age relative to `spawn_ts`. Storing
+/// bursts (not pre-expanded particles) keeps memory ~`48×` smaller
+/// for the same visible history, which matters once
+/// `PARTICLE_LIFETIME` is long enough to cover fullscreen terminals.
 #[derive(Debug, Clone, Copy)]
-struct Particle {
+struct EventBurst {
     spawn_ts: Instant,
-    y: u8, // 0..(TURBINE_ROWS × Y_PER_ROW)
+    /// Already clamped to `MAX_PARTICLES_PER_EVENT` at construction.
+    particle_count: u8,
+    /// Seed for deterministic per-particle Y at render time. Mixed
+    /// with the particle's index inside the burst.
+    y_seed: u64,
 }
 
-/// Time-based particle stream for turbine. Particles persist for
-/// [`PARTICLE_LIFETIME`] and drift left at constant velocity.
+/// Time-based particle stream for turbine. Stores one [`EventBurst`]
+/// per `ShredFetch`; particles are expanded inline by the renderer.
 #[derive(Debug)]
 struct TurbineStream {
-    particles: VecDeque<Particle>,
+    bursts: VecDeque<EventBurst>,
     stream_start: Instant,
 }
 
 impl TurbineStream {
     fn new(now: Instant) -> Self {
         Self {
-            particles: VecDeque::with_capacity(512),
+            bursts: VecDeque::with_capacity(256),
             stream_start: now,
         }
     }
@@ -203,13 +209,12 @@ impl TurbineStream {
         let n = count
             .div_ceil(SHREDS_PER_PARTICLE)
             .clamp(1, MAX_PARTICLES_PER_EVENT);
-        let base_offset = now.saturating_duration_since(self.stream_start).as_nanos() as u64;
-        for i in 0..n {
-            let stagger = PARTICLE_STAGGER.saturating_mul(i);
-            let spawn_ts = now + stagger;
-            let y = particle_y(base_offset, i);
-            self.particles.push_back(Particle { spawn_ts, y });
-        }
+        let y_seed = now.saturating_duration_since(self.stream_start).as_nanos() as u64;
+        self.bursts.push_back(EventBurst {
+            spawn_ts: now,
+            particle_count: n as u8,
+            y_seed,
+        });
         self.prune(now);
     }
 
@@ -219,17 +224,26 @@ impl TurbineStream {
 
     fn prune(&mut self, now: Instant) {
         if let Some(cutoff) = now.checked_sub(PARTICLE_LIFETIME) {
-            while let Some(p) = self.particles.front() {
-                if p.spawn_ts < cutoff {
-                    self.particles.pop_front();
+            while let Some(b) = self.bursts.front() {
+                if b.spawn_ts < cutoff {
+                    self.bursts.pop_front();
                 } else {
                     break;
                 }
             }
         }
-        while self.particles.len() > MAX_RETAINED_PARTICLES {
-            self.particles.pop_front();
+        while self.bursts.len() > MAX_RETAINED_BURSTS {
+            self.bursts.pop_front();
         }
+    }
+
+    /// Total live particle count across all retained bursts (used by
+    /// the snapshot row to surface the visualisation's working set).
+    fn particle_count(&self) -> usize {
+        self.bursts
+            .iter()
+            .map(|b| usize::from(b.particle_count))
+            .sum()
     }
 }
 
@@ -367,9 +381,11 @@ impl ShredIngressPane {
         let label_area = h[0];
         let chart_area = h[1];
 
-        // Label only on the first row of the turbine block.
+        // Label only on the first row of the turbine block. Format
+        // pads the lane name to 7 chars so all marker arrows across
+        // the four lanes sit at the same column.
         let label_line = Line::from(Span::styled(
-            format!(" {} {}", Lane::Turbine.label(), Lane::Turbine.marker()),
+            format!(" {:<7} {LANE_MARKER}", Lane::Turbine.label()),
             Style::default()
                 .fg(Lane::Turbine.colour())
                 .add_modifier(Modifier::BOLD),
@@ -397,7 +413,7 @@ impl ShredIngressPane {
         let chart_area = h[1];
 
         let label_line = Line::from(Span::styled(
-            format!(" {} {}", lane.label(), lane.marker()),
+            format!(" {:<7} {LANE_MARKER}", lane.label()),
             Style::default()
                 .fg(lane.colour())
                 .add_modifier(Modifier::BOLD),
@@ -413,12 +429,12 @@ impl ShredIngressPane {
         let repair = fmt_opt(self.numbers.repair);
         let drop = fmt_opt(self.numbers.drop);
         let err = fmt_opt(self.numbers.err);
-        let particles = self.turbine_stream.particles.len();
+        let particles = self.turbine_stream.particle_count();
 
         let line = Line::from(vec![
-            Span::styled(format!(" {fetch}"), Style::default().fg(COL_TURBINE)),
-            Span::styled(" sh", theme::label_style()),
-            sep(),
+            Span::styled(" latest sample: ", theme::label_style()),
+            Span::styled(fetch, Style::default().fg(COL_TURBINE)),
+            Span::styled(" sh / ", theme::label_style()),
             Span::styled(
                 repair,
                 if self.numbers.repair.unwrap_or(0) > 0 {
@@ -427,8 +443,7 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" rep", theme::label_style()),
-            sep(),
+            Span::styled(" rep / ", theme::label_style()),
             Span::styled(
                 drop,
                 if self.numbers.drop.unwrap_or(0) > 0 {
@@ -437,8 +452,7 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" drop", theme::label_style()),
-            sep(),
+            Span::styled(" drop / ", theme::label_style()),
             Span::styled(
                 err,
                 if self.numbers.err.unwrap_or(0) > 0 {
@@ -450,11 +464,7 @@ impl ShredIngressPane {
             Span::styled(" err", theme::label_style()),
             sep(),
             Span::styled(
-                format!(
-                    "{} particles · {} ms / cell",
-                    particles,
-                    BUCKET_DURATION.as_millis()
-                ),
+                format!("{particles} turbine particles in flight"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -520,24 +530,32 @@ fn render_turbine_particles(
         .map(|_| vec![0u8; chart_width])
         .collect();
 
-    for particle in &stream.particles {
-        if particle.spawn_ts > now {
-            continue;
+    // Expand each retained burst into its particles inline. A burst
+    // with `particle_count = N` produces N particles staggered by
+    // `PARTICLE_STAGGER`; each particle's Y comes from a hash of the
+    // burst's `y_seed` and the particle's index.
+    for burst in &stream.bursts {
+        for i in 0..u32::from(burst.particle_count) {
+            let spawn_ts = burst.spawn_ts + PARTICLE_STAGGER.saturating_mul(i);
+            if spawn_ts > now {
+                continue;
+            }
+            let age_micros = now.duration_since(spawn_ts).as_micros() as u64;
+            let drift = (age_micros / subpixel_micros) as usize;
+            if drift >= total_subpixels {
+                continue;
+            }
+            let sub_x = total_subpixels - 1 - drift;
+            let cell_idx = sub_x / SUBPIXELS_PER_CELL;
+            let cell_col = (sub_x % SUBPIXELS_PER_CELL) as u8;
+            let y = particle_y(burst.y_seed, i);
+            let row = (y / Y_PER_ROW) as usize;
+            let y_in_row = y % Y_PER_ROW;
+            if row >= row_bits.len() || cell_idx >= chart_width {
+                continue;
+            }
+            row_bits[row][cell_idx] |= braille_bit(cell_col, y_in_row);
         }
-        let age_micros = now.duration_since(particle.spawn_ts).as_micros() as u64;
-        let drift = (age_micros / subpixel_micros) as usize;
-        if drift >= total_subpixels {
-            continue;
-        }
-        let sub_x = total_subpixels - 1 - drift;
-        let cell_idx = sub_x / SUBPIXELS_PER_CELL;
-        let cell_col = (sub_x % SUBPIXELS_PER_CELL) as u8;
-        let row = (particle.y / Y_PER_ROW) as usize;
-        let y_in_row = particle.y % Y_PER_ROW;
-        if row >= row_bits.len() || cell_idx >= chart_width {
-            continue;
-        }
-        row_bits[row][cell_idx] |= braille_bit(cell_col, y_in_row);
     }
 
     let particle_style = Style::default()
@@ -734,16 +752,16 @@ mod tests {
     }
 
     #[test]
-    fn shred_fetch_spawns_turbine_particles() {
+    fn shred_fetch_spawns_turbine_burst_with_expected_particle_count() {
         let mut p = ShredIngressPane::new();
-        let before = p.turbine_stream.particles.len();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
             shred_count: 100,
         })));
-        let after = p.turbine_stream.particles.len();
-        // 100 / 16 = 7 particles
-        assert!(after > before);
-        assert!(after - before >= 6);
+        assert_eq!(p.turbine_stream.bursts.len(), 1);
+        // 100 / 16 = 7 particles (div_ceil)
+        let count = p.turbine_stream.bursts[0].particle_count;
+        assert!((6..=8).contains(&count), "got {count}");
+        assert_eq!(p.turbine_stream.particle_count(), usize::from(count));
     }
 
     #[test]
@@ -773,17 +791,22 @@ mod tests {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::FirstShred { slot: 1 }));
         assert_eq!(p.turbine.current, 0);
-        assert_eq!(p.turbine_stream.particles.len(), 0);
+        assert_eq!(p.turbine_stream.bursts.len(), 0);
+        assert_eq!(p.turbine_stream.particle_count(), 0);
     }
 
     #[test]
     fn particle_event_caps_count_at_max() {
         let mut p = ShredIngressPane::new();
-        // Huge event — should be capped at MAX_PARTICLES_PER_EVENT.
+        // Huge event — particle_count should be clamped to MAX_PARTICLES_PER_EVENT.
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
             shred_count: 100_000,
         })));
-        assert!(p.turbine_stream.particles.len() <= MAX_PARTICLES_PER_EVENT as usize);
+        assert_eq!(p.turbine_stream.bursts.len(), 1);
+        assert_eq!(
+            u32::from(p.turbine_stream.bursts[0].particle_count),
+            MAX_PARTICLES_PER_EVENT
+        );
     }
 
     #[test]

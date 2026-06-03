@@ -259,7 +259,7 @@ impl SlotLifecyclePane {
         let chart_area = h_chunks[1];
 
         let label_line = Line::from(Span::styled(
-            format!(" {} ●", lane.label()),
+            format!(" {:<7} ▶", lane.label()),
             Style::default()
                 .fg(lane.colour())
                 .add_modifier(Modifier::BOLD),
@@ -278,6 +278,7 @@ impl SlotLifecyclePane {
             .last_fec_per_slot
             .map_or_else(|| "—".to_owned(), |n| format!("{n}"));
 
+        let window_n = self.history.len().min(ROLLING_WINDOW);
         let line = Line::from(vec![
             Span::styled(
                 format!(" {fast_pct}%"),
@@ -305,19 +306,15 @@ impl SlotLifecyclePane {
             ),
             Span::styled(" skip", theme::label_style()),
             sep(),
-            Span::styled(fec, Style::default().fg(COL_FEC)),
-            Span::styled(" fec (last)", theme::label_style()),
-            sep(),
             Span::styled(
-                format!(
-                    "last {} slots · {} ms / cell · stable scale",
-                    self.history.len().min(ROLLING_WINDOW),
-                    BUCKET_DURATION.as_millis(),
-                ),
+                format!("over last {window_n} finalised slots"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
             ),
+            sep(),
+            Span::styled("latest fec ", theme::label_style()),
+            Span::styled(fec, Style::default().fg(COL_FEC)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }

@@ -170,8 +170,6 @@ impl TxPressurePane {
         let window_secs = VISIBLE_WINDOW.as_secs_f64();
         let peak_observed = self.samples.iter().map(|s| s.signatures).max().unwrap_or(0) as f64;
         let y_max = peak_observed.max(MIN_Y_MAX);
-        let avg = (self.samples.iter().map(|s| s.signatures).sum::<u64>() as f64)
-            / (self.samples.len() as f64);
 
         // Pre-compute sample coords + per-sample intensity so the
         // Canvas paint closure stays cheap and capture-free.
@@ -205,17 +203,7 @@ impl TxPressurePane {
                     });
                 }
 
-                // 2. Reference line at rolling average. Drawn after
-                // fill so it overlays cleanly.
-                ctx.draw(&CanvasLine {
-                    x1: 0.0,
-                    y1: avg,
-                    x2: window_secs,
-                    y2: avg,
-                    color: Color::DarkGray,
-                });
-
-                // 3. Smooth curve: segments between consecutive
+                // 2. Smooth curve: segments between consecutive
                 // samples, full-intensity thermal color (averaged
                 // across the segment for smoothness).
                 for w in coords.windows(2) {
@@ -230,7 +218,7 @@ impl TxPressurePane {
                     });
                 }
 
-                // 4. "Now" glow: a small cross at the latest sample.
+                // 3. "Now" glow: a small cross at the latest sample.
                 if let Some(&(x, y, t)) = coords.last() {
                     let glow = thermal_color(t.max(0.6));
                     let dx = window_secs * 0.005;
@@ -257,31 +245,28 @@ impl TxPressurePane {
             .map_or_else(|| "—".to_owned(), |n| format!("{n}"));
 
         let line = Line::from(vec![
+            Span::styled(" now ", theme::label_style()),
             Span::styled(
-                format!(" {latest}"),
+                latest,
                 Style::default()
                     .fg(Color::Rgb(180, 220, 255))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" sig/slot now", theme::label_style()),
+            Span::styled(" sig/slot", theme::label_style()),
             sep(),
+            Span::styled("avg ", theme::label_style()),
             Span::styled(avg, Style::default().fg(Color::Rgb(220, 200, 80))),
-            Span::styled(" avg", theme::label_style()),
             sep(),
+            Span::styled("peak ", theme::label_style()),
             Span::styled(
                 peak,
                 Style::default()
                     .fg(Color::Rgb(230, 70, 60))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" peak", theme::label_style()),
             sep(),
             Span::styled(
-                format!(
-                    "last ~{} s ({} slots)",
-                    VISIBLE_WINDOW.as_secs(),
-                    self.samples.len()
-                ),
+                format!("showing last {} s", VISIBLE_WINDOW.as_secs()),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),

@@ -115,15 +115,19 @@ impl SceneEngine {
     /// │ shred ingress          │ slot outcomes                     │  ← top row, 50/50 split
     /// │ (pane 0)               │ (pane 1)                          │
     /// ├────────────────────────────────────────────────────────────┤
-    /// │ tx pressure (full width canvas chart)                      │  ← pane 2
+    /// │ (reserved)             │ tx pressure                       │  ← middle row, 50/50 split
+    /// │                        │ (pane 2)                          │     left half free for
+    /// │                        │                                   │     future widgets
     /// ├────────────────────────────────────────────────────────────┤
     /// │ decorations strip                                          │  ← pane 3
     /// └────────────────────────────────────────────────────────────┘
     /// ```
     ///
-    /// The top-row height is the maximum of the two top panes'
-    /// declared row heights; the middle slot expands with the
-    /// terminal (Constraint::Min(0)).
+    /// Top-row height is the maximum of the two top panes' declared
+    /// heights. Middle row uses the same 50/50 horizontal split as
+    /// the top, so tx pressure aligns column-for-column with slot
+    /// outcomes above. Left middle half is intentionally blank for
+    /// the next strip to land.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         // For the current Live-tab layout: slots[0] = shred ingress,
         // slots[1] = slot lifecycle, slots[2] = empty filler,
@@ -152,9 +156,17 @@ impl SceneEngine {
             .split(v_chunks[0]);
         self.slots[0].pane.render(frame, top_h[0]);
         self.slots[1].pane.render(frame, top_h[1]);
-        // Middle breathing strip: render the EmptyPane into v_chunks[1]
-        // so it can grow into a real strip later by swapping the pane.
-        self.slots[2].pane.render(frame, v_chunks[1]);
+
+        // Middle row uses the same 50/50 horizontal split as the top
+        // row so tx pressure sits column-aligned beneath slot
+        // outcomes. The left half is intentionally not rendered —
+        // it's reserved for the next strip; the screen background
+        // (already cleared by the frame) shows through.
+        let mid_h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(v_chunks[1]);
+        self.slots[2].pane.render(frame, mid_h[1]);
         self.slots[3].pane.render(frame, v_chunks[2]);
     }
 
