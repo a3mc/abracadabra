@@ -13,7 +13,9 @@
 //! on individual panes — every pane in the engine sees the same event
 //! stream exactly once per pane per event.
 
+pub mod chain;
 pub mod decorations;
+pub mod leader;
 pub mod shred_ingress;
 pub mod slot_lifecycle;
 pub mod tx_pressure;
@@ -66,6 +68,14 @@ impl SceneEngine {
                     constraint: Constraint::Length(slot_lifecycle::PANE_HEIGHT),
                 },
                 PaneSlot {
+                    pane: Box::new(chain::ChainPane::new()),
+                    constraint: Constraint::Min(0),
+                },
+                PaneSlot {
+                    pane: Box::new(leader::LeaderPane::new()),
+                    constraint: Constraint::Min(0),
+                },
+                PaneSlot {
                     pane: Box::new(tx_pressure::TxPressurePane::new()),
                     constraint: Constraint::Min(0),
                 },
@@ -111,30 +121,30 @@ impl SceneEngine {
     /// Render the Live-tab layout:
     ///
     /// ```text
-    /// ┌────────────────────────────────────────────────────────────┐
-    /// │ shred ingress          │ slot outcomes                     │  ← top row, 50/50 split
-    /// │ (pane 0)               │ (pane 1)                          │
-    /// ├────────────────────────────────────────────────────────────┤
-    /// │ (reserved)             │ tx pressure                       │  ← middle row, 50/50 split
-    /// │                        │ (pane 2)                          │     left half free for
-    /// │                        │                                   │     future widgets
-    /// ├────────────────────────────────────────────────────────────┤
-    /// │ decorations strip                                          │  ← pane 3
-    /// └────────────────────────────────────────────────────────────┘
+    /// ┌──────────────────────────────────────────────────────────────┐
+    /// │ shred ingress         │ slot outcomes                        │  ← top row, 50/50
+    /// │ (pane 0)              │ (pane 1)                             │
+    /// ├──────────────────────────────────────────────────────────────┤
+    /// │ chain (pane 2)        │ tx pressure                          │  ← middle row, 50/50
+    /// ├───────────────────────┤ (pane 4)                             │     left subdivided
+    /// │ block production (3)  │                                      │     into chain/leader
+    /// ├──────────────────────────────────────────────────────────────┤
+    /// │ decorations strip (pane 5)                                   │
+    /// └──────────────────────────────────────────────────────────────┘
     /// ```
     ///
     /// Top-row height is the maximum of the two top panes' declared
-    /// heights. Middle row uses the same 50/50 horizontal split as
-    /// the top, so tx pressure aligns column-for-column with slot
-    /// outcomes above. Left middle half is intentionally blank for
-    /// the next strip to land.
+    /// heights. Middle row is split 50/50 horizontally; the left
+    /// half is subdivided 50/50 vertically into chain (top) and
+    /// block production (bottom), so they together align column-for-
+    /// column with tx pressure on the right and slot outcomes above.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        // For the current Live-tab layout: slots[0] = shred ingress,
-        // slots[1] = slot lifecycle, slots[2] = empty filler,
-        // slots[3] = decorations. If any are missing, fall back to a
-        // simple vertical-stack render so this method stays robust to
-        // smaller compositions during development.
-        if self.slots.len() < 4 {
+        // Canonical Live-tab composition has 6 slots: 0=shred ingress,
+        // 1=slot lifecycle, 2=chain, 3=leader, 4=tx pressure,
+        // 5=decorations. Anything else falls back to a vertical stack
+        // so this method stays robust to smaller compositions during
+        // development.
+        if self.slots.len() < 6 {
             self.render_vertical_stack(frame, area);
             return;
         }
@@ -146,7 +156,7 @@ impl SceneEngine {
             .constraints([
                 Constraint::Length(top_height),
                 Constraint::Min(0),
-                self.slots[3].constraint,
+                self.slots[5].constraint,
             ])
             .split(area);
 
@@ -157,17 +167,21 @@ impl SceneEngine {
         self.slots[0].pane.render(frame, top_h[0]);
         self.slots[1].pane.render(frame, top_h[1]);
 
-        // Middle row uses the same 50/50 horizontal split as the top
-        // row so tx pressure sits column-aligned beneath slot
-        // outcomes. The left half is intentionally not rendered —
-        // it's reserved for the next strip; the screen background
-        // (already cleared by the frame) shows through.
+        // Middle row: 50/50 left/right. Left half then 50/50
+        // top/bottom for chain and block-production panes.
         let mid_h = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(v_chunks[1]);
-        self.slots[2].pane.render(frame, mid_h[1]);
-        self.slots[3].pane.render(frame, v_chunks[2]);
+        let mid_left_v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(mid_h[0]);
+        self.slots[2].pane.render(frame, mid_left_v[0]);
+        self.slots[3].pane.render(frame, mid_left_v[1]);
+        self.slots[4].pane.render(frame, mid_h[1]);
+
+        self.slots[5].pane.render(frame, v_chunks[2]);
     }
 
     /// Vertical stack fallback used when the composition does not

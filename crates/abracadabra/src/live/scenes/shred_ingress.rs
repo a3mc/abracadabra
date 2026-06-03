@@ -27,6 +27,9 @@
 //! BUCKET_DURATION is 250 ms (was 500 ms): twice the cells, twice
 //! the scroll speed.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -189,12 +192,37 @@ struct EventBurst {
     y_seed: u64,
 }
 
+/// Cache for the turbine particle rasterisation.
+///
+/// `row_bits` is reused across frames: between successive renders
+/// within the same sub-pixel tick and with no new burst, the
+/// existing buffer is re-emitted instead of being rebuilt. Sized
+/// lazily to `TURBINE_ROWS × chart_width` on first use and any
+/// time `chart_width` changes (terminal resize).
+#[derive(Debug, Default)]
+struct TurbineCache {
+    /// `Some(tick)` once the cache has been populated; cleared on
+    /// burst arrival to force the next render to re-rasterise.
+    subpixel_tick: Option<u64>,
+    burst_count: usize,
+    chart_width: usize,
+    row_bits: Vec<Vec<u8>>,
+}
+
 /// Time-based particle stream for turbine. Stores one [`EventBurst`]
 /// per `ShredFetch`; particles are expanded inline by the renderer.
 #[derive(Debug)]
 struct TurbineStream {
     bursts: VecDeque<EventBurst>,
     stream_start: Instant,
+    /// Interior-mutable cache populated by the renderer (`render`
+    /// is `&self` per the [`Pane`] contract, so the cache lives
+    /// behind a [`RefCell`]).
+    cache: RefCell<TurbineCache>,
+    /// Counts the number of full rasterisation passes. Used by tests
+    /// to assert cache reuse across frames.
+    #[cfg(test)]
+    rasterise_count: Cell<usize>,
 }
 
 impl TurbineStream {
@@ -202,6 +230,9 @@ impl TurbineStream {
         Self {
             bursts: VecDeque::with_capacity(256),
             stream_start: now,
+            cache: RefCell::new(TurbineCache::default()),
+            #[cfg(test)]
+            rasterise_count: Cell::new(0),
         }
     }
 
@@ -216,10 +247,19 @@ impl TurbineStream {
             y_seed,
         });
         self.prune(now);
+        // Belt-and-braces: the bursts-count check already catches
+        // this, but clearing the tick stamp keeps the cache state
+        // unambiguous after every new event.
+        self.cache.borrow_mut().subpixel_tick = None;
     }
 
     fn tick(&mut self, now: Instant) {
+        let pre = self.bursts.len();
         self.prune(now);
+        if self.bursts.len() != pre {
+            // Pruned bursts also invalidate the cached raster.
+            self.cache.borrow_mut().subpixel_tick = None;
+        }
     }
 
     fn prune(&mut self, now: Instant) {
@@ -431,10 +471,14 @@ impl ShredIngressPane {
         let err = fmt_opt(self.numbers.err);
         let particles = self.turbine_stream.particle_count();
 
+        // Compact snapshot — half-width laptop pane is ~70 cells of
+        // inner width. Drop "latest sample:" prefix and abbreviate
+        // "turbine particles in flight" → "particles".
         let line = Line::from(vec![
-            Span::styled(" latest sample: ", theme::label_style()),
+            Span::styled(" ", theme::label_style()),
             Span::styled(fetch, Style::default().fg(COL_TURBINE)),
-            Span::styled(" sh / ", theme::label_style()),
+            Span::styled(" sh", theme::label_style()),
+            sep(),
             Span::styled(
                 repair,
                 if self.numbers.repair.unwrap_or(0) > 0 {
@@ -443,7 +487,8 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" rep / ", theme::label_style()),
+            Span::styled(" rep", theme::label_style()),
+            sep(),
             Span::styled(
                 drop,
                 if self.numbers.drop.unwrap_or(0) > 0 {
@@ -452,7 +497,8 @@ impl ShredIngressPane {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" drop / ", theme::label_style()),
+            Span::styled(" drop", theme::label_style()),
+            sep(),
             Span::styled(
                 err,
                 if self.numbers.err.unwrap_or(0) > 0 {
@@ -464,7 +510,7 @@ impl ShredIngressPane {
             Span::styled(" err", theme::label_style()),
             sep(),
             Span::styled(
-                format!("{particles} turbine particles in flight"),
+                format!("{particles} particles"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -512,6 +558,12 @@ const fn braille_bit(col: u8, row: u8) -> u8 {
 /// `TURBINE_ROWS × Y_PER_ROW` vertical sub-pixels, and the row a
 /// particle lands in is `y / Y_PER_ROW`. Card dividers are
 /// embedded into the same `Line` as the Braille glyphs.
+///
+/// The bit-pattern raster is cached on [`TurbineStream`]: while the
+/// sub-pixel tick, burst count, and chart width are unchanged the
+/// renderer reuses the cached `row_bits` instead of re-expanding
+/// every burst. Cache is invalidated by `on_event` (new burst),
+/// `tick` (pruned burst), terminal resize, and sub-pixel advance.
 fn render_turbine_particles(
     frame: &mut Frame<'_>,
     chart_area: Rect,
@@ -522,18 +574,67 @@ fn render_turbine_particles(
     if chart_width == 0 || chart_area.height == 0 {
         return;
     }
+
+    let subpixel_micros = SUBPIXEL_DURATION.as_micros() as u64;
+    let elapsed_micros = now
+        .saturating_duration_since(stream.stream_start)
+        .as_micros() as u64;
+    let current_subpixel = elapsed_micros / subpixel_micros.max(1);
+    let burst_count = stream.bursts.len();
+
+    let mut cache = stream.cache.borrow_mut();
+    let hit = cache.subpixel_tick == Some(current_subpixel)
+        && cache.burst_count == burst_count
+        && cache.chart_width == chart_width
+        && cache.row_bits.len() == TURBINE_ROWS as usize
+        && cache.row_bits.iter().all(|r| r.len() == chart_width);
+
+    if !hit {
+        rasterise_turbine_row_bits(stream, now, chart_width, &mut cache.row_bits);
+        cache.subpixel_tick = Some(current_subpixel);
+        cache.burst_count = burst_count;
+        cache.chart_width = chart_width;
+        #[cfg(test)]
+        stream.rasterise_count.set(stream.rasterise_count.get() + 1);
+    }
+
+    let particle_style = Style::default()
+        .fg(COL_TURBINE)
+        .add_modifier(Modifier::BOLD);
+    let div_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+
+    for (row_idx, bits) in cache.row_bits.iter().enumerate() {
+        let line = build_turbine_row_line(bits, chart_width, particle_style, div_style);
+        let y = chart_area.y + row_idx as u16;
+        let row_rect = Rect::new(chart_area.x, y, chart_area.width, 1);
+        frame.render_widget(Paragraph::new(line), row_rect);
+    }
+}
+
+/// Resize and zero `row_bits` to `TURBINE_ROWS × chart_width`,
+/// then expand every retained burst into its constituent particles
+/// and OR each particle's Braille bit into the matching cell.
+///
+/// Reuses the existing allocation: outer `Vec` is resized to
+/// `TURBINE_ROWS` rows, each inner `Vec<u8>` is resized to
+/// `chart_width` and zero-filled in place.
+fn rasterise_turbine_row_bits(
+    stream: &TurbineStream,
+    now: Instant,
+    chart_width: usize,
+    row_bits: &mut Vec<Vec<u8>>,
+) {
     let total_subpixels = chart_width * SUBPIXELS_PER_CELL;
     let subpixel_micros = SUBPIXEL_DURATION.as_micros() as u64;
 
-    // One bit-pattern array per chart row.
-    let mut row_bits: Vec<Vec<u8>> = (0..TURBINE_ROWS as usize)
-        .map(|_| vec![0u8; chart_width])
-        .collect();
+    row_bits.resize_with(TURBINE_ROWS as usize, Vec::new);
+    for row in row_bits.iter_mut() {
+        row.clear();
+        row.resize(chart_width, 0u8);
+    }
 
-    // Expand each retained burst into its particles inline. A burst
-    // with `particle_count = N` produces N particles staggered by
-    // `PARTICLE_STAGGER`; each particle's Y comes from a hash of the
-    // burst's `y_seed` and the particle's index.
     for burst in &stream.bursts {
         for i in 0..u32::from(burst.particle_count) {
             let spawn_ts = burst.spawn_ts + PARTICLE_STAGGER.saturating_mul(i);
@@ -541,7 +642,7 @@ fn render_turbine_particles(
                 continue;
             }
             let age_micros = now.duration_since(spawn_ts).as_micros() as u64;
-            let drift = (age_micros / subpixel_micros) as usize;
+            let drift = (age_micros / subpixel_micros.max(1)) as usize;
             if drift >= total_subpixels {
                 continue;
             }
@@ -557,49 +658,48 @@ fn render_turbine_particles(
             row_bits[row][cell_idx] |= braille_bit(cell_col, y_in_row);
         }
     }
+}
 
-    let particle_style = Style::default()
-        .fg(COL_TURBINE)
-        .add_modifier(Modifier::BOLD);
-    let div_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
-
-    for (row_idx, bits) in row_bits.iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut buf = String::new();
-        let mut buf_is_divider = false;
-        for (idx, &b) in bits.iter().enumerate() {
-            let offset_from_right = chart_width.saturating_sub(1).saturating_sub(idx);
-            let is_div = is_divider_offset(offset_from_right);
-            if is_div != buf_is_divider && !buf.is_empty() {
-                let s = if buf_is_divider {
-                    div_style
-                } else {
-                    particle_style
-                };
-                spans.push(Span::styled(std::mem::take(&mut buf), s));
-            }
-            buf_is_divider = is_div;
-            if is_div {
-                buf.push_str(CARD_DIVIDER);
-            } else {
-                let codepoint = 0x2800u32 + u32::from(b);
-                buf.push(char::from_u32(codepoint).unwrap_or('⠀'));
-            }
-        }
-        if !buf.is_empty() {
+/// Build the styled `Line` for a single rasterised turbine row.
+/// Inlines card dividers at the same offsets as the sparkline rows
+/// below so the four lanes share a unified divider grid.
+fn build_turbine_row_line(
+    bits: &[u8],
+    chart_width: usize,
+    particle_style: Style,
+    div_style: Style,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_divider = false;
+    for (idx, &b) in bits.iter().enumerate() {
+        let offset_from_right = chart_width.saturating_sub(1).saturating_sub(idx);
+        let is_div = is_divider_offset(offset_from_right);
+        if is_div != buf_is_divider && !buf.is_empty() {
             let s = if buf_is_divider {
                 div_style
             } else {
                 particle_style
             };
-            spans.push(Span::styled(buf, s));
+            spans.push(Span::styled(std::mem::take(&mut buf), s));
         }
-        let y = chart_area.y + row_idx as u16;
-        let row_rect = Rect::new(chart_area.x, y, chart_area.width, 1);
-        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+        buf_is_divider = is_div;
+        if is_div {
+            buf.push_str(CARD_DIVIDER);
+        } else {
+            let codepoint = 0x2800u32 + u32::from(b);
+            buf.push(char::from_u32(codepoint).unwrap_or('⠀'));
+        }
     }
+    if !buf.is_empty() {
+        let s = if buf_is_divider {
+            div_style
+        } else {
+            particle_style
+        };
+        spans.push(Span::styled(buf, s));
+    }
+    Line::from(spans)
 }
 
 /// Stable per-lane scaling for sparkline rows: `2 × mean(nonzero)`
@@ -844,5 +944,107 @@ mod tests {
             let y = particle_y(idx as u64 * 31, idx as u32);
             assert!(u16::from(y) < TURBINE_ROWS * u16::from(Y_PER_ROW));
         }
+    }
+
+    #[test]
+    fn turbine_row_bits_cached_until_subpixel_tick() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let t0 = Instant::now();
+        let stream = {
+            let mut s = TurbineStream::new(t0);
+            s.on_event(t0, 64);
+            s
+        };
+
+        // Two renders inside the same sub-pixel tick. Drawing area
+        // is fixed, no new burst arrives, and `now` advances by
+        // less than SUBPIXEL_DURATION (125 ms). The second render
+        // must hit the cache.
+        let chart_rect = Rect::new(0, 0, 60, TURBINE_ROWS);
+        terminal
+            .draw(|f| render_turbine_particles(f, chart_rect, &stream, t0))
+            .unwrap();
+        let after_first = stream.rasterise_count.get();
+        assert_eq!(after_first, 1, "first render should rasterise");
+
+        let t1 = t0 + Duration::from_millis(50);
+        terminal
+            .draw(|f| render_turbine_particles(f, chart_rect, &stream, t1))
+            .unwrap();
+        assert_eq!(
+            stream.rasterise_count.get(),
+            after_first,
+            "second render within the same sub-pixel tick must reuse cache",
+        );
+
+        // Advancing past the sub-pixel boundary forces a re-raster.
+        let t2 = t0 + SUBPIXEL_DURATION + Duration::from_millis(1);
+        terminal
+            .draw(|f| render_turbine_particles(f, chart_rect, &stream, t2))
+            .unwrap();
+        assert_eq!(
+            stream.rasterise_count.get(),
+            after_first + 1,
+            "crossing a sub-pixel boundary must re-rasterise",
+        );
+    }
+
+    #[test]
+    fn turbine_cache_invalidated_on_new_burst() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let t0 = Instant::now();
+        let mut stream = TurbineStream::new(t0);
+        stream.on_event(t0, 32);
+        let chart_rect = Rect::new(0, 0, 60, TURBINE_ROWS);
+        terminal
+            .draw(|f| render_turbine_particles(f, chart_rect, &stream, t0))
+            .unwrap();
+        let baseline = stream.rasterise_count.get();
+
+        // New burst within the same sub-pixel tick must invalidate.
+        stream.on_event(t0, 16);
+        terminal
+            .draw(|f| render_turbine_particles(f, chart_rect, &stream, t0))
+            .unwrap();
+        assert_eq!(
+            stream.rasterise_count.get(),
+            baseline + 1,
+            "new burst must invalidate the cache",
+        );
+    }
+
+    #[test]
+    fn turbine_cache_invalidated_on_resize() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let t0 = Instant::now();
+        let stream = {
+            let mut s = TurbineStream::new(t0);
+            s.on_event(t0, 64);
+            s
+        };
+        terminal
+            .draw(|f| render_turbine_particles(f, Rect::new(0, 0, 60, TURBINE_ROWS), &stream, t0))
+            .unwrap();
+        let baseline = stream.rasterise_count.get();
+
+        // Same tick, same burst count, different chart width:
+        // resize invalidates the cache.
+        terminal
+            .draw(|f| render_turbine_particles(f, Rect::new(0, 0, 80, TURBINE_ROWS), &stream, t0))
+            .unwrap();
+        assert_eq!(
+            stream.rasterise_count.get(),
+            baseline + 1,
+            "chart-width change must invalidate the cache",
+        );
     }
 }

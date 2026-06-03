@@ -307,13 +307,13 @@ impl SlotLifecyclePane {
             Span::styled(" skip", theme::label_style()),
             sep(),
             Span::styled(
-                format!("over last {window_n} finalised slots"),
+                format!("last {window_n} slots"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
             ),
             sep(),
-            Span::styled("latest fec ", theme::label_style()),
+            Span::styled("fec ", theme::label_style()),
             Span::styled(fec, Style::default().fg(COL_FEC)),
         ]);
         frame.render_widget(Paragraph::new(line), area);
