@@ -1,17 +1,12 @@
-//! Slot outcomes — bucketed bars.
+//! Slot outcomes — single-paragraph rows, stable scale.
 //!
-//! Same time-bucketed model as `shred_ingress`: 250ms windows, one
-//! bucket per terminal column, fill height by accumulated value, per
-//! lane scale chosen for visibility. Lanes:
+//! One row per lane (fast / slow / skip / fec). Each row is a
+//! single `Line` of styled spans built once per frame and rendered
+//! as one `Paragraph` — see `shred_ingress` for the rationale.
 //!
-//! - **fast**  one Finalized{fast:true}  per slot → cap 3 events/bucket
-//! - **slow**  one Finalized{fast:false} per slot → cap 1 (every slow visible)
-//! - **skip**  one VotingSkip            per slot → cap 1 (any skip full bar)
-//! - **fec**   Σ num_recovered (per-slot)        → cap 50
-//!
-//! Snapshot row carries rolling percentages and counts (last N slots)
-//! so the operator gets both the *flow* (bars sliding left) and the
-//! *aggregate* (numbers below).
+//! Scaling per lane uses [`stable_max`] (`2 × mean(nonzero buckets)`)
+//! so single peaks don't reshape every other cell. Snapshot row
+//! keeps rolling percentages over the last 64 slots.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -26,16 +21,22 @@ use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
-pub const PANE_HEIGHT: u16 = 9;
+pub const PANE_HEIGHT: u16 = 10;
 
-const BUCKET_DURATION: Duration = Duration::from_secs(10);
-const LANES_PER_CARD: u16 = 4;
-const CARD_SLOT_WIDTH: u16 = LANES_PER_CARD + 1;
-const CARD_BAR_ROWS: u16 = 4;
-const LABEL_COL_WIDTH: u16 = 9;
-const CARD_DIVIDER: &str = "│";
+const BUCKET_DURATION: Duration = Duration::from_millis(250);
+const LANE_COUNT: u16 = 4;
+const LABEL_COL_WIDTH: u16 = 10;
+const HISTORY_CAPACITY: usize = 256;
+const MIN_LANE_MAX: u64 = 1;
 
-const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Cells between two adjacent card dividers (20 cells × 250 ms = 5 s).
+const CELLS_PER_CARD: u16 = 20;
+const CARD_DIVIDER: &str = "┊";
+
+const BLOCK_BARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Dot-size glyphs for discrete event lanes (slow, skip). Three
+/// visible levels read as event marks rather than gradient bars.
+const MARK_BARS: [&str; 9] = [" ", "·", "·", "•", "•", "•", "●", "●", "●"];
 
 const COL_GOOD: Color = Color::Green;
 const COL_WARN: Color = Color::Yellow;
@@ -55,32 +56,6 @@ enum Lane {
 }
 
 impl Lane {
-    /// Cap = Σ value over the 10-second card window at which the bar
-    /// fills the full bar height. Tuned for 5× replay.
-    const fn cap(self) -> u32 {
-        match self {
-            // ~25 fast finalizations per 10s real-time, ~125 at 5×.
-            Self::Fast => 150,
-            // Slow rare; cap 5 keeps single events visible, 5 fills.
-            Self::Slow => 5,
-            // Skip rare; same gradation as slow.
-            Self::Skip => 5,
-            // Per-slot num_recovered ~30 × 25 slots = ~750 real-time,
-            // ~3750 at 5×. Cap 4000 prevents wall-of-full.
-            Self::Fec => 4_000,
-        }
-    }
-
-    /// Position of this lane within a card (column 0..LANES_PER_CARD).
-    const fn card_col(self) -> u16 {
-        match self {
-            Self::Fast => 0,
-            Self::Slow => 1,
-            Self::Skip => 2,
-            Self::Fec => 3,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Fast => "fast",
@@ -104,6 +79,8 @@ impl Lane {
     }
 }
 
+const LANES: [Lane; 4] = [Lane::Fast, Lane::Slow, Lane::Skip, Lane::Fec];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Fast,
@@ -112,16 +89,16 @@ enum Outcome {
 }
 
 #[derive(Debug)]
-struct BucketLane {
+struct LaneSpark {
     history: VecDeque<u32>,
     current: u32,
     current_started: Instant,
 }
 
-impl BucketLane {
+impl LaneSpark {
     fn new(now: Instant) -> Self {
         Self {
-            history: VecDeque::with_capacity(256),
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
             current: 0,
             current_started: now,
         }
@@ -131,12 +108,12 @@ impl BucketLane {
         self.current = self.current.saturating_add(v);
     }
 
-    fn advance(&mut self, now: Instant, max_history: usize) {
+    fn advance(&mut self, now: Instant) {
         while now.saturating_duration_since(self.current_started) >= BUCKET_DURATION {
             self.history.push_back(self.current);
             self.current = 0;
             self.current_started += BUCKET_DURATION;
-            while self.history.len() > max_history {
+            while self.history.len() > HISTORY_CAPACITY {
                 self.history.pop_front();
             }
         }
@@ -144,14 +121,11 @@ impl BucketLane {
 }
 
 pub struct SlotLifecyclePane {
-    fast: BucketLane,
-    slow: BucketLane,
-    skip: BucketLane,
-    fec: BucketLane,
-    /// Rolling window of recent slot outcomes for the snapshot row.
+    fast: LaneSpark,
+    slow: LaneSpark,
+    skip: LaneSpark,
+    fec: LaneSpark,
     history: VecDeque<Outcome>,
-    /// Last seen `num_recovered` per slot — shown as `fec/slot N` in
-    /// the snapshot row.
     last_fec_per_slot: Option<u64>,
     now: Instant,
 }
@@ -160,17 +134,17 @@ impl SlotLifecyclePane {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            fast: BucketLane::new(now),
-            slow: BucketLane::new(now),
-            skip: BucketLane::new(now),
-            fec: BucketLane::new(now),
+            fast: LaneSpark::new(now),
+            slow: LaneSpark::new(now),
+            skip: LaneSpark::new(now),
+            fec: LaneSpark::new(now),
             history: VecDeque::with_capacity(ROLLING_WINDOW),
             last_fec_per_slot: None,
             now,
         }
     }
 
-    const fn lane_ref(&self, lane: Lane) -> &BucketLane {
+    const fn lane_ref(&self, lane: Lane) -> &LaneSpark {
         match lane {
             Lane::Fast => &self.fast,
             Lane::Slow => &self.slow,
@@ -233,11 +207,10 @@ impl Pane for SlotLifecyclePane {
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
-        let cap = 1024;
-        self.fast.advance(now, cap);
-        self.slow.advance(now, cap);
-        self.skip.advance(now, cap);
-        self.fec.advance(now, cap);
+        self.fast.advance(now);
+        self.slow.advance(now);
+        self.skip.advance(now);
+        self.fec.advance(now);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -249,7 +222,7 @@ impl Pane for SlotLifecyclePane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 30 || inner.height < CARD_BAR_ROWS + 2 {
+        if inner.width < LABEL_COL_WIDTH + 8 || inner.height < LANE_COUNT + 2 {
             return;
         }
 
@@ -257,40 +230,44 @@ impl Pane for SlotLifecyclePane {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(CARD_BAR_ROWS),
+                Constraint::Length(LANE_COUNT),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(inner);
 
-        self.render_chart(frame, chunks[1]);
+        self.render_lane_rows(frame, chunks[1]);
         self.render_snapshot(frame, chunks[3]);
     }
 }
 
 impl SlotLifecyclePane {
-    fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width <= LABEL_COL_WIDTH + CARD_SLOT_WIDTH {
-            return;
+    fn render_lane_rows(&self, frame: &mut Frame<'_>, area: Rect) {
+        for (i, lane) in LANES.iter().enumerate() {
+            let y = area.y + i as u16;
+            let row = Rect::new(area.x, y, area.width, 1);
+            self.render_lane_row(frame, row, *lane);
         }
+    }
+
+    fn render_lane_row(&self, frame: &mut Frame<'_>, row_area: Rect, lane: Lane) {
         let h_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(LABEL_COL_WIDTH), Constraint::Min(8)])
-            .split(area);
+            .split(row_area);
         let label_area = h_chunks[0];
         let chart_area = h_chunks[1];
 
-        render_legend(frame, label_area);
-        render_card_flow(
-            frame,
-            chart_area,
-            &[
-                (Lane::Fast, self.lane_ref(Lane::Fast)),
-                (Lane::Slow, self.lane_ref(Lane::Slow)),
-                (Lane::Skip, self.lane_ref(Lane::Skip)),
-                (Lane::Fec, self.lane_ref(Lane::Fec)),
-            ],
-        );
+        let label_line = Line::from(Span::styled(
+            format!(" {} ●", lane.label()),
+            Style::default()
+                .fg(lane.colour())
+                .add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(label_line), label_area);
+
+        let line = build_chart_line(self.lane_ref(lane), chart_area.width, lane);
+        frame.render_widget(Paragraph::new(line), chart_area);
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -333,10 +310,9 @@ impl SlotLifecyclePane {
             sep(),
             Span::styled(
                 format!(
-                    "last {} slots · card {}s × {} lanes",
+                    "last {} slots · {} ms / cell · stable scale",
                     self.history.len().min(ROLLING_WINDOW),
-                    BUCKET_DURATION.as_secs(),
-                    LANES_PER_CARD,
+                    BUCKET_DURATION.as_millis(),
                 ),
                 Style::default()
                     .fg(Color::DarkGray)
@@ -356,114 +332,129 @@ fn sep() -> Span<'static> {
     )
 }
 
-fn render_legend(frame: &mut Frame<'_>, label_area: Rect) {
-    if label_area.height < CARD_BAR_ROWS || label_area.width < 4 {
-        return;
-    }
-    let lanes = [Lane::Fast, Lane::Slow, Lane::Skip, Lane::Fec];
-    for (row, lane) in lanes.iter().enumerate() {
-        let y = label_area.y + row as u16;
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {}", lane.label()),
-                Style::default()
-                    .fg(lane.colour())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " ●",
-                Style::default()
-                    .fg(lane.colour())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(label_area.x, y, label_area.width, 1),
-        );
-    }
-}
-
-type LaneBuckets<'a> = [(Lane, &'a BucketLane); LANES_PER_CARD as usize];
-
-fn render_card_flow(frame: &mut Frame<'_>, chart_area: Rect, lanes: &LaneBuckets<'_>) {
-    if chart_area.width == 0 || chart_area.height < CARD_BAR_ROWS {
-        return;
-    }
-    let rightmost_x = chart_area.x + chart_area.width - 1;
-    let stride = CARD_SLOT_WIDTH;
-    let n_cards = chart_area.width / stride;
-
-    for card_index in 0..n_cards {
-        let card_right_x = rightmost_x - card_index * stride;
-        let bars_left_x = card_right_x.saturating_sub(LANES_PER_CARD - 1);
-
-        if card_index + 1 < n_cards && bars_left_x > 0 {
-            let div_x = bars_left_x - 1;
-            for row in 0..CARD_BAR_ROWS {
-                let y = chart_area.y + row;
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        CARD_DIVIDER.to_owned(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    )),
-                    Rect::new(div_x, y, 1, 1),
-                );
-            }
-        }
-
-        for (lane, bucket) in lanes {
-            let value = lookup_bucket_value(bucket, card_index as usize);
-            let cap = lane.cap();
-            let col_x = bars_left_x + lane.card_col();
-            render_vertical_bar(frame, col_x, chart_area.y, value, cap, *lane);
+/// Stable per-lane scaling max: `2 × mean(nonzero buckets)` across
+/// retained history. See `shred_ingress::stable_max` for shared
+/// rationale.
+fn stable_max(spark: &LaneSpark) -> u64 {
+    let mut count = 0u64;
+    let mut sum = 0u64;
+    for &v in spark.history.iter().chain(std::iter::once(&spark.current)) {
+        if v > 0 {
+            count = count.saturating_add(1);
+            sum = sum.saturating_add(u64::from(v));
         }
     }
+    if count == 0 {
+        MIN_LANE_MAX
+    } else {
+        sum.saturating_mul(2)
+            .checked_div(count)
+            .unwrap_or(MIN_LANE_MAX)
+            .max(MIN_LANE_MAX)
+    }
 }
 
-fn lookup_bucket_value(bucket: &BucketLane, n_back: usize) -> u32 {
-    if n_back == 0 {
-        return bucket.current;
+fn build_visible_cells(spark: &LaneSpark, width: usize) -> Vec<Option<u32>> {
+    if width == 0 {
+        return Vec::new();
     }
-    let idx = bucket.history.len().wrapping_sub(n_back);
-    bucket.history.get(idx).copied().unwrap_or(0)
+    let history_window = width.saturating_sub(1);
+    let history_skip = spark.history.len().saturating_sub(history_window);
+    let real: Vec<u32> = spark
+        .history
+        .iter()
+        .skip(history_skip)
+        .copied()
+        .chain(std::iter::once(spark.current))
+        .collect();
+    let pad = width.saturating_sub(real.len());
+    let mut cells = Vec::with_capacity(width);
+    for _ in 0..pad {
+        cells.push(None);
+    }
+    for v in real {
+        cells.push(Some(v));
+    }
+    cells
 }
 
-fn render_vertical_bar(
-    frame: &mut Frame<'_>,
-    col_x: u16,
-    top_y: u16,
-    value: u32,
-    cap: u32,
-    lane: Lane,
-) {
-    if cap == 0 {
-        return;
+#[allow(clippy::cast_possible_truncation)]
+fn level_for(value: u32, max: u64) -> usize {
+    if max == 0 {
+        return 0;
     }
-    let total_subpixels = u32::from(CARD_BAR_ROWS) * 8;
-    let filled = (u64::from(value) * u64::from(total_subpixels) / u64::from(cap))
-        .min(u64::from(total_subpixels)) as u32;
-    let modifier = if lane.is_attention() {
+    let level = (u64::from(value).saturating_mul(8) / max).min(8);
+    level as usize
+}
+
+fn glyph_for_level(level: usize, bars: &[&'static str; 9]) -> &'static str {
+    bars[level.min(8)]
+}
+
+/// Per-lane glyph table. High-rate aggregating lanes (fast, fec)
+/// keep block bars; sparse event lanes (slow, skip) get dot marks
+/// so a single slow finalization or skip stands out as an event.
+const fn bars_for(lane: Lane) -> &'static [&'static str; 9] {
+    match lane {
+        Lane::Fast | Lane::Fec => &BLOCK_BARS,
+        Lane::Slow | Lane::Skip => &MARK_BARS,
+    }
+}
+
+const fn is_divider_offset(offset_from_right: usize) -> bool {
+    offset_from_right > 0 && offset_from_right.is_multiple_of(CELLS_PER_CARD as usize)
+}
+
+fn build_chart_line(spark: &LaneSpark, chart_width: u16, lane: Lane) -> Line<'static> {
+    let max = stable_max(spark);
+    let width = chart_width as usize;
+    let cells = build_visible_cells(spark, width);
+    let bars = bars_for(lane);
+    let lane_modifier = if lane.is_attention() {
         Modifier::BOLD
     } else {
         Modifier::DIM
     };
-    let style = Style::default().fg(lane.colour()).add_modifier(modifier);
-    for row_from_bottom in 0..CARD_BAR_ROWS {
-        let consumed_below = u32::from(row_from_bottom) * 8;
-        let in_this_row = filled.saturating_sub(consumed_below).min(8) as usize;
-        if in_this_row == 0 {
-            continue;
+    let lane_style = Style::default()
+        .fg(lane.colour())
+        .add_modifier(lane_modifier);
+    let div_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_divider = false;
+
+    for (idx, cell) in cells.iter().enumerate() {
+        let offset_from_right = width.saturating_sub(1).saturating_sub(idx);
+        let is_div = is_divider_offset(offset_from_right);
+        if is_div != buf_is_divider && !buf.is_empty() {
+            let style = if buf_is_divider {
+                div_style
+            } else {
+                lane_style
+            };
+            spans.push(Span::styled(std::mem::take(&mut buf), style));
         }
-        let glyph = FILL_CHARS[in_this_row];
-        let y = top_y + (CARD_BAR_ROWS - 1 - row_from_bottom);
-        frame.render_widget(
-            Paragraph::new(Span::styled(glyph.to_owned(), style)),
-            Rect::new(col_x, y, 1, 1),
-        );
+        buf_is_divider = is_div;
+        if is_div {
+            buf.push_str(CARD_DIVIDER);
+        } else if let Some(value) = cell {
+            buf.push_str(glyph_for_level(level_for(*value, max), bars));
+        } else {
+            buf.push(' ');
+        }
     }
+    if !buf.is_empty() {
+        let style = if buf_is_divider {
+            div_style
+        } else {
+            lane_style
+        };
+        spans.push(Span::styled(buf, style));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -478,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_finalize_accumulates_fast_bucket_and_records_outcome() {
+    fn fast_finalize_accumulates_fast_lane_and_records_outcome() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Finalized {
             slot: 1,
@@ -490,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_finalize_accumulates_slow_bucket() {
+    fn slow_finalize_accumulates_slow_lane() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::Finalized {
             slot: 1,
@@ -502,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn voting_skip_accumulates_skip_bucket() {
+    fn voting_skip_accumulates_skip_lane() {
         let mut p = SlotLifecyclePane::new();
         p.on_event(&mk(EventKind::VotingSkip { slot: 1 }));
         assert_eq!(p.skip.current, 1);
@@ -547,22 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn lane_caps_match_documented_values() {
-        assert_eq!(Lane::Fast.cap(), 150);
-        assert_eq!(Lane::Slow.cap(), 5);
-        assert_eq!(Lane::Skip.cap(), 5);
-        assert_eq!(Lane::Fec.cap(), 4_000);
-    }
-
-    #[test]
-    fn card_col_assignment_unique_per_lane() {
-        assert_eq!(Lane::Fast.card_col(), 0);
-        assert_eq!(Lane::Slow.card_col(), 1);
-        assert_eq!(Lane::Skip.card_col(), 2);
-        assert_eq!(Lane::Fec.card_col(), 3);
-    }
-
-    #[test]
     fn rolling_window_caps_history() {
         let mut p = SlotLifecyclePane::new();
         for _ in 0..(ROLLING_WINDOW * 3) {
@@ -573,5 +548,23 @@ mod tests {
             }));
         }
         assert_eq!(p.history.len(), ROLLING_WINDOW);
+    }
+
+    #[test]
+    fn stable_max_returns_floor_when_idle() {
+        let now = Instant::now();
+        let spark = LaneSpark::new(now);
+        assert_eq!(stable_max(&spark), MIN_LANE_MAX);
+    }
+
+    #[test]
+    fn stable_max_is_2x_mean_of_nonzero() {
+        let now = Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(3);
+        spark.history.push_back(9);
+        spark.current = 0;
+        // mean nonzero = 6 → 2× = 12
+        assert_eq!(stable_max(&spark), 12);
     }
 }

@@ -1,29 +1,31 @@
-//! Shred streams — bucketed bars.
+//! Shred streams — turbine as a particle stream, others as
+//! sparklines.
 //!
-//! Time is sliced into 250ms buckets. Each bucket = one terminal
-//! column. Each lane's bucket aggregates the relevant metric field
-//! (Σ shred_count, Σ num_discards, etc.), scales against a predefined
-//! per-lane cap, and renders one of nine Unicode block-fill levels.
+//! Turbine is a real time-based particle simulation, not a bucket
+//! sparkline. The validator emits `ShredFetch` metric datapoints
+//! infrequently (sometimes once per ~25 seconds on a live node), so
+//! a per-bucket aggregation leaves the row almost entirely empty.
+//! Instead, each event *spawns* particles that persist for ~25 s
+//! and drift left at constant velocity; the chart stays visually
+//! populated even when source events are sparse, and when events
+//! come fast the row densifies into a real flow.
 //!
-//! ```text
-//! ┌─ shred streams ───────────────────────────────────────┐
-//! │                                                       │
-//! │ turbine ▅▆▅▇▅▆▆▅▆▆▅▆▆▅▇▆▅▆▆▆▅▆▅▆▆▅▇▆▅▆▆▆▅▆▅▆▆▅      │   cyan, steady
-//! │ repair         ▃                  ▂                   │   yellow, sparse
-//! │ drop                                                  │   magenta, empty (healthy)
-//! │ err                                                   │   red, empty (healthy)
-//! │                                                       │
-//! │ 357 sh  ·  5 rep  ·  0 drop  ·  0 err  ·  per-sample  │   snapshot
-//! └───────────────────────────────────────────────────────┘
-//! ```
+//! - Each `ShredFetch` spawns `count / SHREDS_PER_PARTICLE` particles
+//!   (capped at [`MAX_PARTICLES_PER_EVENT`]), with random vertical
+//!   position and [`PARTICLE_STAGGER`] between them.
+//! - Particles drift left 1 sub-pixel per [`SUBPIXEL_DURATION`]
+//!   (8 sub-pixels per second). At chart width ≈ 100 cells and 2
+//!   sub-pixels per Braille cell, one event's trail spans the
+//!   chart over [`PARTICLE_LIFETIME`].
+//! - Turbine occupies 2 chart rows (Braille glyphs have 4 vertical
+//!   sub-pixels per cell × 2 rows = 8 vertical positions).
 //!
-//! Newest bucket on the right; older buckets slide left as new ones
-//! complete. The visible time window equals `pane_width × BUCKET_MS`
-//! (~37s at 150-col half-width and 250ms buckets).
+//! Other lanes (repair / drop / err) keep the stable mean-based
+//! sparkline rendering. They are sparse-event lanes; bucket sums
+//! read clearly as block bars.
 //!
-//! Per-lane caps (full-bar threshold) are picked so typical activity
-//! shows in the 4–6 pixel range and bursts saturate to a full bar
-//! `█`. See [`Lane::cap`] for the rationale per lane.
+//! BUCKET_DURATION is 250 ms (was 500 ms): twice the cells, twice
+//! the scroll speed.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -38,41 +40,54 @@ use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind, MetricEvent};
 use crate::tui::theme;
 
-pub const PANE_HEIGHT: u16 = 9;
+pub const PANE_HEIGHT: u16 = 10;
 
-/// Duration of one bucket = one full mini-card.
-///
-/// The current (rightmost) card actively populates as events arrive;
-/// once 10 seconds elapse it "departs" leftward (becomes a static
-/// snapshot) and a fresh empty card starts populating on the right.
-pub const BUCKET_DURATION: Duration = Duration::from_secs(10);
+const BUCKET_DURATION: Duration = Duration::from_millis(250);
+const LABEL_COL_WIDTH: u16 = 10;
+const HISTORY_CAPACITY: usize = 256;
+const MIN_LANE_MAX: u64 = 1;
 
-/// Number of lanes shown side-by-side inside one card.
-const LANES_PER_CARD: u16 = 4;
+const CELLS_PER_CARD: u16 = 20; // 20 cells × 250 ms = 5 s per slot
+const CARD_DIVIDER: &str = "┊";
 
-/// Total width of one card slot in cells, including the gap between
-/// cards. `LANES_PER_CARD` vertical bars + 1 divider column.
-const CARD_SLOT_WIDTH: u16 = LANES_PER_CARD + 1;
-
-/// Bar rows inside each card. Each row holds one terminal cell whose
-/// sub-pixel fill is taken from `FILL_CHARS`. Total levels per bar =
-/// `CARD_BAR_ROWS * 8`.
-const CARD_BAR_ROWS: u16 = 4;
-
-/// Width reserved on the left for lane labels.
-const LABEL_COL_WIDTH: u16 = 9;
-
-/// Vertical divider rendered between cards.
-const CARD_DIVIDER: &str = "│";
-
-/// Nine block-fill levels. Index 0 = empty space, 8 = full block.
-/// Unicode lower-block-fill characters give a clean bottom-up bar.
-const FILL_CHARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const BLOCK_BARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Dot-size glyphs for discrete event lanes. Three visible levels
+/// (·, •, ●) read as event marks rather than a gradient bar — the
+/// shape signals "an event happened" with rough magnitude, instead
+/// of treating sparse events like a continuous quantity.
+const MARK_BARS: [&str; 9] = [" ", "·", "·", "•", "•", "•", "●", "●", "●"];
 
 const COL_TURBINE: Color = Color::Cyan;
 const COL_REPAIR: Color = Color::Yellow;
 const COL_DROP: Color = Color::LightMagenta;
 const COL_ERR: Color = Color::Red;
+
+const TURBINE_ROWS: u16 = 2;
+const SPARK_LANES: usize = 3; // repair, drop, err
+
+/// One Braille cell has 4 vertical dots × 2 horizontal columns.
+/// A `TURBINE_ROWS`-tall stack has `TURBINE_ROWS × 4` vertical
+/// sub-pixels; sub-pixel widths are 2 per cell.
+const SUBPIXEL_DURATION: Duration = Duration::from_millis(125);
+const SUBPIXELS_PER_CELL: usize = 2;
+const Y_PER_ROW: u8 = 4;
+
+/// How long a particle is visible. Tuned so a particle drifts the
+/// width of a typical chart (~100 cells) before being pruned:
+/// 100 × 2 sub-pixels × 125 ms = 25 s.
+const PARTICLE_LIFETIME: Duration = Duration::from_secs(25);
+/// Each particle represents this many shreds. Big events become
+/// dense bursts; small events become single particles.
+const SHREDS_PER_PARTICLE: u32 = 16;
+/// Cap to keep storage and rendering bounded for huge bursts.
+const MAX_PARTICLES_PER_EVENT: u32 = 48;
+/// Inter-particle release delay within a single burst. Spreads
+/// particles horizontally so a burst looks like a comet, not a
+/// single bright column.
+const PARTICLE_STAGGER: Duration = Duration::from_millis(30);
+/// Upper bound on retained particles to keep memory bounded under
+/// pathological burst patterns.
+const MAX_RETAINED_PARTICLES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -83,36 +98,6 @@ enum Lane {
 }
 
 impl Lane {
-    /// Cap = Σ value over the 10-second card window at which the
-    /// lane's bar fills the full bar height (CARD_BAR_ROWS × 8 = 32
-    /// sub-pixel levels). Tuned for 5× replay-log testing so typical
-    /// activity fills ~30–60 % of the bar and bursts saturate.
-    ///
-    /// - Turbine: ~3 500 sh/s real-time × 10 s = ~35 000 per card;
-    ///   ~175 000 at 5× replay. Cap = 200 000 prevents saturation.
-    /// - Repair: ~2 sh/s real-time × 10 s = ~20; ~100 replay.
-    ///   Cap = 150 keeps replay bursts visible.
-    /// - Drop: ~40/s replay × 10 = ~400. Cap = 1 000 for headroom.
-    /// - Err: ~1/s × 10 s = ~10. Cap = 50.
-    const fn cap(self) -> u32 {
-        match self {
-            Self::Turbine => 200_000,
-            Self::Repair => 150,
-            Self::Drop => 1_000,
-            Self::Err => 50,
-        }
-    }
-
-    /// Position of this lane within a card (column 0..LANES_PER_CARD).
-    const fn card_col(self) -> u16 {
-        match self {
-            Self::Turbine => 0,
-            Self::Repair => 1,
-            Self::Drop => 2,
-            Self::Err => 3,
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Turbine => "turbine",
@@ -131,12 +116,23 @@ impl Lane {
         }
     }
 
-    /// Whether the lane is a calm baseline (rendered DIM when filled)
-    /// or an attention lane (rendered BOLD when filled).
     const fn is_attention(self) -> bool {
         matches!(self, Self::Repair | Self::Drop | Self::Err)
     }
+
+    /// Label marker shown right after the lane name. Turbine uses a
+    /// flow arrow `▶` because it's the animated particle stream;
+    /// other lanes use a `●` bullet because they're static-by-tick
+    /// event indicators.
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Turbine => "▶",
+            _ => "●",
+        }
+    }
 }
+
+const SPARK_LANE_LIST: [Lane; SPARK_LANES] = [Lane::Repair, Lane::Drop, Lane::Err];
 
 #[derive(Debug, Default, Clone, Copy)]
 struct LatestNumbers {
@@ -146,49 +142,114 @@ struct LatestNumbers {
     err: Option<u64>,
 }
 
-/// One lane's bucket history. `current` is the in-progress bucket
-/// being accumulated; on bucket roll-over it pushes to `history`.
 #[derive(Debug)]
-struct BucketLane {
+struct LaneSpark {
     history: VecDeque<u32>,
     current: u32,
     current_started: Instant,
 }
 
-impl BucketLane {
+impl LaneSpark {
     fn new(now: Instant) -> Self {
         Self {
-            history: VecDeque::with_capacity(256),
+            history: VecDeque::with_capacity(HISTORY_CAPACITY),
             current: 0,
             current_started: now,
         }
     }
 
-    /// Add `v` to the current in-progress bucket.
     const fn accumulate(&mut self, v: u32) {
         self.current = self.current.saturating_add(v);
     }
 
-    /// Advance the bucket clock to `now`. May roll the current bucket
-    /// into history one or more times if multiple bucket windows have
-    /// elapsed since the last call (e.g. after a pause).
-    fn advance(&mut self, now: Instant, max_history: usize) {
+    fn advance(&mut self, now: Instant) {
         while now.saturating_duration_since(self.current_started) >= BUCKET_DURATION {
             self.history.push_back(self.current);
             self.current = 0;
             self.current_started += BUCKET_DURATION;
-            while self.history.len() > max_history {
+            while self.history.len() > HISTORY_CAPACITY {
                 self.history.pop_front();
             }
         }
     }
 }
 
+/// One drifting particle. `spawn_ts` may be slightly in the future
+/// relative to the event that produced it (intra-burst stagger);
+/// rendering treats not-yet-spawned particles as off-screen.
+#[derive(Debug, Clone, Copy)]
+struct Particle {
+    spawn_ts: Instant,
+    y: u8, // 0..(TURBINE_ROWS × Y_PER_ROW)
+}
+
+/// Time-based particle stream for turbine. Particles persist for
+/// [`PARTICLE_LIFETIME`] and drift left at constant velocity.
+#[derive(Debug)]
+struct TurbineStream {
+    particles: VecDeque<Particle>,
+    stream_start: Instant,
+}
+
+impl TurbineStream {
+    fn new(now: Instant) -> Self {
+        Self {
+            particles: VecDeque::with_capacity(512),
+            stream_start: now,
+        }
+    }
+
+    fn on_event(&mut self, now: Instant, count: u32) {
+        let n = count
+            .div_ceil(SHREDS_PER_PARTICLE)
+            .clamp(1, MAX_PARTICLES_PER_EVENT);
+        let base_offset = now.saturating_duration_since(self.stream_start).as_nanos() as u64;
+        for i in 0..n {
+            let stagger = PARTICLE_STAGGER.saturating_mul(i);
+            let spawn_ts = now + stagger;
+            let y = particle_y(base_offset, i);
+            self.particles.push_back(Particle { spawn_ts, y });
+        }
+        self.prune(now);
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        if let Some(cutoff) = now.checked_sub(PARTICLE_LIFETIME) {
+            while let Some(p) = self.particles.front() {
+                if p.spawn_ts < cutoff {
+                    self.particles.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        while self.particles.len() > MAX_RETAINED_PARTICLES {
+            self.particles.pop_front();
+        }
+    }
+}
+
+/// Deterministic Y position for a particle, in
+/// `0..(TURBINE_ROWS × Y_PER_ROW)`. Hash-mixed so consecutive
+/// particles within a burst don't all stack on the same row.
+fn particle_y(base_nanos: u64, idx: u32) -> u8 {
+    let h = base_nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(idx).wrapping_mul(0xC6BC_2796_92B5_C323));
+    let total = u64::from(TURBINE_ROWS) * u64::from(Y_PER_ROW);
+    ((h >> 27) % total) as u8
+}
+
 pub struct ShredIngressPane {
-    turbine: BucketLane,
-    repair: BucketLane,
-    drop_lane: BucketLane,
-    err_lane: BucketLane,
+    turbine: LaneSpark,
+    turbine_stream: TurbineStream,
+    repair: LaneSpark,
+    drop_lane: LaneSpark,
+    err_lane: LaneSpark,
     numbers: LatestNumbers,
     now: Instant,
 }
@@ -197,25 +258,17 @@ impl ShredIngressPane {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
-            turbine: BucketLane::new(now),
-            repair: BucketLane::new(now),
-            drop_lane: BucketLane::new(now),
-            err_lane: BucketLane::new(now),
+            turbine: LaneSpark::new(now),
+            turbine_stream: TurbineStream::new(now),
+            repair: LaneSpark::new(now),
+            drop_lane: LaneSpark::new(now),
+            err_lane: LaneSpark::new(now),
             numbers: LatestNumbers::default(),
             now,
         }
     }
 
-    const fn lane_mut(&mut self, lane: Lane) -> &mut BucketLane {
-        match lane {
-            Lane::Turbine => &mut self.turbine,
-            Lane::Repair => &mut self.repair,
-            Lane::Drop => &mut self.drop_lane,
-            Lane::Err => &mut self.err_lane,
-        }
-    }
-
-    const fn lane_ref(&self, lane: Lane) -> &BucketLane {
+    const fn lane_ref(&self, lane: Lane) -> &LaneSpark {
         match lane {
             Lane::Turbine => &self.turbine,
             Lane::Repair => &self.repair,
@@ -239,22 +292,24 @@ impl Pane for ShredIngressPane {
         match m {
             MetricEvent::ShredFetch { shred_count } => {
                 self.numbers.fetch = Some(*shred_count);
-                self.lane_mut(Lane::Turbine)
-                    .accumulate(u32::try_from(*shred_count).unwrap_or(u32::MAX));
+                let v = u32::try_from(*shred_count).unwrap_or(u32::MAX);
+                self.turbine.accumulate(v);
+                // Particle stream spawns proportional to count.
+                self.turbine_stream.on_event(self.now, v);
             }
             MetricEvent::ShredFetchRepair { shred_count } => {
                 self.numbers.repair = Some(*shred_count);
-                self.lane_mut(Lane::Repair)
+                self.repair
                     .accumulate(u32::try_from(*shred_count).unwrap_or(u32::MAX));
             }
             MetricEvent::ShredSigverify { num_discards, .. } => {
                 self.numbers.drop = Some(*num_discards);
-                self.lane_mut(Lane::Drop)
+                self.drop_lane
                     .accumulate(u32::try_from(*num_discards).unwrap_or(u32::MAX));
             }
             MetricEvent::RecvWindowInsert { num_errors, .. } => {
                 self.numbers.err = Some(*num_errors);
-                self.lane_mut(Lane::Err)
+                self.err_lane
                     .accumulate(u32::try_from(*num_errors).unwrap_or(u32::MAX));
             }
             _ => {}
@@ -263,14 +318,11 @@ impl Pane for ShredIngressPane {
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
-        // History capacity is generous; the render loop only paints
-        // what fits in the chart area, so we cap once at the upper
-        // limit and let the renderer slice.
-        let cap = 1024;
-        self.turbine.advance(now, cap);
-        self.repair.advance(now, cap);
-        self.drop_lane.advance(now, cap);
-        self.err_lane.advance(now, cap);
+        self.turbine.advance(now);
+        self.turbine_stream.tick(now);
+        self.repair.advance(now);
+        self.drop_lane.advance(now);
+        self.err_lane.advance(now);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -282,50 +334,78 @@ impl Pane for ShredIngressPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Need enough height for the 4 bar rows + 1 row breathing
-        // above + 1 snapshot row at bottom.
-        if inner.width < 30 || inner.height < CARD_BAR_ROWS + 2 {
+        let min_height = 1 + TURBINE_ROWS + SPARK_LANES as u16 + 1;
+        if inner.width < LABEL_COL_WIDTH + 8 || inner.height < min_height {
             return;
         }
 
+        // Vertical layout: top spacer / turbine (2 rows) /
+        // repair-drop-err (1 row each) / filler / snapshot.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Length(CARD_BAR_ROWS),
+                Constraint::Length(TURBINE_ROWS),
+                Constraint::Length(SPARK_LANES as u16),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
             .split(inner);
 
-        self.render_chart(frame, chunks[1]);
-        self.render_snapshot(frame, chunks[3]);
+        self.render_turbine(frame, chunks[1]);
+        self.render_spark_lanes(frame, chunks[2]);
+        self.render_snapshot(frame, chunks[4]);
     }
 }
 
 impl ShredIngressPane {
-    fn render_chart(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width <= LABEL_COL_WIDTH + CARD_SLOT_WIDTH {
-            return;
-        }
-        let h_chunks = Layout::default()
+    fn render_turbine(&self, frame: &mut Frame<'_>, area: Rect) {
+        let h = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(LABEL_COL_WIDTH), Constraint::Min(8)])
             .split(area);
-        let label_area = h_chunks[0];
-        let chart_area = h_chunks[1];
+        let label_area = h[0];
+        let chart_area = h[1];
 
-        render_legend(frame, label_area);
-        render_card_flow(
-            frame,
-            chart_area,
-            &[
-                (Lane::Turbine, self.lane_ref(Lane::Turbine)),
-                (Lane::Repair, self.lane_ref(Lane::Repair)),
-                (Lane::Drop, self.lane_ref(Lane::Drop)),
-                (Lane::Err, self.lane_ref(Lane::Err)),
-            ],
-        );
+        // Label only on the first row of the turbine block.
+        let label_line = Line::from(Span::styled(
+            format!(" {} {}", Lane::Turbine.label(), Lane::Turbine.marker()),
+            Style::default()
+                .fg(Lane::Turbine.colour())
+                .add_modifier(Modifier::BOLD),
+        ));
+        let label_first = Rect::new(label_area.x, label_area.y, label_area.width, 1);
+        frame.render_widget(Paragraph::new(label_line), label_first);
+
+        render_turbine_particles(frame, chart_area, &self.turbine_stream, self.now);
+    }
+
+    fn render_spark_lanes(&self, frame: &mut Frame<'_>, area: Rect) {
+        for (i, lane) in SPARK_LANE_LIST.iter().enumerate() {
+            let y = area.y + i as u16;
+            let row = Rect::new(area.x, y, area.width, 1);
+            self.render_spark_row(frame, row, *lane);
+        }
+    }
+
+    fn render_spark_row(&self, frame: &mut Frame<'_>, row_area: Rect, lane: Lane) {
+        let h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(LABEL_COL_WIDTH), Constraint::Min(8)])
+            .split(row_area);
+        let label_area = h[0];
+        let chart_area = h[1];
+
+        let label_line = Line::from(Span::styled(
+            format!(" {} {}", lane.label(), lane.marker()),
+            Style::default()
+                .fg(lane.colour())
+                .add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(label_line), label_area);
+
+        let line = build_chart_line(self.lane_ref(lane), chart_area.width, lane);
+        frame.render_widget(Paragraph::new(line), chart_area);
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -333,6 +413,7 @@ impl ShredIngressPane {
         let repair = fmt_opt(self.numbers.repair);
         let drop = fmt_opt(self.numbers.drop);
         let err = fmt_opt(self.numbers.err);
+        let particles = self.turbine_stream.particles.len();
 
         let line = Line::from(vec![
             Span::styled(format!(" {fetch}"), Style::default().fg(COL_TURBINE)),
@@ -370,9 +451,9 @@ impl ShredIngressPane {
             sep(),
             Span::styled(
                 format!(
-                    "card {}s × {} lanes",
-                    BUCKET_DURATION.as_secs(),
-                    LANES_PER_CARD,
+                    "{} particles · {} ms / cell",
+                    particles,
+                    BUCKET_DURATION.as_millis()
                 ),
                 Style::default()
                     .fg(Color::DarkGray)
@@ -396,136 +477,236 @@ fn sep() -> Span<'static> {
     )
 }
 
-/// Paint the legend in the label column: one row per lane showing
-/// `name ●` with the lane's colour, so the operator knows which
-/// vertical bar inside each card maps to which lane.
-fn render_legend(frame: &mut Frame<'_>, label_area: Rect) {
-    if label_area.height < CARD_BAR_ROWS || label_area.width < 4 {
-        return;
-    }
-    let lanes = [Lane::Turbine, Lane::Repair, Lane::Drop, Lane::Err];
-    for (row, lane) in lanes.iter().enumerate() {
-        let y = label_area.y + row as u16;
-        let label = lane.label();
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {label}"),
-                Style::default()
-                    .fg(lane.colour())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " ●",
-                Style::default()
-                    .fg(lane.colour())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(label_area.x, y, label_area.width, 1),
-        );
+/// Standard Braille dot bit values per (col, row) — see U+2800 block:
+/// dots are numbered 1-8 in a 2×4 grid (col, row):
+/// (0,0)=1=0x01 (1,0)=4=0x08
+/// (0,1)=2=0x02 (1,1)=5=0x10
+/// (0,2)=3=0x04 (1,2)=6=0x20
+/// (0,3)=7=0x40 (1,3)=8=0x80
+const fn braille_bit(col: u8, row: u8) -> u8 {
+    match (col, row) {
+        (0, 0) => 0x01,
+        (1, 0) => 0x08,
+        (0, 1) => 0x02,
+        (1, 1) => 0x10,
+        (0, 2) => 0x04,
+        (1, 2) => 0x20,
+        (0, 3) => 0x40,
+        (1, 3) => 0x80,
+        _ => 0,
     }
 }
 
-type LaneBuckets<'a> = [(Lane, &'a BucketLane); LANES_PER_CARD as usize];
-
-/// Paint the card flow. Cards line up right-to-left across the chart
-/// area; each card has LANES_PER_CARD vertical bars (one per lane)
-/// followed by one divider column. The rightmost card is the in-
-/// progress (current) bucket — its bars grow as new events arrive.
-fn render_card_flow(frame: &mut Frame<'_>, chart_area: Rect, lanes: &LaneBuckets<'_>) {
-    if chart_area.width == 0 || chart_area.height < CARD_BAR_ROWS {
+/// Render the turbine particle field. The chart area is
+/// [`TURBINE_ROWS`] rows tall; particles' Y values map into one of
+/// `TURBINE_ROWS × Y_PER_ROW` vertical sub-pixels, and the row a
+/// particle lands in is `y / Y_PER_ROW`. Card dividers are
+/// embedded into the same `Line` as the Braille glyphs.
+fn render_turbine_particles(
+    frame: &mut Frame<'_>,
+    chart_area: Rect,
+    stream: &TurbineStream,
+    now: Instant,
+) {
+    let chart_width = chart_area.width as usize;
+    if chart_width == 0 || chart_area.height == 0 {
         return;
     }
-    let rightmost_x = chart_area.x + chart_area.width - 1;
-    let stride = CARD_SLOT_WIDTH;
-    let n_cards = chart_area.width / stride;
+    let total_subpixels = chart_width * SUBPIXELS_PER_CELL;
+    let subpixel_micros = SUBPIXEL_DURATION.as_micros() as u64;
 
-    for card_index in 0..n_cards {
-        // card_index 0 = rightmost (current); higher = older.
-        let card_right_x = rightmost_x - card_index * stride;
-        // The card slot is [card_left_x, card_right_x] where
-        // card_left_x = card_right_x - (LANES_PER_CARD - 1). The
-        // divider column sits at card_left_x - 1.
-        let bars_left_x = card_right_x.saturating_sub(LANES_PER_CARD - 1);
+    // One bit-pattern array per chart row.
+    let mut row_bits: Vec<Vec<u8>> = (0..TURBINE_ROWS as usize)
+        .map(|_| vec![0u8; chart_width])
+        .collect();
 
-        // Divider column (between THIS card and the OLDER one to its
-        // left). Skip if the older card slot wouldn't exist.
-        if card_index + 1 < n_cards && bars_left_x > 0 {
-            let div_x = bars_left_x - 1;
-            for row in 0..CARD_BAR_ROWS {
-                let y = chart_area.y + row;
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        CARD_DIVIDER.to_owned(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    )),
-                    Rect::new(div_x, y, 1, 1),
-                );
+    for particle in &stream.particles {
+        if particle.spawn_ts > now {
+            continue;
+        }
+        let age_micros = now.duration_since(particle.spawn_ts).as_micros() as u64;
+        let drift = (age_micros / subpixel_micros) as usize;
+        if drift >= total_subpixels {
+            continue;
+        }
+        let sub_x = total_subpixels - 1 - drift;
+        let cell_idx = sub_x / SUBPIXELS_PER_CELL;
+        let cell_col = (sub_x % SUBPIXELS_PER_CELL) as u8;
+        let row = (particle.y / Y_PER_ROW) as usize;
+        let y_in_row = particle.y % Y_PER_ROW;
+        if row >= row_bits.len() || cell_idx >= chart_width {
+            continue;
+        }
+        row_bits[row][cell_idx] |= braille_bit(cell_col, y_in_row);
+    }
+
+    let particle_style = Style::default()
+        .fg(COL_TURBINE)
+        .add_modifier(Modifier::BOLD);
+    let div_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+
+    for (row_idx, bits) in row_bits.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut buf = String::new();
+        let mut buf_is_divider = false;
+        for (idx, &b) in bits.iter().enumerate() {
+            let offset_from_right = chart_width.saturating_sub(1).saturating_sub(idx);
+            let is_div = is_divider_offset(offset_from_right);
+            if is_div != buf_is_divider && !buf.is_empty() {
+                let s = if buf_is_divider {
+                    div_style
+                } else {
+                    particle_style
+                };
+                spans.push(Span::styled(std::mem::take(&mut buf), s));
+            }
+            buf_is_divider = is_div;
+            if is_div {
+                buf.push_str(CARD_DIVIDER);
+            } else {
+                let codepoint = 0x2800u32 + u32::from(b);
+                buf.push(char::from_u32(codepoint).unwrap_or('⠀'));
             }
         }
+        if !buf.is_empty() {
+            let s = if buf_is_divider {
+                div_style
+            } else {
+                particle_style
+            };
+            spans.push(Span::styled(buf, s));
+        }
+        let y = chart_area.y + row_idx as u16;
+        let row_rect = Rect::new(chart_area.x, y, chart_area.width, 1);
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+    }
+}
 
-        // Each lane within the card gets its own column.
-        for (lane, bucket) in lanes {
-            let value = lookup_bucket_value(bucket, card_index as usize);
-            let cap = lane.cap();
-            let col_x = bars_left_x + lane.card_col();
-            render_vertical_bar(frame, col_x, chart_area.y, value, cap, *lane);
+/// Stable per-lane scaling for sparkline rows: `2 × mean(nonzero)`
+/// across retained history. See LIVE-21 for rationale.
+fn stable_max(spark: &LaneSpark) -> u64 {
+    let mut count = 0u64;
+    let mut sum = 0u64;
+    for &v in spark.history.iter().chain(std::iter::once(&spark.current)) {
+        if v > 0 {
+            count = count.saturating_add(1);
+            sum = sum.saturating_add(u64::from(v));
         }
     }
+    if count == 0 {
+        MIN_LANE_MAX
+    } else {
+        sum.saturating_mul(2)
+            .checked_div(count)
+            .unwrap_or(MIN_LANE_MAX)
+            .max(MIN_LANE_MAX)
+    }
 }
 
-/// Look up the bucket value `n_back` cards from the present.
-/// `n_back == 0` returns the current (in-progress) bucket;
-/// `n_back == 1` returns the most recently committed bucket; etc.
-fn lookup_bucket_value(bucket: &BucketLane, n_back: usize) -> u32 {
-    if n_back == 0 {
-        return bucket.current;
+fn build_visible_cells(spark: &LaneSpark, width: usize) -> Vec<Option<u32>> {
+    if width == 0 {
+        return Vec::new();
     }
-    let idx = bucket.history.len().wrapping_sub(n_back);
-    bucket.history.get(idx).copied().unwrap_or(0)
+    let history_window = width.saturating_sub(1);
+    let history_skip = spark.history.len().saturating_sub(history_window);
+    let real: Vec<u32> = spark
+        .history
+        .iter()
+        .skip(history_skip)
+        .copied()
+        .chain(std::iter::once(spark.current))
+        .collect();
+    let pad = width.saturating_sub(real.len());
+    let mut cells = Vec::with_capacity(width);
+    for _ in 0..pad {
+        cells.push(None);
+    }
+    for v in real {
+        cells.push(Some(v));
+    }
+    cells
 }
 
-/// Render one vertical bar at column `col_x`, starting at `top_y`,
-/// spanning [`CARD_BAR_ROWS`] rows. Value/cap is mapped to a total
-/// fill of `CARD_BAR_ROWS × 8` sub-pixels, distributed bottom-up.
-fn render_vertical_bar(
-    frame: &mut Frame<'_>,
-    col_x: u16,
-    top_y: u16,
-    value: u32,
-    cap: u32,
-    lane: Lane,
-) {
-    if cap == 0 {
-        return;
+#[allow(clippy::cast_possible_truncation)]
+fn level_for(value: u32, max: u64) -> usize {
+    if max == 0 {
+        return 0;
     }
-    let total_subpixels = u32::from(CARD_BAR_ROWS) * 8;
-    let filled = (u64::from(value) * u64::from(total_subpixels) / u64::from(cap))
-        .min(u64::from(total_subpixels)) as u32;
-    let modifier = if lane.is_attention() {
+    let level = (u64::from(value).saturating_mul(8) / max).min(8);
+    level as usize
+}
+
+fn glyph_for_level(level: usize, bars: &[&'static str; 9]) -> &'static str {
+    bars[level.min(8)]
+}
+
+/// Per-lane glyph table. Sparse event lanes (repair, drop, err)
+/// use dot marks; turbine is rendered via the particle path so
+/// this is unused for it. The match is exhaustive so any future
+/// lane gets an explicit decision instead of a silent default.
+const fn bars_for(lane: Lane) -> &'static [&'static str; 9] {
+    match lane {
+        Lane::Turbine => &BLOCK_BARS,
+        Lane::Repair | Lane::Drop | Lane::Err => &MARK_BARS,
+    }
+}
+
+const fn is_divider_offset(offset_from_right: usize) -> bool {
+    offset_from_right > 0 && offset_from_right.is_multiple_of(CELLS_PER_CARD as usize)
+}
+
+fn build_chart_line(spark: &LaneSpark, chart_width: u16, lane: Lane) -> Line<'static> {
+    let max = stable_max(spark);
+    let width = chart_width as usize;
+    let cells = build_visible_cells(spark, width);
+    let bars = bars_for(lane);
+    let lane_modifier = if lane.is_attention() {
         Modifier::BOLD
     } else {
         Modifier::DIM
     };
-    let style = Style::default().fg(lane.colour()).add_modifier(modifier);
-    // Bottom-up: the bottom row of the bar fills first.
-    for row_from_bottom in 0..CARD_BAR_ROWS {
-        let consumed_below = u32::from(row_from_bottom) * 8;
-        let in_this_row = filled.saturating_sub(consumed_below).min(8) as usize;
-        if in_this_row == 0 {
-            continue;
+    let lane_style = Style::default()
+        .fg(lane.colour())
+        .add_modifier(lane_modifier);
+    let div_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_divider = false;
+
+    for (idx, cell) in cells.iter().enumerate() {
+        let offset_from_right = width.saturating_sub(1).saturating_sub(idx);
+        let is_div = is_divider_offset(offset_from_right);
+        if is_div != buf_is_divider && !buf.is_empty() {
+            let style = if buf_is_divider {
+                div_style
+            } else {
+                lane_style
+            };
+            spans.push(Span::styled(std::mem::take(&mut buf), style));
         }
-        let glyph = FILL_CHARS[in_this_row];
-        let y = top_y + (CARD_BAR_ROWS - 1 - row_from_bottom);
-        frame.render_widget(
-            Paragraph::new(Span::styled(glyph.to_owned(), style)),
-            Rect::new(col_x, y, 1, 1),
-        );
+        buf_is_divider = is_div;
+        if is_div {
+            buf.push_str(CARD_DIVIDER);
+        } else if let Some(value) = cell {
+            buf.push_str(glyph_for_level(level_for(*value, max), bars));
+        } else {
+            buf.push(' ');
+        }
     }
+    if !buf.is_empty() {
+        let style = if buf_is_divider {
+            div_style
+        } else {
+            lane_style
+        };
+        spans.push(Span::styled(buf, style));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -553,33 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn tick_rolls_current_bucket_into_history_after_duration() {
+    fn shred_fetch_spawns_turbine_particles() {
         let mut p = ShredIngressPane::new();
+        let before = p.turbine_stream.particles.len();
         p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
             shred_count: 100,
         })));
-        // Force the elapsed time past one bucket window.
-        p.turbine.current_started = Instant::now()
-            .checked_sub(BUCKET_DURATION + Duration::from_millis(10))
-            .unwrap();
-        p.tick(Instant::now());
-        assert_eq!(p.turbine.current, 0);
-        assert_eq!(p.turbine.history.back().copied(), Some(100));
-    }
-
-    #[test]
-    fn repair_only_accumulates_when_shred_count_present() {
-        let mut p = ShredIngressPane::new();
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
-            shred_count: 0,
-        })));
-        // Accumulation of 0 is allowed (history will show empty), but
-        // the field updates regardless.
-        assert_eq!(p.repair.current, 0);
-        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetchRepair {
-            shred_count: 5,
-        })));
-        assert_eq!(p.repair.current, 5);
+        let after = p.turbine_stream.particles.len();
+        // 100 / 16 = 7 particles
+        assert!(after > before);
+        assert!(after - before >= 6);
     }
 
     #[test]
@@ -609,21 +773,53 @@ mod tests {
         let mut p = ShredIngressPane::new();
         p.on_event(&mk(EventKind::FirstShred { slot: 1 }));
         assert_eq!(p.turbine.current, 0);
+        assert_eq!(p.turbine_stream.particles.len(), 0);
     }
 
     #[test]
-    fn lane_caps_match_documented_values() {
-        assert_eq!(Lane::Turbine.cap(), 200_000);
-        assert_eq!(Lane::Repair.cap(), 150);
-        assert_eq!(Lane::Drop.cap(), 1_000);
-        assert_eq!(Lane::Err.cap(), 50);
+    fn particle_event_caps_count_at_max() {
+        let mut p = ShredIngressPane::new();
+        // Huge event — should be capped at MAX_PARTICLES_PER_EVENT.
+        p.on_event(&mk(EventKind::Metric(MetricEvent::ShredFetch {
+            shred_count: 100_000,
+        })));
+        assert!(p.turbine_stream.particles.len() <= MAX_PARTICLES_PER_EVENT as usize);
     }
 
     #[test]
-    fn card_col_assignment_unique_per_lane() {
-        assert_eq!(Lane::Turbine.card_col(), 0);
-        assert_eq!(Lane::Repair.card_col(), 1);
-        assert_eq!(Lane::Drop.card_col(), 2);
-        assert_eq!(Lane::Err.card_col(), 3);
+    fn build_visible_cells_pads_left_with_none() {
+        let now = Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(5);
+        spark.history.push_back(10);
+        spark.current = 7;
+        let cells = build_visible_cells(&spark, 6);
+        assert_eq!(cells, vec![None, None, None, Some(5), Some(10), Some(7)]);
+    }
+
+    #[test]
+    fn stable_max_is_2x_mean_of_nonzero() {
+        let now = Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(4);
+        spark.history.push_back(8);
+        spark.current = 0;
+        assert_eq!(stable_max(&spark), 12);
+    }
+
+    #[test]
+    fn divider_offsets_anchored_to_right_edge() {
+        assert!(!is_divider_offset(0));
+        assert!(is_divider_offset(CELLS_PER_CARD as usize));
+        assert!(is_divider_offset((CELLS_PER_CARD * 2) as usize));
+        assert!(!is_divider_offset(CELLS_PER_CARD as usize + 1));
+    }
+
+    #[test]
+    fn particle_y_within_bounds() {
+        for idx in 0..1000 {
+            let y = particle_y(idx as u64 * 31, idx as u32);
+            assert!(u16::from(y) < TURBINE_ROWS * u16::from(Y_PER_ROW));
+        }
     }
 }
