@@ -1,7 +1,18 @@
-//! Chain timeline — recent slots with fork detection, canonical
-//! resolution, and skip classification.
+//! Chain pane — calm spinner + event log.
 //!
-//! Tracks the block graph as events arrive:
+//! Most slots on a healthy validator are fast-finalised canonical
+//! slots that we notarised in time — there is no useful per-slot
+//! visual to draw for them. Instead the pane shows:
+//!
+//! - A spinner and the **tip slot number** at the top, proving the
+//!   stream is live and giving the operator a slot counter.
+//! - A short **event log** of *only* the notable things that
+//!   happened recently: forks, canonical-skips, slow finalisations,
+//!   slots we did not notarise, and leader-window announcements.
+//!
+//! The underlying graph model still tracks every `Block` /
+//! `Finalized` / `VotingSkip` / `VotingNotarize` /
+//! `SettingRoot` / `ProduceWindow` event:
 //!
 //! - [`EventKind::Block { slot, hash, parent_slot, parent_hash, .. }`]
 //!   stores the parent edge `(slot, hash) → (parent_slot, parent_hash)`.
@@ -16,8 +27,6 @@
 //! - [`EventKind::VotingSkip { slot }`] records the skip. At render
 //!   time the skip is classified (see below).
 //!
-//! Renders a two-row timeline: canonical events on top, non-canonical
-//! observations on the bottom (only populated when forks are seen).
 //! Snapshot row tallies canonical-skip / indeterminate counts.
 //!
 //! Classification (mirrors the aggregator):
@@ -128,7 +137,16 @@ pub struct ChainPane {
     /// `Finalized` events and walked back through `parents`.
     canonical: HashSet<BlockId>,
     last_root: Option<u64>,
+    /// Recent leader windows observed via `ProduceWindow`. Surfaced
+    /// in the event log as `★ leader N..M`.
+    recent_leader_windows: VecDeque<(u64, u64)>,
+    /// Anchor for the render-time spinner. Not read in `tick`;
+    /// driven by `Instant::elapsed` purely in `render`.
+    stream_start: Instant,
 }
+
+const RECENT_WINDOWS_CAPACITY: usize = 8;
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 impl ChainPane {
     pub fn new() -> Self {
@@ -137,7 +155,13 @@ impl ChainPane {
             parents: HashMap::with_capacity(EDGES_CAPACITY),
             canonical: HashSet::with_capacity(EDGES_CAPACITY),
             last_root: None,
+            recent_leader_windows: VecDeque::with_capacity(RECENT_WINDOWS_CAPACITY),
+            stream_start: Instant::now(),
         }
+    }
+
+    fn tip_slot(&self) -> Option<u64> {
+        self.slots.back().map(|s| s.slot)
     }
 
     fn upsert_slot(&mut self, slot: u64) -> &mut SlotState {
@@ -303,6 +327,14 @@ impl Pane for ChainPane {
             EventKind::SettingRoot { slot } | EventKind::NewRoot { slot } => {
                 self.last_root = Some(*slot);
             }
+            EventKind::ProduceWindow { start, end, .. } => {
+                if *end >= *start && end.saturating_sub(*start) <= 32 {
+                    self.recent_leader_windows.push_back((*start, *end));
+                    while self.recent_leader_windows.len() > RECENT_WINDOWS_CAPACITY {
+                        self.recent_leader_windows.pop_front();
+                    }
+                }
+            }
             _ => return,
         }
         self.prune();
@@ -319,7 +351,7 @@ impl Pane for ChainPane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if inner.width < 10 || inner.height < 4 {
+        if inner.width < 20 || inner.height < 4 {
             return;
         }
 
@@ -327,144 +359,165 @@ impl Pane for ChainPane {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // top spacer
-                Constraint::Length(1), // canonical row
-                Constraint::Length(1), // non-canonical row
-                Constraint::Min(0),    // filler
+                Constraint::Length(1), // spinner + tip slot
+                Constraint::Length(1), // blank
+                Constraint::Length(1), // "recent activity" label
+                Constraint::Min(1),    // event log
                 Constraint::Length(1), // snapshot
             ])
             .split(inner);
 
-        self.render_canonical_row(frame, chunks[1]);
-        self.render_noncanonical_row(frame, chunks[2]);
-        self.render_snapshot(frame, chunks[4]);
+        self.render_tip(frame, chunks[1]);
+        Self::render_section_label(frame, chunks[3], "recent activity");
+        self.render_event_log(frame, chunks[4]);
+        self.render_snapshot(frame, chunks[5]);
     }
 }
 
+/// One row in the "recent activity" log: a slot number, a glyph,
+/// and a short description. Boring slots (fast-finalised canonical
+/// that we notarised in time) never produce a log entry.
+#[derive(Debug, Clone)]
+struct EventEntry {
+    slot: u64,
+    glyph: &'static str,
+    colour: Color,
+    label: String,
+}
+
 impl ChainPane {
-    fn render_canonical_row(&self, frame: &mut Frame<'_>, area: Rect) {
-        let width = area.width as usize;
-        if width == 0 || self.slots.is_empty() {
+    fn render_tip(&self, frame: &mut Frame<'_>, area: Rect) {
+        let elapsed_ms = self.stream_start.elapsed().as_millis() as u64;
+        let spinner_idx = (elapsed_ms / 100) as usize % SPINNER.len();
+        let spinner = SPINNER[spinner_idx];
+        let tip = self
+            .tip_slot()
+            .map_or_else(|| "—".to_owned(), |s| s.to_string());
+        let line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                spinner.to_owned(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                tip,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  tip slot", theme::label_style()),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    fn render_section_label(frame: &mut Frame<'_>, area: Rect, label: &str) {
+        let line = Line::from(Span::styled(format!("  {label}"), theme::label_style()));
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    fn render_event_log(&self, frame: &mut Frame<'_>, area: Rect) {
+        let max = area.height as usize;
+        if max == 0 {
             return;
         }
-        let n = self.slots.len();
-        let start = n.saturating_sub(width);
-        let visible_count = n - start;
-        let pad = width.saturating_sub(visible_count);
-
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        let mut buf = String::new();
-        let mut buf_style: Option<Style> = None;
-        for s in self.slots.iter().skip(start) {
-            let (glyph, style) = self.canonical_row_glyph(s);
-            if buf_style != Some(style) && !buf.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut buf),
-                    buf_style.unwrap_or_default(),
-                ));
-            }
-            buf_style = Some(style);
-            buf.push_str(glyph);
-        }
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, buf_style.unwrap_or_default()));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    fn render_noncanonical_row(&self, frame: &mut Frame<'_>, area: Rect) {
-        let width = area.width as usize;
-        if width == 0 || self.slots.is_empty() {
+        let events = self.recent_events(max);
+        if events.is_empty() {
+            let line = Line::from(vec![
+                Span::raw("     "),
+                Span::styled(
+                    "(no notable events yet)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            let row = Rect::new(area.x, area.y, area.width, 1);
+            frame.render_widget(Paragraph::new(line), row);
             return;
         }
-        let n = self.slots.len();
-        let start = n.saturating_sub(width);
-        let visible_count = n - start;
-        let pad = width.saturating_sub(visible_count);
-
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
+        for (i, e) in events.iter().enumerate().take(max) {
+            let y = area.y + i as u16;
+            let row = Rect::new(area.x, y, area.width, 1);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("    {}", e.slot),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    e.glyph.to_owned(),
+                    Style::default().fg(e.colour).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(e.label.clone(), Style::default().fg(Color::White)),
+            ]);
+            frame.render_widget(Paragraph::new(line), row);
         }
-        let mut buf = String::new();
-        let mut buf_style: Option<Style> = None;
-        for s in self.slots.iter().skip(start) {
-            let (glyph, style) = self.noncanonical_row_glyph(s);
-            if buf_style != Some(style) && !buf.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut buf),
-                    buf_style.unwrap_or_default(),
-                ));
-            }
-            buf_style = Some(style);
-            buf.push_str(glyph);
-        }
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, buf_style.unwrap_or_default()));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Canonical row's glyph for slot `s`. Surfaces three dimensions
-    /// at once for canonical slots: fast vs slow finalisation, and
-    /// whether we notarised the slot ourselves.
-    ///
-    /// - `●` bright green — fast finalised AND we notarised (ideal).
-    /// - `◐` green — slow finalised (two rounds) AND we notarised.
-    /// - `○` yellow — canonical but we did *not* notarise (we missed
-    ///   the vote or it arrived too late).
-    /// - `▴` red — canonical-skip (we voted skip on a slot that
-    ///   ended up canonical).
-    /// - `?` yellow — indeterminate skip.
-    fn canonical_row_glyph(&self, s: &SlotState) -> (&'static str, Style) {
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let has_canonical_here = s
-            .hashes
-            .iter()
-            .any(|h| self.canonical.contains(&(s.slot, h.clone())));
-        if has_canonical_here {
-            if s.skipped {
-                // Canonical but we voted skip — handled below.
-            } else if !s.notarized {
-                return ("○", bold.fg(Color::Yellow));
-            } else if s.fast_finalized == Some(false) {
-                return ("◐", bold.fg(Color::Green));
-            } else {
-                return ("●", bold.fg(Color::Green));
+    /// Derive the event log from current slot state + leader window
+    /// deque. Newest first. Boring fast-finalised-canonical slots that
+    /// we notarised in time produce no entry.
+    fn recent_events(&self, max: usize) -> Vec<EventEntry> {
+        let mut out: Vec<EventEntry> = Vec::new();
+        for s in self.slots.iter().rev() {
+            if out.len() >= max * 2 {
+                break;
+            }
+            if s.is_forked() {
+                out.push(EventEntry {
+                    slot: s.slot,
+                    glyph: "⊕",
+                    colour: Color::Yellow,
+                    label: format!("fork ({} blocks)", s.hashes.len()),
+                });
+                continue;
+            }
+            let canonical_here = s
+                .hashes
+                .iter()
+                .any(|h| self.canonical.contains(&(s.slot, h.clone())));
+            if canonical_here && s.skipped {
+                out.push(EventEntry {
+                    slot: s.slot,
+                    glyph: "▴",
+                    colour: Color::Red,
+                    label: "canonical-skip".to_owned(),
+                });
+                continue;
+            }
+            if canonical_here && !s.notarized {
+                out.push(EventEntry {
+                    slot: s.slot,
+                    glyph: "○",
+                    colour: Color::Yellow,
+                    label: "canonical, we did not notarise".to_owned(),
+                });
+                continue;
+            }
+            if canonical_here && s.fast_finalized == Some(false) {
+                out.push(EventEntry {
+                    slot: s.slot,
+                    glyph: "◐",
+                    colour: Color::Yellow,
+                    label: "slow finalise".to_owned(),
+                });
             }
         }
-        if s.skipped {
-            return match self.classify_skip(s.slot) {
-                SkipClass::OnCanonical => ("▴", bold.fg(Color::Red)),
-                SkipClass::Indeterminate => ("?", bold.fg(Color::Yellow)),
-            };
+        for &(start, end) in self.recent_leader_windows.iter().rev().take(2) {
+            out.push(EventEntry {
+                slot: start,
+                glyph: "★",
+                colour: Color::Green,
+                label: format!("leader {start}..{end}"),
+            });
         }
-        (" ", Style::default())
-    }
-
-    /// Non-canonical row: shows non-canonical block observations
-    /// (forks and pending non-canonical singles).
-    fn noncanonical_row_glyph(&self, s: &SlotState) -> (&'static str, Style) {
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        // Non-canonical blocks present? (blocks observed but none canonical)
-        let has_any = !s.hashes.is_empty();
-        let has_canonical = s
-            .hashes
-            .iter()
-            .any(|h| self.canonical.contains(&(s.slot, h.clone())));
-        if s.is_forked() {
-            // Multiple hashes seen; if at least one is non-canonical,
-            // show the non-canonical sibling.
-            return ("○", bold.fg(Color::DarkGray));
-        }
-        if has_any && !has_canonical {
-            // Single hash but never finalised canonical — could be a
-            // pending non-canonical block.
-            return ("○", Style::default().fg(Color::DarkGray));
-        }
-        (" ", Style::default())
+        out.sort_by_key(|e| std::cmp::Reverse(e.slot));
+        out.truncate(max);
+        out
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -674,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_slot_we_did_not_notarize_renders_yellow_circle() {
+    fn canonical_slot_we_did_not_notarise_appears_in_event_log() {
         let mut p = ChainPane::new();
         p.on_event(&block_ev(100, "a", 99, "root"));
         p.on_event(&mk(EventKind::Finalized {
@@ -682,14 +735,18 @@ mod tests {
             hash: "a".into(),
             fast: true,
         }));
-        // No VotingNotarize for slot 100.
-        let s = p.slots.iter().find(|s| s.slot == 100).unwrap();
-        let (glyph, _) = p.canonical_row_glyph(s);
-        assert_eq!(glyph, "○", "canonical without notarise → ○");
+        // No VotingNotarize for slot 100 — should surface as a notable event.
+        let events = p.recent_events(10);
+        let e = events
+            .iter()
+            .find(|e| e.slot == 100)
+            .expect("event for 100");
+        assert_eq!(e.glyph, "○");
+        assert!(e.label.contains("notarise"), "got {}", e.label);
     }
 
     #[test]
-    fn slow_finalised_with_notarise_renders_half_circle() {
+    fn slow_finalised_with_notarise_appears_in_event_log() {
         let mut p = ChainPane::new();
         p.on_event(&block_ev(100, "a", 99, "root"));
         p.on_event(&mk(EventKind::VotingNotarize {
@@ -701,13 +758,17 @@ mod tests {
             hash: "a".into(),
             fast: false,
         }));
-        let s = p.slots.iter().find(|s| s.slot == 100).unwrap();
-        let (glyph, _) = p.canonical_row_glyph(s);
-        assert_eq!(glyph, "◐", "slow + notarised → ◐");
+        let events = p.recent_events(10);
+        let e = events
+            .iter()
+            .find(|e| e.slot == 100)
+            .expect("event for 100");
+        assert_eq!(e.glyph, "◐");
+        assert!(e.label.contains("slow"), "got {}", e.label);
     }
 
     #[test]
-    fn fast_finalised_with_notarise_renders_full_circle() {
+    fn fast_finalised_with_notarise_is_a_boring_slot_no_event() {
         let mut p = ChainPane::new();
         p.on_event(&block_ev(100, "a", 99, "root"));
         p.on_event(&mk(EventKind::VotingNotarize {
@@ -719,9 +780,27 @@ mod tests {
             hash: "a".into(),
             fast: true,
         }));
-        let s = p.slots.iter().find(|s| s.slot == 100).unwrap();
-        let (glyph, _) = p.canonical_row_glyph(s);
-        assert_eq!(glyph, "●", "fast + notarised → ●");
+        // Fast + notarised = ideal slot. Nothing to log.
+        let events = p.recent_events(10);
+        assert!(
+            events.iter().all(|e| e.slot != 100),
+            "fast notarised slot should not appear in event log"
+        );
+    }
+
+    #[test]
+    fn produce_window_event_appears_in_event_log() {
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::ProduceWindow {
+            start: 200,
+            end: 203,
+            parent_slot: 199,
+            parent_hash: "x".into(),
+        }));
+        let events = p.recent_events(10);
+        let e = events.iter().find(|e| e.slot == 200).expect("leader event");
+        assert_eq!(e.glyph, "★");
+        assert!(e.label.contains("leader"), "got {}", e.label);
     }
 
     #[test]
