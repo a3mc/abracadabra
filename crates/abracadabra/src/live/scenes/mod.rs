@@ -16,6 +16,7 @@
 pub mod decorations;
 pub mod shred_ingress;
 pub mod slot_lifecycle;
+pub mod tx_pressure;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -39,17 +40,6 @@ struct PaneSlot {
 /// Constructed alongside the [`TailHandle`] on SPACEBAR-start; dropped
 /// alongside it on SPACEBAR-stop. Single-threaded, lives on the render
 /// thread.
-/// No-op pane used as a layout filler so the breathing strip between
-/// the named panes and the decorations strip is allocated explicitly.
-/// Future strips (voting, leader window, etc.) will replace this slot.
-struct EmptyPane;
-
-impl crate::live::animation::Pane for EmptyPane {
-    fn on_event(&mut self, _ev: &crate::parser::Event) {}
-    fn tick(&mut self, _now: Instant) {}
-    fn render(&self, _frame: &mut Frame<'_>, _area: Rect) {}
-}
-
 pub struct SceneEngine {
     slots: Vec<PaneSlot>,
     /// `LiveBuffer::total_events` value as of the last successful drain.
@@ -76,7 +66,7 @@ impl SceneEngine {
                     constraint: Constraint::Length(slot_lifecycle::PANE_HEIGHT),
                 },
                 PaneSlot {
-                    pane: Box::new(EmptyPane),
+                    pane: Box::new(tx_pressure::TxPressurePane::new()),
                     constraint: Constraint::Min(0),
                 },
                 PaneSlot {
@@ -122,19 +112,18 @@ impl SceneEngine {
     ///
     /// ```text
     /// ┌────────────────────────────────────────────────────────────┐
-    /// │ shred ingress          │ recent slots                      │  ← top row, 50/50 split
+    /// │ shred ingress          │ slot outcomes                     │  ← top row, 50/50 split
     /// │ (pane 0)               │ (pane 1)                          │
     /// ├────────────────────────────────────────────────────────────┤
-    /// │                                                            │  ← reserved breathing room
-    /// │ (future strips land here as a horizontal stack)            │     (pane 2 = EmptyPane)
+    /// │ tx pressure (full width canvas chart)                      │  ← pane 2
     /// ├────────────────────────────────────────────────────────────┤
     /// │ decorations strip                                          │  ← pane 3
     /// └────────────────────────────────────────────────────────────┘
     /// ```
     ///
     /// The top-row height is the maximum of the two top panes'
-    /// declared row heights; future strips live in the breathing slot
-    /// in the middle.
+    /// declared row heights; the middle slot expands with the
+    /// terminal (Constraint::Min(0)).
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         // For the current Live-tab layout: slots[0] = shred ingress,
         // slots[1] = slot lifecycle, slots[2] = empty filler,
