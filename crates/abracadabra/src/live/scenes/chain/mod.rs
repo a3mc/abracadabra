@@ -72,6 +72,7 @@
 //!   between state and render.
 
 mod format;
+mod particle;
 mod render;
 mod state;
 
@@ -91,9 +92,13 @@ impl Pane for ChainPane {
         self.observe_event(ev);
     }
 
-    fn tick(&mut self, _now: Instant) {
-        // No wall-clock state to advance; spinner derives from
-        // `event_count` / `last_event_at`, both updated in `observe_event`.
+    fn tick(&mut self, now: Instant) {
+        // Spinner derives from `event_count` / `last_event_at`,
+        // updated in `observe_event` — it does not need a per-tick
+        // advance. The cannon-particle world DOES: each frame
+        // advances in-flight particles by `(now - last_tick)` and
+        // lands any whose TTL has elapsed.
+        self.cannon.tick(now);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -103,7 +108,7 @@ impl Pane for ChainPane {
 
 #[cfg(test)]
 mod tests {
-    use super::render::snapshot_line;
+    use super::render::header_line;
     use super::state::{ChainPane, SkipClass};
     use crate::live::animation::Pane;
     use crate::parser::{Event, EventKind};
@@ -429,16 +434,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_line_uses_cskip_label_not_canon() {
+    fn header_line_uses_cskip_label_not_canon() {
         // UX-04: chain pane previously labelled the canonical-skip
         // count as ` canon`. Unified across the TUI to `CSKIP` to
         // match the Slots tab and status bar vocabulary.
         let p = ChainPane::new();
-        let text = line_text(&snapshot_line(&p));
-        assert!(text.contains(" CSKIP"), "snapshot missing CSKIP: {text:?}");
+        let text = line_text(&header_line(&p));
+        assert!(text.contains(" CSKIP"), "header missing CSKIP: {text:?}");
         assert!(
             !text.contains(" canon"),
-            "snapshot still uses ` canon` label: {text:?}"
+            "header still uses ` canon` label: {text:?}"
         );
     }
 
@@ -596,14 +601,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_line_surfaces_anomaly_only_when_nonzero() {
+    fn header_line_surfaces_anomaly_only_when_nonzero() {
         // CORRECT-01 display policy: silence on a healthy stream,
         // surface a red ` anom` segment only when anomalies were seen.
         let mut p = ChainPane::new();
-        let text = line_text(&snapshot_line(&p));
+        let text = line_text(&header_line(&p));
         assert!(
             !text.contains(" anom"),
-            "snapshot must stay silent on healthy stream: {text:?}"
+            "header must stay silent on healthy stream: {text:?}"
         );
         // Inject a corrupt parent edge and finalise to trip the
         // anomaly path.
@@ -613,14 +618,14 @@ mod tests {
             hash: "a".into(),
             fast: true,
         }));
-        let text = line_text(&snapshot_line(&p));
+        let text = line_text(&header_line(&p));
         assert!(
             text.contains(" anom"),
-            "snapshot must surface anomaly counter when nonzero: {text:?}"
+            "header must surface anomaly counter when nonzero: {text:?}"
         );
         assert!(
             text.contains("1 anom"),
-            "anomaly count missing in snapshot: {text:?}"
+            "anomaly count missing in header: {text:?}"
         );
     }
 }

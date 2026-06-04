@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use crate::parser::{Event, EventKind};
 
 use super::format::{percentiles_ms, stage_delta_us, TimingTable};
+use super::particle::CannonSystem;
 
 pub(super) const HISTORY_CAPACITY: usize = 512;
 pub(super) const EDGES_CAPACITY: usize = 1024;
@@ -122,6 +123,12 @@ pub struct ChainPane {
     /// spinner only advances if events arrived within the shared
     /// liveness window; otherwise the cell freezes.
     pub(super) last_event_at: Option<Instant>,
+    /// Cannon-particle visualisation state. Each new slot the pane
+    /// observes fires one particle from the cannon (top-left of the
+    /// pane); particles land in the matrix after a fixed flight
+    /// duration. Render reads `particles` (in flight) and `matrix`
+    /// (landed) to paint the visualisation. See [`super::particle`].
+    pub(super) cannon: CannonSystem,
 }
 
 impl ChainPane {
@@ -135,6 +142,7 @@ impl ChainPane {
             last_root: None,
             event_count: 0,
             last_event_at: None,
+            cannon: CannonSystem::new(),
         }
     }
 
@@ -372,10 +380,14 @@ impl ChainPane {
         if let Some(slot) = ev.kind.local_skip_vote_slot() {
             let s = self.upsert_slot(slot);
             s.skipped = true;
+            self.cannon.fire(slot);
             self.prune();
             return;
         }
-        match &ev.kind {
+        // Slot the event addresses, captured for the cannon spawn at
+        // the bottom of the function so each arm doesn't repeat the
+        // `cannon.fire()` call. `None` for non-slot events (roots).
+        let particle_slot: Option<u64> = match &ev.kind {
             EventKind::Block {
                 slot,
                 hash,
@@ -404,6 +416,7 @@ impl ChainPane {
                 if already_canonical {
                     self.mark_canonical_and_walk_back(*parent_slot, parent_hash.clone());
                 }
+                Some(*slot)
             }
             EventKind::Finalized { slot, hash, fast } => {
                 let ts = ev.ts;
@@ -412,29 +425,37 @@ impl ChainPane {
                 s.fast_finalized = Some(*fast);
                 s.finalized_at.get_or_insert(ts);
                 self.mark_canonical_and_walk_back(*slot, hash.clone());
+                Some(*slot)
             }
             EventKind::FirstShred { slot } => {
                 let ts = ev.ts;
                 let s = self.upsert_slot(*slot);
                 s.first_shred_at.get_or_insert(ts);
+                Some(*slot)
             }
             EventKind::BankFrozen { slot, .. } => {
                 let ts = ev.ts;
                 let s = self.upsert_slot(*slot);
                 s.bank_frozen_at.get_or_insert(ts);
+                Some(*slot)
             }
             EventKind::VotingNotarize { slot, .. } => {
                 let s = self.upsert_slot(*slot);
                 s.notarized = true;
+                Some(*slot)
             }
             EventKind::SettingRoot { slot } | EventKind::NewRoot { slot } => {
                 self.last_root = Some(*slot);
+                None
             }
             // ProduceWindow is consumed by the block-production pane;
             // leader-window events do not belong in the chain log.
             // Skip-vote variants are handled by the
             // `local_skip_vote_slot` fast-path above.
             _ => return,
+        };
+        if let Some(slot) = particle_slot {
+            self.cannon.fire(slot);
         }
         self.prune();
     }
