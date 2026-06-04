@@ -5,13 +5,19 @@
 //! landing point in the bucket area, then the slot identity is
 //! appended to the **paged bucket** ring.
 //!
-//! **Paged bucket.** The bucket holds exactly [`PAGE_CAPACITY`] = 100
-//! slots arranged in a fixed grid. Once a slot lands at a cell that
-//! cell **never moves** until the page completes. When the 100th slot
-//! lands the system starts a **magic wipe** animation (left-to-right
-//! sweep, ~500 ms) that flashes each column white then clears it.
-//! After the wipe completes the bucket is empty and the next page
-//! begins from cell 0.
+//! **Paged bucket.** The bucket holds exactly [`PAGE_CAPACITY`] = 125
+//! slots arranged in a fixed 25×5 grid. Once a slot lands at a cell
+//! that cell **never moves** until the page completes. When the 125th
+//! slot lands the system starts a **magic wipe** animation (left-to-
+//! right sweep, ~500 ms) that flashes each column white then clears
+//! it. After the wipe completes the bucket is empty and the next
+//! page begins from cell 0.
+//!
+//! **Glyph caching.** Each [`BucketCell`] stores the slot ID plus an
+//! optional cached [`super::glyph::CellGlyph`]. The cache freezes
+//! when the underlying slot is pruned from the pane's retained deque
+//! — pruned cells keep their last-known classification rather than
+//! degrading to the "unknown" dim grey dot.
 //!
 //! The fixed-position design was deliberate: the previous sliding
 //! window with eviction caused every visible cell to shift one slot
@@ -30,6 +36,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
+
+use super::glyph::CellGlyph;
 
 /// World-space cannon position (normalised, top-left origin).
 /// Particles spawn at the **top of the viz area** (the cannon `▼`
@@ -57,12 +65,11 @@ const LANDING_X_JITTER: f32 = 0.18;
 /// against Solana's 400 ms slot cadence.
 const FLIGHT_DURATION: Duration = Duration::from_millis(700);
 
-/// Slots per bucket page. Bumped to 200 in LIVE-54 to fill the
-/// vertical space the half-pane layout grants — 100 cells in a
-/// 25×4 grid left a large empty bottom margin. The 25×8 = 200 grid
-/// fits comfortably while keeping the wipe cadence visible
-/// (200 × ~0.4 s slot rate ≈ 80 s per page).
-pub(super) const PAGE_CAPACITY: usize = 200;
+/// Slots per bucket page. Operator spec (LIVE-55): build 5 rows of
+/// 25 cells = 125 per page. Wipe cadence at Solana's ~400 ms slot
+/// rate is ~50 s per page — frequent enough to feel "alive", slow
+/// enough to read each glyph as it lands.
+pub(super) const PAGE_CAPACITY: usize = 125;
 
 /// Magic-wipe sweep duration. Long enough for the column-by-column
 /// flash to read as a wave; short enough that the next page can
@@ -75,6 +82,22 @@ const WIPE_DURATION: Duration = Duration::from_millis(500);
 /// burst large enough to fill a whole page in one tick can still
 /// fly every particle without trimming the head.
 const MAX_IN_FLIGHT: usize = PAGE_CAPACITY * 2;
+
+/// One landed bucket cell — a slot ID plus the **cached** glyph
+/// that classifies its outcome. The glyph is `None` immediately
+/// after landing (the slot has not yet been classified for the
+/// cache) and then `Some(...)` once the chain pane's tick refresh
+/// captures a classification from the pane's retained state.
+/// Crucially, the refresh **never downgrades** the cached glyph
+/// back to `None`: when the underlying slot is later pruned from
+/// the retained deque the cell keeps its last known classification
+/// instead of degrading to the dim "unknown" dot. The cache lifes
+/// for one page only — wipe clears the bucket.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BucketCell {
+    pub(super) slot: u64,
+    pub(super) glyph: Option<CellGlyph>,
+}
 
 /// One in-flight slot marker.
 #[derive(Debug, Clone, Copy)]
@@ -93,9 +116,11 @@ pub(super) struct ChainParticle {
 #[derive(Debug)]
 pub(super) struct CannonSystem {
     pub(super) particles: Vec<ChainParticle>,
-    /// Landed slots for the **current page**, oldest first. Capped
+    /// Landed cells for the **current page**, oldest first. Capped
     /// at [`PAGE_CAPACITY`]; reaching the cap triggers a wipe.
-    pub(super) bucket: VecDeque<u64>,
+    /// Each cell stores the slot ID and a cached glyph (see
+    /// [`BucketCell`]).
+    pub(super) bucket: VecDeque<BucketCell>,
     /// Slots that landed while a wipe was in progress. Applied to
     /// the next page once the wipe completes — keeps the new-page
     /// alignment honest even if particle TTL races the wipe.
@@ -176,7 +201,7 @@ impl CannonSystem {
                 // would be wrong because the particles already flew.
                 for slot in self.pending_landed.drain(..) {
                     self.fired_slots.insert(slot);
-                    self.bucket.push_back(slot);
+                    self.bucket.push_back(BucketCell { slot, glyph: None });
                 }
             }
         }
@@ -206,7 +231,7 @@ impl CannonSystem {
             if self.wipe_started_at.is_some() {
                 self.pending_landed.push(slot);
             } else {
-                self.bucket.push_back(slot);
+                self.bucket.push_back(BucketCell { slot, glyph: None });
             }
         }
 
@@ -270,7 +295,11 @@ mod tests {
         let past_ttl = Instant::now() + FLIGHT_DURATION + Duration::from_millis(10);
         sys.tick(past_ttl);
         assert!(sys.particles.is_empty(), "expired particle must despawn");
-        assert_eq!(sys.bucket.back().copied(), Some(100));
+        assert_eq!(sys.bucket.back().map(|c| c.slot), Some(100));
+        assert!(
+            sys.bucket.back().is_some_and(|c| c.glyph.is_none()),
+            "freshly landed cell starts with no cached glyph"
+        );
         assert!(
             sys.wipe_started_at.is_none(),
             "single landing must not trigger a wipe"
@@ -316,7 +345,7 @@ mod tests {
         // time so by the time slot 999 lands the wipe is done).
         assert!(sys.wipe_started_at.is_none(), "wipe should have completed");
         assert_eq!(
-            sys.bucket.back().copied(),
+            sys.bucket.back().map(|c| c.slot),
             Some(999),
             "slot landing post-wipe enters fresh page"
         );

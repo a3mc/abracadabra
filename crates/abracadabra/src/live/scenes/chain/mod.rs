@@ -100,10 +100,44 @@ impl Pane for ChainPane {
         // advances in-flight particles by `(now - last_tick)` and
         // lands any whose TTL has elapsed.
         self.cannon.tick(now);
+        refresh_bucket_glyphs(self);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         render::render(self, frame, area);
+    }
+}
+
+/// Refresh the cached glyph on every bucket cell whose underlying
+/// slot is still present in the pane's retained `slots` deque.
+/// Cells whose slot has been pruned are left alone — their previous
+/// `glyph` (if any) is the "last known classification", which is
+/// exactly what we want to keep showing.
+///
+/// Disjoint-field borrow: the bucket lives inside `pane.cannon` and
+/// the slot lookup reads `pane.slots` + `pane.canonical_slots`.
+/// Splitting the borrow via field access lets the loop run without
+/// cloning the deque or rebuilding an index.
+///
+/// Performance: 125 cells × `O(log N)` binary search per refresh
+/// per tick (~30 fps) = ~125 × 9 = ~1 125 comparisons / tick ≈ 34 k
+/// comparisons / s. Trivial; well below the SSH-friendly budget.
+fn refresh_bucket_glyphs(pane: &mut state::ChainPane) {
+    let state::ChainPane {
+        ref slots,
+        ref canonical_slots,
+        ref mut cannon,
+        ..
+    } = *pane;
+    for cell in &mut cannon.bucket {
+        if let Some(s) = state::slot_state_in_deque(slots, cell.slot) {
+            cell.glyph = Some(glyph::classify_slot_state(
+                s,
+                canonical_slots.contains(&cell.slot),
+            ));
+        }
+        // else: slot pruned. Keep cell.glyph as-is — the cached
+        // classification is the operator's view of this slot.
     }
 }
 
@@ -754,5 +788,78 @@ mod tests {
         assert_eq!(cell.ch, '⊕');
         assert_eq!(cell.style.fg, Some(Color::Yellow));
         assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // ---- Bucket glyph cache tests -----------------------------------
+
+    #[test]
+    fn refresh_bucket_glyphs_caches_classification_from_state() {
+        // Tick refresh must replace `None` cache with the live
+        // classification when the slot is present in the deque.
+        use super::particle::BucketCell;
+        let mut p = ChainPane::new();
+        // Bring slot 100 into existence and finalize it canonically.
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        // Inject a fresh bucket cell with no cached glyph yet.
+        p.cannon.bucket.push_back(BucketCell {
+            slot: 100,
+            glyph: None,
+        });
+        super::refresh_bucket_glyphs(&mut p);
+        let cell = p.cannon.bucket.back().expect("bucket has the cell");
+        let glyph = cell.glyph.expect("cache must be populated after refresh");
+        assert_eq!(glyph.ch, '■');
+        assert_eq!(glyph.style.fg, Some(Color::Green));
+        assert!(glyph.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn refresh_bucket_glyphs_keeps_cache_when_slot_is_pruned() {
+        // The regression behind LIVE-55: bucket cells should NOT
+        // degrade to the "unknown" dim grey dot when their slot is
+        // pruned out of the pane's retained deque. The first refresh
+        // captures the live classification; later pruning happens
+        // off-stage and the cache survives.
+        use super::particle::BucketCell;
+        let mut p = ChainPane::new();
+        // Initial state: slot 100 is canonical-fast.
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        p.cannon.bucket.push_back(BucketCell {
+            slot: 100,
+            glyph: None,
+        });
+        super::refresh_bucket_glyphs(&mut p);
+        let cached_before = p.cannon.bucket.back().unwrap().glyph;
+        assert!(cached_before.is_some(), "first refresh must populate");
+
+        // Simulate the slot being pruned out of the retained deque.
+        // The cannon's bucket cell still references slot 100 but the
+        // pane no longer has SlotState for it.
+        let cell_idx = p
+            .slots
+            .iter()
+            .position(|s| s.slot == 100)
+            .expect("slot 100 was in the deque");
+        p.slots.remove(cell_idx);
+
+        // Refresh after prune — the cell's cache MUST persist
+        // unchanged. (The cell stays at its last-known
+        // classification rather than degrading to "unknown".)
+        super::refresh_bucket_glyphs(&mut p);
+        let cached_after = p.cannon.bucket.back().unwrap().glyph;
+        assert_eq!(
+            cached_after, cached_before,
+            "pruned-slot cache must persist; got {cached_before:?} -> {cached_after:?}",
+        );
     }
 }

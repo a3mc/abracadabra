@@ -46,10 +46,10 @@ pub const PANE_HEIGHT: u16 = 12;
 /// particles fall vertically into the bucket.
 const CANNON_GLYPH: char = '▼';
 
-/// Default bucket width in cells. 25 × 8 = 200 = [`PAGE_CAPACITY`].
+/// Default bucket width in cells. 25 × 5 = 125 = `PAGE_CAPACITY`.
 const DEFAULT_BUCKET_COLS: usize = 25;
 /// Default bucket height in rows.
-const DEFAULT_BUCKET_ROWS: usize = 8;
+const DEFAULT_BUCKET_ROWS: usize = 5;
 /// Per-cell horizontal stride: `glyph + space`. Packed solid the
 /// grid reads as a bar; spaced cells read as discrete slots.
 const BUCKET_STRIDE: u16 = 2;
@@ -289,7 +289,7 @@ fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now
     let buf = frame.buffer_mut();
     let cols_minus_one = u16::max(cols, 1) - 1;
 
-    for (i, slot) in pane.cannon.bucket.iter().enumerate() {
+    for (i, cell) in pane.cannon.bucket.iter().enumerate() {
         if i >= capacity {
             break;
         }
@@ -304,7 +304,11 @@ fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now
         let x = bucket_area.x + col * BUCKET_STRIDE;
         let y = bucket_area.y + row;
 
-        let CellGlyph { ch, style } = classify_slot(pane, *slot);
+        // Cached glyph wins. Only fall back to a live classify when
+        // the cache is still `None` (the slot landed THIS tick — the
+        // tick refresh will populate the cache before the next
+        // render).
+        let CellGlyph { ch, style } = cell.glyph.unwrap_or_else(|| classify_slot(pane, cell.slot));
 
         let (ch_out, style_out) = wipe_progress.map_or((ch, style), |p| {
             wipe_cell(ch, style, col, cols_minus_one, p)
@@ -392,11 +396,11 @@ mod tests {
 
     #[test]
     fn compute_bucket_area_targets_default_size_when_room() {
-        // 25 cols × 2 stride = 50; 8 rows. Plenty of room in 80×12.
-        let viz = Rect::new(0, 0, 80, 12);
+        // 25 cols × 2 stride = 50; 5 rows. Plenty of room in 80×9.
+        let viz = Rect::new(0, 0, 80, 9);
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 50);
-        assert_eq!(b.height, 8);
+        assert_eq!(b.height, 5);
         // Centred horizontally.
         assert_eq!(b.x, 15);
         // Bottom-aligned vertically — bucket flush with viz bottom
@@ -408,19 +412,19 @@ mod tests {
     fn compute_bucket_area_falls_back_when_narrow() {
         // Viz tighter than the default 50-cell width: bucket
         // shrinks to fit.
-        let viz = Rect::new(0, 0, 30, 8);
+        let viz = Rect::new(0, 0, 30, 5);
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 30);
-        assert_eq!(b.height, 8);
+        assert_eq!(b.height, 5);
     }
 
     #[test]
     fn compute_bucket_area_clamps_height_when_viz_shorter_than_default() {
-        // Viz shorter than the default 8-row bucket: bucket
+        // Viz shorter than the default 5-row bucket: bucket
         // shrinks to fit and is flush with the bottom.
-        let viz = Rect::new(0, 0, 80, 6);
+        let viz = Rect::new(0, 0, 80, 4);
         let b = compute_bucket_area(viz);
-        assert_eq!(b.height, 6, "bucket clamps to viz height");
+        assert_eq!(b.height, 4, "bucket clamps to viz height");
         assert_eq!(b.y, 0, "no top margin when bucket already fills viz");
     }
 

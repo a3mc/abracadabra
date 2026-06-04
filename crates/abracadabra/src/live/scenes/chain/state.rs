@@ -165,18 +165,7 @@ impl ChainPane {
     /// O(log N) via [`VecDeque::binary_search_by_key`] against the
     /// sorted-by-slot invariant `upsert_slot` maintains.
     pub(super) fn slot_state(&self, slot: u64) -> Option<&SlotState> {
-        let (front, back) = self.slots.as_slices();
-        // VecDeque does not expose binary_search directly across the
-        // wrap boundary, so search the two contiguous slices and
-        // fall through to the second if the first does not contain
-        // the slot. Both slices stay sorted by `upsert_slot`.
-        if let Ok(idx) = front.binary_search_by_key(&slot, |s| s.slot) {
-            return Some(&front[idx]);
-        }
-        if let Ok(idx) = back.binary_search_by_key(&slot, |s| s.slot) {
-            return Some(&back[idx]);
-        }
-        None
+        slot_state_in_deque(&self.slots, slot)
     }
 
     fn upsert_slot(&mut self, slot: u64) -> &mut SlotState {
@@ -503,4 +492,27 @@ impl Default for ChainPane {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Free-function variant of [`ChainPane::slot_state`]. Used by the
+/// `Pane::tick` refresh in [`super`] which needs to read the slots
+/// deque while also holding a `&mut` borrow on a different
+/// `ChainPane` field — the method form's `&self` receiver would
+/// conflict with that disjoint mutable borrow.
+///
+/// O(log N) via [`VecDeque::binary_search_by_key`] against the
+/// sorted-by-slot invariant.
+pub(super) fn slot_state_in_deque(slots: &VecDeque<SlotState>, slot: u64) -> Option<&SlotState> {
+    let (front, back) = slots.as_slices();
+    // VecDeque does not expose binary_search directly across the
+    // wrap boundary, so search the two contiguous slices and fall
+    // through to the second if the first does not contain the slot.
+    // Both slices stay sorted by `upsert_slot`.
+    if let Ok(idx) = front.binary_search_by_key(&slot, |s| s.slot) {
+        return Some(&front[idx]);
+    }
+    if let Ok(idx) = back.binary_search_by_key(&slot, |s| s.slot) {
+        return Some(&back[idx]);
+    }
+    None
 }

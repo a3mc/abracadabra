@@ -32,7 +32,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-use super::state::ChainPane;
+use super::state::{ChainPane, SlotState};
 
 /// Cell payload returned by [`classify_slot`]. Caller writes
 /// `(ch, style)` into the buffer at the cell position.
@@ -42,20 +42,33 @@ pub(super) struct CellGlyph {
     pub(super) style: Style,
 }
 
-/// Classify `slot` against the pane's current state. See module
-/// docs for the precedence ladder. Inputs are immutable; the
-/// classifier may be called many times per frame for the same
-/// slot (matrix render walks the landed deque).
+/// Classify `slot` against the pane's current state. Returns the
+/// "unknown" dim gray dot when the slot is not in the retained
+/// deque (e.g. pruned via the root cutoff). Used by the particle
+/// renderer for in-flight slots — pruning during flight is rare
+/// but possible.
 pub(super) fn classify_slot(pane: &ChainPane, slot: u64) -> CellGlyph {
-    let Some(s) = pane.slot_state(slot) else {
-        return CellGlyph {
-            ch: '·',
-            style: Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        };
-    };
+    classify_known(pane, slot).unwrap_or(UNKNOWN_GLYPH)
+}
 
+/// Classify `slot` against the pane's current state, returning
+/// `None` when the slot is not in the retained deque. Used by the
+/// bucket-cell glyph refresh: a `None` result means "do not change
+/// the cached glyph". When the slot is later pruned the bucket cell
+/// keeps the last known classification rather than degrading to the
+/// unknown dot.
+pub(super) fn classify_known(pane: &ChainPane, slot: u64) -> Option<CellGlyph> {
+    let s = pane.slot_state(slot)?;
+    Some(classify_slot_state(s, pane.canonical_slots.contains(&slot)))
+}
+
+/// Classify a slot from its [`SlotState`] + canonical-membership
+/// flag. Used by the bucket-glyph refresh in
+/// [`crate::live::scenes::chain`]'s `Pane::tick` handler, which has
+/// disjoint-field access to the pane's `slots` deque and the
+/// `canonical_slots` projection and so cannot call the
+/// [`classify_slot`] helper that takes the whole `ChainPane`.
+pub(super) fn classify_slot_state(s: &SlotState, is_canonical: bool) -> CellGlyph {
     if s.hashes.len() >= 2 {
         return CellGlyph {
             ch: '⊕',
@@ -64,26 +77,19 @@ pub(super) fn classify_slot(pane: &ChainPane, slot: u64) -> CellGlyph {
                 .add_modifier(Modifier::BOLD),
         };
     }
-
     if s.skipped {
-        if pane.canonical_slots.contains(&s.slot) {
-            // Canonical-skip: we voted skip but the chain kept the
-            // slot — operationally bad signal, paint bold red.
+        if is_canonical {
             return CellGlyph {
                 ch: '▴',
                 style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             };
         }
-        // Indeterminate vote-skip: no canonical evidence on either
-        // fork yet. Plain red, no bold — softer signal until the
-        // classification firms up.
         return CellGlyph {
             ch: '▾',
             style: Style::default().fg(Color::Red),
         };
     }
-
-    if pane.canonical_slots.contains(&s.slot) {
+    if is_canonical {
         return match s.fast_finalized {
             Some(true) => CellGlyph {
                 ch: '■',
@@ -102,8 +108,6 @@ pub(super) fn classify_slot(pane: &ChainPane, slot: u64) -> CellGlyph {
                         style: Style::default().fg(Color::Yellow),
                     }
                 } else {
-                    // Canonical by walk-back, no direct event — dim
-                    // green so the eye reads it as "good but stale".
                     CellGlyph {
                         ch: '■',
                         style: Style::default()
@@ -114,9 +118,16 @@ pub(super) fn classify_slot(pane: &ChainPane, slot: u64) -> CellGlyph {
             }
         };
     }
-
     CellGlyph {
         ch: '·',
         style: Style::default().fg(Color::DarkGray),
     }
 }
+
+/// The "unknown" dim gray dot returned by [`classify_slot`] when the
+/// slot is not in the retained deque. Held in a `const` because it
+/// has no runtime data — `Style::new()` is a const constructor.
+const UNKNOWN_GLYPH: CellGlyph = CellGlyph {
+    ch: '·',
+    style: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+};
