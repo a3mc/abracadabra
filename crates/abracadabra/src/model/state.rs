@@ -212,6 +212,20 @@ pub struct OverallStats {
     /// regime described above.
     pub parent_ready_recoveries: u64,
 
+    /// Number of `Parent ready N (P, hash)` lines observed (normal-path
+    /// `ParentReadyTracker` emit). One per leader-window first-slot in
+    /// steady state. Counter-only; the Live tab consumes the event
+    /// directly from the stream for per-window timing analysis.
+    pub parent_ready_normal: u64,
+
+    /// Number of `Unable to produce window N-M, skipping window: ...`
+    /// ERROR lines from `solana_core::block_creation_loop`. Each line
+    /// signals that the validator abandoned an entire leader window
+    /// without producing any slot — unambiguously "our fault" rather
+    /// than the leader's. Empirically rare (~10 per 24h log on the
+    /// production cluster); raise this if it spikes.
+    pub unable_to_produce_window_count: u64,
+
     // Bank.
     pub bank_frozen_count: u64,
 

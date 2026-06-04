@@ -281,10 +281,11 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
     let lines = vec![
         section_title("Filters available:"),
         Line::from(""),
-        // status filters (description of FIN/CSKIP/VSKIP/PEND values
-        // is in the static reference block at the bottom of the panel).
-        // VSKIP and CSKIP toggles OR together — press both for the
-        // old "both buckets" view.
+        // status filters (description of FIN/CSKIP/LSKIP/VSKIP/PEND
+        // values is in the static reference block at the bottom of the
+        // panel). VSKIP and CSKIP toggles OR together — press both for
+        // the old "both buckets" view. LSKIP rows are a subset of VSKIP
+        // (`l` filter already isolates them as the leader filter).
         Line::from(vec![
             Span::styled("  status  ", theme::label_style()),
             mark(filters.vskip_only),
@@ -382,6 +383,14 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(" finalized   ", theme::label_style()),
             Span::styled("CSKIP", theme::bad_style()),
             Span::styled(" we voted skip on canonical", theme::label_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(TAG_INDENT, theme::label_style()),
+            Span::styled("LSKIP", theme::accent_style()),
+            Span::styled(
+                " our leader slot, we voted skip (window abandoned)",
+                theme::label_style(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
@@ -573,13 +582,16 @@ fn filter_chips(f: SlotFilters) -> String {
 fn row_for(s: &SlotViewRow) -> Row<'_> {
     // Color-banding for the status cell:
     //   FastFinalized / SlowFinalized → green (healthy outcome)
-    //   Skipped + CanonicalSkip (proven bad) → red (real failure)
-    //   Skipped + Indeterminate/NotSkipped → yellow (unverified;
+    //   Skipped + CanonicalSkip (proven bad)      → red (real failure)
+    //   Skipped + we_are_leader (LSKIP, our skip) → accent (our action,
+    //                                              honestly tagged)
+    //   Skipped + Indeterminate/NotSkipped (VSKIP) → yellow (unverified;
     //                                              could be right or canonical)
     //   Pending → gray (no terminal state yet)
     let status_style = match s.status {
         SlotStatus::FastFinalized | SlotStatus::SlowFinalized => theme::good_style(),
         SlotStatus::Skipped if s.skip_classification.is_canonical_skip() => theme::bad_style(),
+        SlotStatus::Skipped if s.we_are_leader => theme::accent_style(),
         SlotStatus::Skipped => theme::warn_style(),
         SlotStatus::Pending => theme::label_style(),
     };

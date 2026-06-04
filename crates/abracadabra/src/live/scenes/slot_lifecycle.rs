@@ -8,7 +8,7 @@
 //! so single peaks don't reshape every other cell. Snapshot row
 //! keeps rolling percentages over the last 64 slots.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -47,6 +47,26 @@ const COL_FEC: Color = Color::LightBlue;
 /// of cluster activity at Solana's ~400 ms slot time.
 const ROLLING_WINDOW: usize = 64;
 
+/// Per-slot record retention for the canonical-skip cross-reference.
+/// Capped well above [`ROLLING_WINDOW`] so a finalize cert that lags
+/// its skip vote by tens of slots is still joined to the skip.
+const SLOT_RECORDS_CAPACITY: usize = 256;
+
+/// Per-slot record used for the direct canonical-skip cross-reference.
+///
+/// We catch the common case: we voted skip for slot N, and Finalized
+/// fired for N (directly). That's an unambiguous canonical-skip — the
+/// network proved N belongs on the canonical chain *and* we skipped
+/// it. Walk-back classification (which the chain pane does) catches
+/// the additional case where N is the ancestor of a finalized
+/// descendant; that is not done here because the direct case covers
+/// the operational signal at this granularity.
+#[derive(Debug, Default, Clone, Copy)]
+struct SlotRec {
+    voted_skip: bool,
+    finalized: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Fast,
@@ -68,8 +88,12 @@ impl Lane {
     const fn colour(self) -> Color {
         match self {
             Self::Fast => COL_GOOD,
-            Self::Slow => COL_WARN,
-            Self::Skip => COL_BAD,
+            // Skip vote is normal Alpenglow behavior — most skip votes
+            // are healthy (the network agreed the leader was slow or
+            // crashed). Only canonical-skips (we skipped a slot that
+            // turned out canonical) are bad; those are tracked
+            // separately in the snapshot row.
+            Self::Slow | Self::Skip => COL_WARN,
             Self::Fec => COL_FEC,
         }
     }
@@ -127,6 +151,9 @@ pub struct SlotLifecyclePane {
     fec: LaneSpark,
     history: VecDeque<Outcome>,
     last_fec_per_slot: Option<u64>,
+    /// Per-slot cross-reference for direct canonical-skip detection.
+    /// Bounded by [`SLOT_RECORDS_CAPACITY`]; oldest dropped on insert.
+    slot_records: BTreeMap<u64, SlotRec>,
     now: Instant,
 }
 
@@ -140,8 +167,31 @@ impl SlotLifecyclePane {
             fec: LaneSpark::new(now),
             history: VecDeque::with_capacity(ROLLING_WINDOW),
             last_fec_per_slot: None,
+            slot_records: BTreeMap::new(),
             now,
         }
+    }
+
+    /// Mutate the [`SlotRec`] for `slot`, inserting an empty one if
+    /// absent; prune oldest entries to stay within
+    /// [`SLOT_RECORDS_CAPACITY`].
+    fn touch_slot(&mut self, slot: u64, mark: impl FnOnce(&mut SlotRec)) {
+        let rec = self.slot_records.entry(slot).or_default();
+        mark(rec);
+        while self.slot_records.len() > SLOT_RECORDS_CAPACITY {
+            if let Some(&oldest) = self.slot_records.keys().next() {
+                self.slot_records.remove(&oldest);
+            }
+        }
+    }
+
+    /// Number of slots in retention for which we voted skip AND
+    /// `Finalized` fired directly. See [`SlotRec`] for caveats.
+    fn canonical_skip_count(&self) -> u64 {
+        self.slot_records
+            .values()
+            .filter(|r| r.voted_skip && r.finalized)
+            .count() as u64
     }
 
     const fn lane_ref(&self, lane: Lane) -> &LaneSpark {
@@ -182,17 +232,20 @@ impl Default for SlotLifecyclePane {
 impl Pane for SlotLifecyclePane {
     fn on_event(&mut self, ev: &Event) {
         match &ev.kind {
-            EventKind::Finalized { fast: true, .. } => {
-                self.fast.accumulate(1);
-                self.record_outcome(Outcome::Fast);
+            EventKind::Finalized { slot, fast, .. } => {
+                if *fast {
+                    self.fast.accumulate(1);
+                    self.record_outcome(Outcome::Fast);
+                } else {
+                    self.slow.accumulate(1);
+                    self.record_outcome(Outcome::Slow);
+                }
+                self.touch_slot(*slot, |r| r.finalized = true);
             }
-            EventKind::Finalized { fast: false, .. } => {
-                self.slow.accumulate(1);
-                self.record_outcome(Outcome::Slow);
-            }
-            EventKind::VotingSkip { .. } => {
+            EventKind::VotingSkip { slot } => {
                 self.skip.accumulate(1);
                 self.record_outcome(Outcome::Skip);
+                self.touch_slot(*slot, |r| r.voted_skip = true);
             }
             EventKind::Metric(MetricEvent::ShredInsertIsFull { num_recovered, .. })
                 if *num_recovered > 0 =>
@@ -274,6 +327,7 @@ impl SlotLifecyclePane {
         let fast_pct = self.ratio_pct(Outcome::Fast);
         let slow_pct = self.ratio_pct(Outcome::Slow);
         let skips = self.skip_count();
+        let canon_skips = self.canonical_skip_count();
         let fec = self
             .last_fec_per_slot
             .map_or_else(|| "—".to_owned(), |n| format!("{n}"));
@@ -299,12 +353,22 @@ impl SlotLifecyclePane {
             Span::styled(
                 format!("{skips}"),
                 if skips > 0 {
-                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                    Style::default().fg(COL_WARN).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
             Span::styled(" skip", theme::label_style()),
+            sep(),
+            Span::styled(
+                format!("{canon_skips}"),
+                if canon_skips > 0 {
+                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(" canon✗", theme::label_style()),
             sep(),
             Span::styled(
                 format!("last {window_n} slots"),
@@ -545,6 +609,58 @@ mod tests {
             }));
         }
         assert_eq!(p.history.len(), ROLLING_WINDOW);
+    }
+
+    #[test]
+    fn canonical_skip_count_joins_voted_skip_with_finalize() {
+        let mut p = SlotLifecyclePane::new();
+        // Slot 100 — we voted skip, no finalize: NOT canonical-skip.
+        p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
+        assert_eq!(p.canonical_skip_count(), 0);
+        // Slot 101 — we voted skip, then finalize fires for 101.
+        // That's a direct canonical-skip.
+        p.on_event(&mk(EventKind::VotingSkip { slot: 101 }));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 101,
+            hash: "h".into(),
+            fast: true,
+        }));
+        assert_eq!(p.canonical_skip_count(), 1);
+        // Slot 102 — Finalized arrives first, then VotingSkip:
+        // we should still detect the join (order-independent).
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 102,
+            hash: "h".into(),
+            fast: true,
+        }));
+        p.on_event(&mk(EventKind::VotingSkip { slot: 102 }));
+        assert_eq!(p.canonical_skip_count(), 2);
+    }
+
+    #[test]
+    fn canonical_skip_count_ignores_pure_finalize_or_pure_skip() {
+        let mut p = SlotLifecyclePane::new();
+        // Pure fast finalize on a slot we didn't vote skip on.
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 200,
+            hash: "h".into(),
+            fast: true,
+        }));
+        // Pure skip vote on a slot that never finalized.
+        p.on_event(&mk(EventKind::VotingSkip { slot: 201 }));
+        assert_eq!(p.canonical_skip_count(), 0);
+    }
+
+    #[test]
+    fn slot_records_capacity_evicts_oldest() {
+        let mut p = SlotLifecyclePane::new();
+        for slot in 0..(SLOT_RECORDS_CAPACITY as u64 + 10) {
+            p.on_event(&mk(EventKind::VotingSkip { slot }));
+        }
+        assert_eq!(p.slot_records.len(), SLOT_RECORDS_CAPACITY);
+        // First retained slot is the oldest that survived eviction.
+        let &smallest = p.slot_records.keys().next().unwrap();
+        assert_eq!(smallest, 10);
     }
 
     #[test]

@@ -69,6 +69,13 @@ pub fn ingest(state: &mut State, event: Event) {
             state.slot_mut(slot).voted_skip_at.get_or_insert(event.ts);
             state.overall.votes_skip = state.overall.votes_skip.saturating_add(1);
         }
+        EventKind::VotingSkipFallback { slot } => {
+            // Treat as a skip vote for aggregation purposes — the local
+            // validator did not notarise this slot regardless of which
+            // protocol round emitted the vote.
+            state.slot_mut(slot).voted_skip_at.get_or_insert(event.ts);
+            state.overall.votes_skip = state.overall.votes_skip.saturating_add(1);
+        }
         EventKind::BlockNotarized { slot, hash } => {
             let rec = state.slot_mut(slot);
             rec.block_notarized_at.get_or_insert(event.ts);
@@ -206,6 +213,19 @@ pub fn ingest(state: &mut State, event: Event) {
             // See docs/alpenglow/07-safety-machinery.md.
             state.overall.parent_ready_recoveries =
                 state.overall.parent_ready_recoveries.saturating_add(1);
+        }
+        EventKind::ParentReady { .. } => {
+            // Normal-path ParentReady — high-frequency (~one per leader
+            // window first slot in steady state). Counter-only.
+            state.overall.parent_ready_normal = state.overall.parent_ready_normal.saturating_add(1);
+        }
+        EventKind::UnableToProduceWindow { .. } => {
+            // Rare ERROR — leader-side window abandonment. Counter-only at
+            // the aggregator level; Live tab consumes the event directly.
+            state.overall.unable_to_produce_window_count = state
+                .overall
+                .unable_to_produce_window_count
+                .saturating_add(1);
         }
         EventKind::SetIdentity => {
             // Operator rotated validator identity — INFO timeline anchor.

@@ -97,25 +97,30 @@ impl SlotViewRow {
 
     /// Status pill string for the slot table.
     ///
-    /// For skipped slots, the `SkipClassification` discriminator
-    /// determines the operator-visible label:
+    /// For skipped slots, two discriminators determine the label:
     ///
     ///   - `CSKIP` — we voted skip on a slot that became Canonical
-    ///     (real participation failure).
-    ///   - `VSKIP` — Vote/Validator skip: we voted skip; cluster
-    ///     outcome indeterminate from log alone (could be a right
-    ///     skip OR an unverified canonical skip).
+    ///     (real participation failure). Strongest signal.
+    ///   - `LSKIP` — Leader skip: we *were* the leader for this slot
+    ///     and we voted skip. The skip is our own; the slot is gone.
+    ///     Cluster-canonical evidence is irrelevant for the label
+    ///     here because the skip was ours.
+    ///   - `VSKIP` — Vote/Validator skip: we voted skip on someone
+    ///     *else's* slot; cluster outcome indeterminate from log
+    ///     alone. Could be a right skip OR an unverified canonical
+    ///     skip. The honest "outcome unknown" bucket — NOT a claim
+    ///     of correctness.
     ///
-    /// The `V`/`C` prefix convention disambiguates the column at
-    /// a glance: both labels describe *our* vote, with the prefix
-    /// indicating whether canonical evidence exists. Until Stage 2
-    /// RPC enrichment lands, plain `VSKIP` is the indeterminate
-    /// bucket — NOT a claim of correctness.
+    /// Precedence: `CSKIP` > `LSKIP` > `VSKIP`. A leader slot that
+    /// became canonical (rare — would mean another validator
+    /// produced after us) still reports as `CSKIP` so the worst
+    /// signal is not silenced.
     pub const fn status_str(&self) -> &'static str {
         match self.status {
             SlotStatus::FastFinalized | SlotStatus::SlowFinalized => "FIN",
             SlotStatus::Skipped => match self.skip_classification {
                 SkipClassification::CanonicalSkip(_) => "CSKIP",
+                _ if self.we_are_leader => "LSKIP",
                 _ => "VSKIP",
             },
             SlotStatus::Pending => "PEND",

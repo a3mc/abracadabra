@@ -36,6 +36,10 @@ struct Counts {
     retransmit_first_shred: u64,
     retransmit_slot_stats: u64,
     slot_tracking: u64,
+    leader_slot_elapsed: u64,
+    broadcast_shreds: u64,
+    banking_scheduler: u64,
+    slot_metrics: u64,
 }
 
 fn ingest(path: &PathBuf) -> Counts {
@@ -58,6 +62,10 @@ fn ingest(path: &PathBuf) -> Counts {
                 MetricEvent::RetransmitFirstShred { .. } => counts.retransmit_first_shred += 1,
                 MetricEvent::RetransmitSlotStats { .. } => counts.retransmit_slot_stats += 1,
                 MetricEvent::SlotTracking { .. } => counts.slot_tracking += 1,
+                MetricEvent::LeaderSlotElapsed { .. } => counts.leader_slot_elapsed += 1,
+                MetricEvent::BroadcastShreds { .. } => counts.broadcast_shreds += 1,
+                MetricEvent::BankingStageCounts { .. } => counts.banking_scheduler += 1,
+                MetricEvent::SlotMetrics { .. } => counts.slot_metrics += 1,
             }
         }
     }

@@ -1,18 +1,19 @@
-//! Chain pane — calm spinner + event log.
+//! Chain pane — calm spinner + live timing table.
 //!
 //! Most slots on a healthy validator are fast-finalised canonical
-//! slots that we notarised in time — there is no useful per-slot
-//! visual to draw for them. Instead the pane shows:
+//! slots — there is no useful per-slot visual to draw for them.
+//! Instead the pane shows:
 //!
 //! - A spinner and the **tip slot number** at the top, proving the
 //!   stream is live and giving the operator a slot counter.
-//! - A short **event log** of *only* the notable things that
-//!   happened recently: forks, canonical-skips, slow finalisations,
-//!   slots we did not notarise, and leader-window announcements.
+//! - A four-row **live timing table** (p50 / p95 in ms) for the four
+//!   stage-delta families the Windows tab also reports — cluster
+//!   slot cadence, assembly, consensus, lifecycle. Definitions match
+//!   [`crate::model::analysis::LatencyStages`] exactly so the live
+//!   numbers are directly comparable to the Windows-tab snapshot.
 //!
-//! The underlying graph model still tracks every `Block` /
-//! `Finalized` / `VotingSkip` / `VotingNotarize` /
-//! `SettingRoot` / `ProduceWindow` event:
+//! The underlying graph model tracks every `Block` / `Finalized` /
+//! `VotingSkip` / `VotingNotarize` / `SettingRoot` event:
 //!
 //! - [`EventKind::Block { slot, hash, parent_slot, parent_hash, .. }`]
 //!   stores the parent edge `(slot, hash) → (parent_slot, parent_hash)`.
@@ -51,13 +52,14 @@
 //! anchors walking backwards through observed parent edges.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use time::OffsetDateTime;
 
 use crate::live::animation::Pane;
 use crate::parser::{Event, EventKind};
@@ -83,6 +85,15 @@ struct SlotState {
     /// this slot. `None` for slots only marked canonical by walk-back
     /// from a descendant.
     fast_finalized: Option<bool>,
+    /// Timestamps of stage events. Drive the rolling timing table
+    /// (cluster / assembly / consensus / lifecycle) that replaces the
+    /// old "recent activity" log. Definitions match
+    /// [`crate::model::analysis::LatencyStages`] exactly so the live
+    /// values stay comparable to the Windows-tab snapshot.
+    first_shred_at: Option<OffsetDateTime>,
+    block_emitted_at: Option<OffsetDateTime>,
+    bank_frozen_at: Option<OffsetDateTime>,
+    finalized_at: Option<OffsetDateTime>,
 }
 
 impl SlotState {
@@ -93,6 +104,10 @@ impl SlotState {
             skipped: false,
             notarized: false,
             fast_finalized: None,
+            first_shred_at: None,
+            block_emitted_at: None,
+            bank_frozen_at: None,
+            finalized_at: None,
         }
     }
 
@@ -137,16 +152,71 @@ pub struct ChainPane {
     /// `Finalized` events and walked back through `parents`.
     canonical: HashSet<BlockId>,
     last_root: Option<u64>,
-    /// Recent leader windows observed via `ProduceWindow`. Surfaced
-    /// in the event log as `★ leader N..M`.
-    recent_leader_windows: VecDeque<(u64, u64)>,
-    /// Anchor for the render-time spinner. Not read in `tick`;
-    /// driven by `Instant::elapsed` purely in `render`.
-    stream_start: Instant,
+    /// Count of events observed since the pane was constructed.
+    /// Drives the spinner — every Nth event ticks one frame, so the
+    /// spinner pauses when the stream is silent (honest liveness).
+    event_count: u64,
+    /// Wall-clock instant of the most recent event observation. The
+    /// spinner only advances if events arrived within the last
+    /// [`SPINNER_LIVE_WINDOW`]; otherwise the cell freezes.
+    last_event_at: Option<Instant>,
 }
 
-const RECENT_WINDOWS_CAPACITY: usize = 8;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+/// Wall-clock window over which event arrivals still count as
+/// "stream live". Past this, the spinner freezes on its last frame.
+const SPINNER_LIVE_WINDOW: Duration = Duration::from_millis(750);
+/// Events per spinner frame. Each event nudges the spinner by one
+/// step; 4 → calm cadence under steady streams.
+const SPINNER_EVENTS_PER_FRAME: u64 = 4;
+/// BankFrozen inter-arrival deltas spanning more than this many slots
+/// are treated as skip runs and excluded from cluster-cadence
+/// percentiles. Mirrors the same defence in [`crate::live::scenes::leader`].
+const MAX_SLOT_GAP: u64 = 8;
+
+/// Result of [`ChainPane::timing_table`]: p50/p95 (ms) for each
+/// stage-delta family. `None` if no samples retained.
+#[derive(Debug, Default, Clone, Copy)]
+struct TimingTable {
+    cluster: StagePercentiles,
+    assembly: StagePercentiles,
+    consensus: StagePercentiles,
+    lifecycle: StagePercentiles,
+}
+
+/// Whole-microsecond delta `end - start` when both timestamps are
+/// present and the delta is non-negative. Used to harvest stage
+/// samples from per-slot timing fields.
+fn stage_delta_us(start: Option<OffsetDateTime>, end: Option<OffsetDateTime>) -> Option<i64> {
+    let (s, e) = (start?, end?);
+    let raw = e - s;
+    if raw.is_negative() {
+        return None;
+    }
+    i64::try_from(raw.whole_microseconds()).ok()
+}
+
+/// `(p50_ms, p95_ms)` from a stage-sample slice.
+type StagePercentiles = Option<(i64, i64)>;
+
+/// Sort `samples` in place and return `(p50_ms, p95_ms)` derived from
+/// integer positional percentiles. Inputs are microseconds; output is
+/// milliseconds. `None` when the input is empty.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn percentiles_ms(samples: &mut [i64]) -> StagePercentiles {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let pick = |frac: f64| -> i64 {
+        let n = samples.len();
+        let idx = ((frac * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        samples[idx] / 1000
+    };
+    Some((pick(0.50), pick(0.95)))
+}
 
 impl ChainPane {
     pub fn new() -> Self {
@@ -155,8 +225,8 @@ impl ChainPane {
             parents: HashMap::with_capacity(EDGES_CAPACITY),
             canonical: HashSet::with_capacity(EDGES_CAPACITY),
             last_root: None,
-            recent_leader_windows: VecDeque::with_capacity(RECENT_WINDOWS_CAPACITY),
-            stream_start: Instant::now(),
+            event_count: 0,
+            last_event_at: None,
         }
     }
 
@@ -266,6 +336,61 @@ impl ChainPane {
             .count()
     }
 
+    /// Sample `(p50, p95)` (ms) for every stage-delta family the chain
+    /// pane surfaces. Definitions:
+    ///
+    /// - `cluster` — `bank_frozen_at[N] → bank_frozen_at[N+gap]`
+    ///   divided by `gap`, treating gaps larger than [`MAX_SLOT_GAP`]
+    ///   as skip runs (excluded). Reflects observed cluster slot cadence.
+    /// - `assembly` — `first_shred_at → block_emitted_at` per slot.
+    /// - `consensus` — `block_emitted_at → finalized_at` per slot.
+    /// - `lifecycle` — `first_shred_at → finalized_at` per slot.
+    ///
+    /// Exact definitions of assembly/consensus/lifecycle come from
+    /// [`crate::model::analysis::LatencyStages`] so values are directly
+    /// comparable to the Windows-tab snapshot.
+    fn timing_table(&self) -> TimingTable {
+        let mut cluster: Vec<i64> = Vec::new();
+        let mut assembly: Vec<i64> = Vec::new();
+        let mut consensus: Vec<i64> = Vec::new();
+        let mut lifecycle: Vec<i64> = Vec::new();
+        let mut prev: Option<(u64, OffsetDateTime)> = None;
+        for s in &self.slots {
+            if let Some(us) = stage_delta_us(s.first_shred_at, s.block_emitted_at) {
+                assembly.push(us);
+            }
+            if let Some(us) = stage_delta_us(s.block_emitted_at, s.finalized_at) {
+                consensus.push(us);
+            }
+            if let Some(us) = stage_delta_us(s.first_shred_at, s.finalized_at) {
+                lifecycle.push(us);
+            }
+            if let Some(bf) = s.bank_frozen_at {
+                if let Some((prev_slot, prev_bf)) = prev {
+                    if s.slot > prev_slot {
+                        let gap = s.slot - prev_slot;
+                        if gap <= MAX_SLOT_GAP {
+                            let raw = bf - prev_bf;
+                            if !raw.is_negative() {
+                                let total_us =
+                                    i64::try_from(raw.whole_microseconds()).unwrap_or(i64::MAX);
+                                cluster
+                                    .push(total_us / i64::try_from(gap).unwrap_or(i64::MAX).max(1));
+                            }
+                        }
+                    }
+                }
+                prev = Some((s.slot, bf));
+            }
+        }
+        TimingTable {
+            cluster: percentiles_ms(&mut cluster),
+            assembly: percentiles_ms(&mut assembly),
+            consensus: percentiles_ms(&mut consensus),
+            lifecycle: percentiles_ms(&mut lifecycle),
+        }
+    }
+
     fn indeterminate_skip_count(&self) -> usize {
         self.slots
             .iter()
@@ -282,6 +407,8 @@ impl Default for ChainPane {
 
 impl Pane for ChainPane {
     fn on_event(&mut self, ev: &Event) {
+        self.event_count = self.event_count.saturating_add(1);
+        self.last_event_at = Some(Instant::now());
         match &ev.kind {
             EventKind::Block {
                 slot,
@@ -289,8 +416,10 @@ impl Pane for ChainPane {
                 parent_slot,
                 parent_hash,
             } => {
+                let ts = ev.ts;
                 let s = self.upsert_slot(*slot);
                 s.record_hash(hash);
+                s.block_emitted_at.get_or_insert(ts);
                 let edge_key: BlockId = (*slot, hash.clone());
                 let already_canonical = self.canonical.contains(&edge_key);
                 self.parents
@@ -311,10 +440,22 @@ impl Pane for ChainPane {
                 }
             }
             EventKind::Finalized { slot, hash, fast } => {
+                let ts = ev.ts;
                 let s = self.upsert_slot(*slot);
                 s.record_hash(hash);
                 s.fast_finalized = Some(*fast);
+                s.finalized_at.get_or_insert(ts);
                 self.mark_canonical_and_walk_back(*slot, hash.clone());
+            }
+            EventKind::FirstShred { slot } => {
+                let ts = ev.ts;
+                let s = self.upsert_slot(*slot);
+                s.first_shred_at.get_or_insert(ts);
+            }
+            EventKind::BankFrozen { slot, .. } => {
+                let ts = ev.ts;
+                let s = self.upsert_slot(*slot);
+                s.bank_frozen_at.get_or_insert(ts);
             }
             EventKind::VotingNotarize { slot, .. } => {
                 let s = self.upsert_slot(*slot);
@@ -327,14 +468,8 @@ impl Pane for ChainPane {
             EventKind::SettingRoot { slot } | EventKind::NewRoot { slot } => {
                 self.last_root = Some(*slot);
             }
-            EventKind::ProduceWindow { start, end, .. } => {
-                if *end >= *start && end.saturating_sub(*start) <= 32 {
-                    self.recent_leader_windows.push_back((*start, *end));
-                    while self.recent_leader_windows.len() > RECENT_WINDOWS_CAPACITY {
-                        self.recent_leader_windows.pop_front();
-                    }
-                }
-            }
+            // ProduceWindow is consumed by the block-production pane;
+            // leader-window events do not belong in the chain log.
             _ => return,
         }
         self.prune();
@@ -361,34 +496,30 @@ impl Pane for ChainPane {
                 Constraint::Length(1), // top spacer
                 Constraint::Length(1), // spinner + tip slot
                 Constraint::Length(1), // blank
-                Constraint::Length(1), // "recent activity" label
-                Constraint::Min(1),    // event log
+                Constraint::Length(1), // "live timing (p50 / p95)" label
+                Constraint::Min(1),    // timing table
                 Constraint::Length(1), // snapshot
             ])
             .split(inner);
 
         self.render_tip(frame, chunks[1]);
-        Self::render_section_label(frame, chunks[3], "recent activity");
-        self.render_event_log(frame, chunks[4]);
+        Self::render_section_label(frame, chunks[3], "live timing  (p50 / p95)");
+        self.render_timing_table(frame, chunks[4]);
         self.render_snapshot(frame, chunks[5]);
     }
 }
 
-/// One row in the "recent activity" log: a slot number, a glyph,
-/// and a short description. Boring slots (fast-finalised canonical
-/// that we notarised in time) never produce a log entry.
-#[derive(Debug, Clone)]
-struct EventEntry {
-    slot: u64,
-    glyph: &'static str,
-    colour: Color,
-    label: String,
-}
-
 impl ChainPane {
     fn render_tip(&self, frame: &mut Frame<'_>, area: Rect) {
-        let elapsed_ms = self.stream_start.elapsed().as_millis() as u64;
-        let spinner_idx = (elapsed_ms / 100) as usize % SPINNER.len();
+        let spinner_idx = if self
+            .last_event_at
+            .is_some_and(|t| Instant::now().duration_since(t) < SPINNER_LIVE_WINDOW)
+        {
+            usize::try_from(self.event_count / SPINNER_EVENTS_PER_FRAME).unwrap_or(0)
+                % SPINNER.len()
+        } else {
+            0
+        };
         let spinner = SPINNER[spinner_idx];
         let tip = self
             .tip_slot()
@@ -418,106 +549,37 @@ impl ChainPane {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    fn render_event_log(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_timing_table(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let table = self.timing_table();
+        // Order: cluster (network cadence), then assembly → consensus
+        // → lifecycle (stage breakdown matching Windows-tab semantics).
+        let rows: [(&str, StagePercentiles); 4] = [
+            ("cluster slot", table.cluster),
+            ("assembly", table.assembly),
+            ("consensus", table.consensus),
+            ("lifecycle", table.lifecycle),
+        ];
         let max = area.height as usize;
-        if max == 0 {
-            return;
-        }
-        let events = self.recent_events(max);
-        if events.is_empty() {
-            let line = Line::from(vec![
-                Span::raw("     "),
-                Span::styled(
-                    "(no notable events yet)",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]);
-            let row = Rect::new(area.x, area.y, area.width, 1);
-            frame.render_widget(Paragraph::new(line), row);
-            return;
-        }
-        for (i, e) in events.iter().enumerate().take(max) {
+        for (i, (label, pct)) in rows.iter().enumerate().take(max) {
             let y = area.y + i as u16;
             let row = Rect::new(area.x, y, area.width, 1);
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("    {}", e.slot),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    e.glyph.to_owned(),
-                    Style::default().fg(e.colour).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(e.label.clone(), Style::default().fg(Color::White)),
-            ]);
+            let line = match pct {
+                Some((p50, p95)) => Line::from(vec![
+                    Span::styled(format!("    {label:<14}"), theme::label_style()),
+                    Span::styled(format!("p50 {p50}ms"), theme::value_style()),
+                    Span::styled("   ", theme::label_style()),
+                    Span::styled(format!("p95 {p95}ms"), theme::value_style()),
+                ]),
+                None => Line::from(vec![
+                    Span::styled(format!("    {label:<14}"), theme::label_style()),
+                    Span::styled("—", Style::default().fg(Color::DarkGray)),
+                ]),
+            };
             frame.render_widget(Paragraph::new(line), row);
         }
-    }
-
-    /// Derive the event log from current slot state + leader window
-    /// deque. Newest first. Boring fast-finalised-canonical slots that
-    /// we notarised in time produce no entry.
-    fn recent_events(&self, max: usize) -> Vec<EventEntry> {
-        let mut out: Vec<EventEntry> = Vec::new();
-        for s in self.slots.iter().rev() {
-            if out.len() >= max * 2 {
-                break;
-            }
-            if s.is_forked() {
-                out.push(EventEntry {
-                    slot: s.slot,
-                    glyph: "⊕",
-                    colour: Color::Yellow,
-                    label: format!("fork ({} blocks)", s.hashes.len()),
-                });
-                continue;
-            }
-            let canonical_here = s
-                .hashes
-                .iter()
-                .any(|h| self.canonical.contains(&(s.slot, h.clone())));
-            if canonical_here && s.skipped {
-                out.push(EventEntry {
-                    slot: s.slot,
-                    glyph: "▴",
-                    colour: Color::Red,
-                    label: "canonical-skip".to_owned(),
-                });
-                continue;
-            }
-            if canonical_here && !s.notarized {
-                out.push(EventEntry {
-                    slot: s.slot,
-                    glyph: "○",
-                    colour: Color::Yellow,
-                    label: "canonical, we did not notarise".to_owned(),
-                });
-                continue;
-            }
-            if canonical_here && s.fast_finalized == Some(false) {
-                out.push(EventEntry {
-                    slot: s.slot,
-                    glyph: "◐",
-                    colour: Color::Yellow,
-                    label: "slow finalise".to_owned(),
-                });
-            }
-        }
-        for &(start, end) in self.recent_leader_windows.iter().rev().take(2) {
-            out.push(EventEntry {
-                slot: start,
-                glyph: "★",
-                colour: Color::Green,
-                label: format!("leader {start}..{end}"),
-            });
-        }
-        out.sort_by_key(|e| std::cmp::Reverse(e.slot));
-        out.truncate(max);
-        out
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -727,69 +789,80 @@ mod tests {
     }
 
     #[test]
-    fn canonical_slot_we_did_not_notarise_appears_in_event_log() {
+    fn timing_table_consensus_uses_block_emitted_to_finalized() {
         let mut p = ChainPane::new();
-        p.on_event(&block_ev(100, "a", 99, "root"));
-        p.on_event(&mk(EventKind::Finalized {
-            slot: 100,
-            hash: "a".into(),
-            fast: true,
-        }));
-        // No VotingNotarize for slot 100 — should surface as a notable event.
-        let events = p.recent_events(10);
-        let e = events
-            .iter()
-            .find(|e| e.slot == 100)
-            .expect("event for 100");
-        assert_eq!(e.glyph, "○");
-        assert!(e.label.contains("notarise"), "got {}", e.label);
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        let t_be = t0 + time::Duration::milliseconds(50);
+        let t_fin = t0 + time::Duration::milliseconds(130);
+        // first_shred → block_emitted = 50 ms (assembly)
+        // block_emitted → finalized = 80 ms (consensus)
+        // first_shred → finalized = 130 ms (lifecycle)
+        p.on_event(&Event {
+            ts: t0,
+            kind: EventKind::FirstShred { slot: 100 },
+        });
+        p.on_event(&Event {
+            ts: t_be,
+            kind: EventKind::Block {
+                slot: 100,
+                hash: "a".into(),
+                parent_slot: 99,
+                parent_hash: "root".into(),
+            },
+        });
+        p.on_event(&Event {
+            ts: t_fin,
+            kind: EventKind::Finalized {
+                slot: 100,
+                hash: "a".into(),
+                fast: true,
+            },
+        });
+        let table = p.timing_table();
+        let (a50, _) = table.assembly.expect("assembly sample");
+        let (c50, _) = table.consensus.expect("consensus sample");
+        let (l50, _) = table.lifecycle.expect("lifecycle sample");
+        assert_eq!(a50, 50);
+        assert_eq!(c50, 80);
+        assert_eq!(l50, 130);
     }
 
     #[test]
-    fn slow_finalised_with_notarise_appears_in_event_log() {
+    fn timing_table_cluster_uses_bank_frozen_inter_arrival() {
         let mut p = ChainPane::new();
-        p.on_event(&block_ev(100, "a", 99, "root"));
-        p.on_event(&mk(EventKind::VotingNotarize {
-            slot: 100,
-            hash: "a".into(),
-        }));
-        p.on_event(&mk(EventKind::Finalized {
-            slot: 100,
-            hash: "a".into(),
-            fast: false,
-        }));
-        let events = p.recent_events(10);
-        let e = events
-            .iter()
-            .find(|e| e.slot == 100)
-            .expect("event for 100");
-        assert_eq!(e.glyph, "◐");
-        assert!(e.label.contains("slow"), "got {}", e.label);
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        for (i, ms) in [0i64, 400, 800, 1200].iter().enumerate() {
+            let slot = 100 + i as u64;
+            p.on_event(&Event {
+                ts: t0 + time::Duration::milliseconds(*ms),
+                kind: EventKind::BankFrozen {
+                    slot,
+                    hash: "h".into(),
+                    signature_count: 1,
+                },
+            });
+        }
+        let table = p.timing_table();
+        let (cluster_p50, _) = table.cluster.expect("cluster samples");
+        // 3 samples of 400 ms each → p50 = 400 ms.
+        assert_eq!(cluster_p50, 400);
     }
 
     #[test]
-    fn fast_finalised_with_notarise_is_a_boring_slot_no_event() {
-        let mut p = ChainPane::new();
-        p.on_event(&block_ev(100, "a", 99, "root"));
-        p.on_event(&mk(EventKind::VotingNotarize {
-            slot: 100,
-            hash: "a".into(),
-        }));
-        p.on_event(&mk(EventKind::Finalized {
-            slot: 100,
-            hash: "a".into(),
-            fast: true,
-        }));
-        // Fast + notarised = ideal slot. Nothing to log.
-        let events = p.recent_events(10);
-        assert!(
-            events.iter().all(|e| e.slot != 100),
-            "fast notarised slot should not appear in event log"
-        );
+    fn timing_table_empty_when_no_timing_observed() {
+        let p = ChainPane::new();
+        let t = p.timing_table();
+        assert!(t.cluster.is_none());
+        assert!(t.assembly.is_none());
+        assert!(t.consensus.is_none());
+        assert!(t.lifecycle.is_none());
     }
 
     #[test]
-    fn produce_window_event_appears_in_event_log() {
+    fn produce_window_event_is_ignored_by_chain_pane() {
+        // Leader-window events belong to the block-production pane.
+        // The chain pane must NOT surface them — duplicating data
+        // across panes is the bug LIVE-37 fixed.
         let mut p = ChainPane::new();
         p.on_event(&mk(EventKind::ProduceWindow {
             start: 200,
@@ -797,10 +870,8 @@ mod tests {
             parent_slot: 199,
             parent_hash: "x".into(),
         }));
-        let events = p.recent_events(10);
-        let e = events.iter().find(|e| e.slot == 200).expect("leader event");
-        assert_eq!(e.glyph, "★");
-        assert!(e.label.contains("leader"), "got {}", e.label);
+        assert_eq!(p.fork_count(), 0);
+        assert_eq!(p.canonical_skip_count(), 0);
     }
 
     #[test]

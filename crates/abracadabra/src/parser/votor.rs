@@ -36,6 +36,7 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
         "SetIdentity" => Some(EventKind::SetIdentity),
         "Refreshing" => parse_refreshing(event),
         "Triggering" => parse_triggering_parent_ready(event),
+        "Parent" => parse_parent_ready(event),
         _ => None,
     }
 }
@@ -109,6 +110,10 @@ fn parse_voting_variant(event: &str) -> Option<EventKind> {
         })
     } else if let Some(after) = rest.strip_prefix("skip for ") {
         Some(EventKind::VotingSkip {
+            slot: after.parse().ok()?,
+        })
+    } else if let Some(after) = rest.strip_prefix("skip-fallback for ") {
+        Some(EventKind::VotingSkipFallback {
             slot: after.parse().ok()?,
         })
     } else {
@@ -229,6 +234,20 @@ fn parse_triggering_parent_ready(event: &str) -> Option<EventKind> {
     })
 }
 
+// ---- Parent ready (normal-path ParentReadyTracker emit) ----
+
+fn parse_parent_ready(event: &str) -> Option<EventKind> {
+    let caps = re_parent_ready().captures(event)?;
+    let slot = caps.get(1)?.as_str().parse().ok()?;
+    let parent_slot = caps.get(2)?.as_str().parse().ok()?;
+    let parent_hash = caps.get(3)?.as_str().to_owned();
+    Some(EventKind::ParentReady {
+        slot,
+        parent_slot,
+        parent_hash,
+    })
+}
+
 // ---- Shared helpers ----
 
 /// Parse `(SLOT, HASH)` into `(u64, String)`.
@@ -301,6 +320,15 @@ fn re_triggering_parent_ready() -> &'static Regex {
     R.get_or_init(|| {
         must_compile(&format!(
             r"^Triggering parent ready for slot ({SLOT_DIGITS}) with parent ({SLOT_DIGITS}) ({HASH_CHARS})$"
+        ))
+    })
+}
+
+fn re_parent_ready() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        must_compile(&format!(
+            r"^Parent ready ({SLOT_DIGITS}) \(({SLOT_DIGITS}), ({HASH_CHARS})\)$"
         ))
     })
 }
@@ -382,6 +410,15 @@ mod tests {
         assert!(matches!(
             parse_body(&s).unwrap(),
             EventKind::VotingSkip { slot: 1028084 }
+        ));
+    }
+
+    #[test]
+    fn voting_skip_fallback() {
+        let s = body("Voting skip-fallback for 282580");
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::VotingSkipFallback { slot: 282580 }
         ));
     }
 
@@ -540,6 +577,47 @@ mod tests {
             }
             other => panic!("expected TriggeringParentReady, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parent_ready_normal_path() {
+        let s = body("Parent ready 282584 (282579, 5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM)");
+        match parse_body(&s).unwrap() {
+            EventKind::ParentReady {
+                slot,
+                parent_slot,
+                parent_hash,
+            } => {
+                assert_eq!(slot, 282_584);
+                assert_eq!(parent_slot, 282_579);
+                assert_eq!(parent_hash, "5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM");
+            }
+            other => panic!("expected ParentReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parent_ready_garbage_hash_rejected() {
+        let s = body("Parent ready 282584 (282579, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn parent_ready_distinct_from_triggering() {
+        let normal =
+            body("Parent ready 282584 (282579, 5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM)");
+        let trig = body(
+            "Triggering parent ready for slot 282584 with parent 282579 \
+             5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM",
+        );
+        assert!(matches!(
+            parse_body(&normal).unwrap(),
+            EventKind::ParentReady { .. }
+        ));
+        assert!(matches!(
+            parse_body(&trig).unwrap(),
+            EventKind::TriggeringParentReady { .. }
+        ));
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
         "retransmit-first-shred" => parse_retransmit_first_shred(fields)?,
         "retransmit-stage-slot-stats" => parse_retransmit_slot_stats(fields)?,
         "event_handler_slot_tracking" => parse_slot_tracking(fields)?,
+        "leader-slot-start-to-cleared-elapsed-ms" => parse_leader_slot_elapsed(fields)?,
+        "broadcast-process-shreds-stats" => parse_broadcast_shreds(fields, false)?,
+        "broadcast-process-shreds-interrupted-stats" => parse_broadcast_shreds(fields, true)?,
+        "banking_stage_scheduler_slot_counts" => parse_banking_stage_counts(fields)?,
+        "slot-metrics" => parse_slot_metrics(fields)?,
         _ => return None,
     };
     Some(EventKind::Metric(metric))
@@ -124,6 +129,46 @@ fn parse_retransmit_slot_stats(fields: &str) -> Option<MetricEvent> {
     })
 }
 
+fn parse_leader_slot_elapsed(fields: &str) -> Option<MetricEvent> {
+    Some(MetricEvent::LeaderSlotElapsed {
+        slot: field_u64(fields, "slot")?,
+        elapsed_ms: field_u64(fields, "elapsed")?,
+    })
+}
+
+fn parse_broadcast_shreds(fields: &str, interrupted: bool) -> Option<MetricEvent> {
+    let slot = field_u64(fields, "slot")?;
+    let num_data_shreds = field_u64(fields, "num_data_shreds").unwrap_or(0);
+    // The `-interrupted-stats` variant emits `slot_broadcast_time=-1`;
+    // `field_u64` won't parse a negative value, returning None — which
+    // is what we want for the broadcast_us field.
+    let broadcast_us = field_u64(fields, "slot_broadcast_time");
+    Some(MetricEvent::BroadcastShreds {
+        slot,
+        broadcast_us,
+        num_data_shreds,
+        interrupted,
+    })
+}
+
+fn parse_banking_stage_counts(fields: &str) -> Option<MetricEvent> {
+    let slot = field_u64(fields, "slot")?;
+    Some(MetricEvent::BankingStageCounts {
+        slot,
+        num_finished: field_u64(fields, "num_finished").unwrap_or(0),
+        num_dropped_on_capacity: field_u64(fields, "num_dropped_on_capacity").unwrap_or(0),
+    })
+}
+
+fn parse_slot_metrics(fields: &str) -> Option<MetricEvent> {
+    let slot = field_u64(fields, "slot")?;
+    Some(MetricEvent::SlotMetrics {
+        slot,
+        leader_handover_sad: field_u64(fields, "leader_handover_sad").unwrap_or(0) != 0,
+        replay_is_behind_count: field_u64(fields, "replay_is_behind_count").unwrap_or(0),
+    })
+}
+
 fn parse_slot_tracking(fields: &str) -> Option<MetricEvent> {
     Some(MetricEvent::SlotTracking {
         slot: field_u64(fields, "slot")?,
@@ -192,6 +237,19 @@ fn field_bool(fields: &str, key: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leader_slot_elapsed_extracts_slot_and_elapsed_ms() {
+        let line = "datapoint: leader-slot-start-to-cleared-elapsed-ms slot=282936i elapsed=400i";
+        let ev = parse_body(line).unwrap();
+        match ev {
+            EventKind::Metric(MetricEvent::LeaderSlotElapsed { slot, elapsed_ms }) => {
+                assert_eq!(slot, 282_936);
+                assert_eq!(elapsed_ms, 400);
+            }
+            other => panic!("expected LeaderSlotElapsed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn non_datapoint_lines_ignored() {

@@ -1,14 +1,16 @@
 //! Parser pipeline: turns raw log lines into typed `Event`s.
 //!
 //! Layout:
-//! - `line`         splits the bracketed `[ts LEVEL  module] body` prefix
-//! - `votor`        parses `agave_votor::event_handler` lines
-//! - `root`         parses `agave_votor::root_utils` lines
-//! - `bank`         parses `solana_runtime::bank` lines (`bank frozen: ...`)
-//! - `metrics`      parses selected `solana_metrics::metrics` datapoints
-//! - `known_issues` parses `solana_core::cluster_slots_service::cluster_slots` etc.
+//! - `line`                splits the bracketed `[ts LEVEL  module] body` prefix
+//! - `votor`               parses `agave_votor::event_handler` lines
+//! - `root`                parses `agave_votor::root_utils` lines
+//! - `bank`                parses `solana_runtime::bank` lines (`bank frozen: ...`)
+//! - `metrics`             parses selected `solana_metrics::metrics` datapoints
+//! - `known_issues`        parses `solana_core::cluster_slots_service::cluster_slots` etc.
+//! - `block_creation_loop` parses `solana_core::block_creation_loop` ERROR lines
 
 pub mod bank;
+pub mod block_creation_loop;
 pub mod known_issues;
 pub mod line;
 pub mod metrics;
@@ -97,6 +99,12 @@ pub enum EventKind {
     VotingSkip {
         slot: u64,
     },
+    /// `Voting skip-fallback for SLOT` — Alpenglow fallback-path skip vote
+    /// (distinct from [`EventKind::VotingSkip`], which is the round-1 vote).
+    /// Both signal the local validator decided not to notarise the slot.
+    VotingSkipFallback {
+        slot: u64,
+    },
     BlockNotarized {
         slot: u64,
         hash: String,
@@ -161,6 +169,36 @@ pub enum EventKind {
         parent_slot: u64,
         /// Parent block id.
         parent_hash: String,
+    },
+    /// `Parent ready N (parent_slot, parent_hash)` — normal-path ParentReady
+    /// trigger from `ParentReadyTracker`. Marks slot `N` as ready to be
+    /// produced or voted on (parent block is itself notarized).
+    ///
+    /// Distinct from `TriggeringParentReady`, which is the recovery path.
+    /// Each block-creation cycle for a leader window begins with one of
+    /// these for the first slot of the window; downstream `First shred N`
+    /// is the validator's own first shred for `N`.
+    ParentReady {
+        slot: u64,
+        parent_slot: u64,
+        parent_hash: String,
+    },
+
+    // -- solana_core::block_creation_loop --
+    /// `Unable to produce window N-M, skipping window: <reason>` — ERROR
+    /// emitted when our block-creation loop abandons our entire leader
+    /// window without producing any of its slots. Distinct from a network
+    /// `Voting skip` for one slot — this covers the whole window N..=M
+    /// inclusive and is unambiguously "our fault" rather than the leader's.
+    ///
+    /// `reason` is the verbatim trailing string after `skipping window: `
+    /// (truncated by [`ISSUE_BODY_MAX_BYTES`]). The only observed shape
+    /// to date is `PohRecorder(WindowMovedOn(slot))`, indicating banking
+    /// fell behind PoH and the recorder advanced past our window.
+    UnableToProduceWindow {
+        start: u64,
+        end: u64,
+        reason: String,
     },
 
     // -- agave_votor::root_utils --
@@ -298,6 +336,42 @@ pub enum MetricEvent {
         finalized_us: u64,
         is_fast_finalization: bool,
     },
+    /// `leader-slot-start-to-cleared-elapsed-ms slot=N elapsed=M` —
+    /// authoritative leader-slot duration in milliseconds emitted by the
+    /// validator on every slot it produced. Drives the per-slot bank
+    /// time shown in the block-production pane. Distinct from
+    /// `SlotTracking`, which times the voter-side observation pipeline.
+    LeaderSlotElapsed { slot: u64, elapsed_ms: u64 },
+    /// `broadcast-process-shreds-stats` or `broadcast-process-shreds-interrupted-stats`
+    /// — per-slot stats from the leader broadcast pipeline.
+    /// `broadcast_us` is `slot_broadcast_time` (µs); `None` when the
+    /// line is the `-interrupted-stats` variant (which emits
+    /// `slot_broadcast_time=-1` for slots the validator abandoned
+    /// mid-broadcast). `interrupted` flags that variant.
+    BroadcastShreds {
+        slot: u64,
+        broadcast_us: Option<u64>,
+        num_data_shreds: u64,
+        interrupted: bool,
+    },
+    /// `banking_stage_scheduler_slot_counts` — per-slot tally from the
+    /// banking-stage scheduler. `num_finished` is txns that completed
+    /// execution; `num_dropped_on_capacity` is txns the scheduler had
+    /// to drop because its buffer was full (red-flag: normally 0).
+    BankingStageCounts {
+        slot: u64,
+        num_finished: u64,
+        num_dropped_on_capacity: u64,
+    },
+    /// `slot-metrics` — per-slot meta about leader handover and replay
+    /// keeping up. `leader_handover_sad` is the validator's own 1/0
+    /// flag for a bad handover from the prior leader; `replay_is_behind_count`
+    /// counts how many times replay was lagging during the slot.
+    SlotMetrics {
+        slot: u64,
+        leader_handover_sad: bool,
+        replay_is_behind_count: u64,
+    },
 }
 
 /// Outcome of trying to parse a single log line.
@@ -354,6 +428,7 @@ pub fn parse(raw: &str) -> Result<Parsed, ParseError> {
         "solana_runtime::bank" => bank::parse_body(parts.body),
         "solana_core::cluster_slots_service::cluster_slots"
         | "solana_core::cluster_slots_service" => known_issues::parse_body(parts.body),
+        "solana_core::block_creation_loop" => block_creation_loop::parse_body(parts.body),
         "solana_metrics::metrics" => metrics::parse_body(parts.body),
         _ => None,
     };
