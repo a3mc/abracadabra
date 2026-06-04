@@ -42,8 +42,9 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
         "retransmit-stage-slot-stats" => parse_retransmit_slot_stats(fields)?,
         "event_handler_slot_tracking" => parse_slot_tracking(fields)?,
         "leader-slot-start-to-cleared-elapsed-ms" => parse_leader_slot_elapsed(fields)?,
-        "broadcast-process-shreds-stats" => parse_broadcast_shreds(fields, false)?,
-        "broadcast-process-shreds-interrupted-stats" => parse_broadcast_shreds(fields, true)?,
+        "broadcast-process-shreds-stats" | "broadcast-process-shreds-interrupted-stats" => {
+            parse_broadcast_shreds(fields)?
+        }
         "banking_stage_scheduler_slot_counts" => parse_banking_stage_counts(fields)?,
         "slot-metrics" => parse_slot_metrics(fields)?,
         _ => return None,
@@ -136,18 +137,18 @@ fn parse_leader_slot_elapsed(fields: &str) -> Option<MetricEvent> {
     })
 }
 
-fn parse_broadcast_shreds(fields: &str, interrupted: bool) -> Option<MetricEvent> {
+fn parse_broadcast_shreds(fields: &str) -> Option<MetricEvent> {
     let slot = field_u64(fields, "slot")?;
     let num_data_shreds = field_u64(fields, "num_data_shreds").unwrap_or(0);
     // The `-interrupted-stats` variant emits `slot_broadcast_time=-1`;
     // `field_u64` won't parse a negative value, returning None — which
-    // is what we want for the broadcast_us field.
+    // is what we want for the broadcast_us field. The variant flag is
+    // not retained — interruption is observable via `broadcast_us.is_none()`.
     let broadcast_us = field_u64(fields, "slot_broadcast_time");
     Some(MetricEvent::BroadcastShreds {
         slot,
         broadcast_us,
         num_data_shreds,
-        interrupted,
     })
 }
 

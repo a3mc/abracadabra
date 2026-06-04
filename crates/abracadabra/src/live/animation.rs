@@ -306,6 +306,41 @@ impl Slot {
     }
 }
 
+// ---- Spinner ---------------------------------------------------------------
+
+/// Braille spinner frames; same cell pattern Cargo uses.
+const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// Wall-clock window over which event arrivals still count as
+/// "stream live". Past this, the spinner freezes on its last frame.
+pub const SPINNER_LIVE_WINDOW: Duration = Duration::from_millis(750);
+
+/// Events per spinner frame. Each event nudges the spinner by one
+/// step; 4 → calm cadence under steady streams.
+pub const SPINNER_EVENTS_PER_FRAME: u64 = 4;
+
+/// Frame count in the shared spinner table. Exposed so callers can
+/// compute the same index a future frame would land on (used by tests
+/// that exercise the frame-from-event-count math).
+pub const SPINNER_FRAME_COUNT: usize = SPINNER_FRAMES.len();
+
+/// Pick the current spinner glyph for the calling pane.
+///
+/// Honest-liveness: the spinner is event-driven, not wall-clock-driven.
+/// `event_count` advances the frame index; `last_event_at` gates whether
+/// any frame other than the first renders, so a stalled stream freezes
+/// the cell on frame 0 rather than spinning over silent input.
+pub fn spinner_frame(event_count: u64, last_event_at: Option<Instant>) -> &'static str {
+    let alive =
+        last_event_at.is_some_and(|t| Instant::now().duration_since(t) < SPINNER_LIVE_WINDOW);
+    let idx = if alive {
+        usize::try_from(event_count / SPINNER_EVENTS_PER_FRAME).unwrap_or(0) % SPINNER_FRAME_COUNT
+    } else {
+        0
+    };
+    SPINNER_FRAMES[idx]
+}
+
 // ---- Pane trait ------------------------------------------------------------
 
 /// One visual zone of the Live tab.
@@ -524,5 +559,43 @@ mod tests {
     #[allow(dead_code)]
     fn _ref_elapsed() -> Instant {
         elapsed_world(1.0)
+    }
+
+    // ---- Spinner ----
+
+    #[test]
+    fn spinner_freezes_when_no_event_ever_seen() {
+        // No `last_event_at` → spinner pins to frame 0 regardless of
+        // event_count. Renders a stable cell on the cold-start path.
+        let f0 = spinner_frame(0, None);
+        let f1 = spinner_frame(999, None);
+        assert_eq!(f0, f1);
+    }
+
+    #[test]
+    fn spinner_freezes_when_stale_past_live_window() {
+        // Stale `last_event_at` → spinner pins to frame 0 even if
+        // events were observed in the past. Idle-state guarantee.
+        let stale = Instant::now()
+            .checked_sub(SPINNER_LIVE_WINDOW + Duration::from_millis(50))
+            .unwrap();
+        let stale_frame = spinner_frame(SPINNER_EVENTS_PER_FRAME * 3, Some(stale));
+        let fresh_frame_0 = spinner_frame(0, Some(Instant::now()));
+        assert_eq!(stale_frame, fresh_frame_0);
+    }
+
+    #[test]
+    fn spinner_advances_one_step_per_events_per_frame() {
+        // Within the live window, the frame index advances by one
+        // every `SPINNER_EVENTS_PER_FRAME` events. Verify two adjacent
+        // bands map to different frames.
+        let now = Some(Instant::now());
+        let f0 = spinner_frame(0, now);
+        let f1 = spinner_frame(SPINNER_EVENTS_PER_FRAME, now);
+        let f2 = spinner_frame(SPINNER_EVENTS_PER_FRAME * 2, now);
+        assert_ne!(f0, f1);
+        assert_ne!(f1, f2);
+        // Same band → same frame.
+        assert_eq!(f0, spinner_frame(SPINNER_EVENTS_PER_FRAME - 1, now));
     }
 }

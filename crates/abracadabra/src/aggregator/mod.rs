@@ -215,11 +215,26 @@ pub fn ingest(state: &mut State, event: Event) {
                 state.overall.parent_ready_recoveries.saturating_add(1);
         }
         EventKind::ParentReady { .. } => {
-            // Normal-path ParentReady — high-frequency (~one per leader
-            // window first slot in steady state). Counter-only.
-            state.overall.parent_ready_normal = state.overall.parent_ready_normal.saturating_add(1);
+            // Normal-path `ParentReady` — formerly counted on
+            // `OverallStats.parent_ready_normal`; that field was dead
+            // state (no consumer). Now a no-op explicit arm so the
+            // match stays exhaustive. Live tab does not consume this
+            // event today.
         }
-        EventKind::UnableToProduceWindow { .. } => {
+        EventKind::UnableToProduceWindow { start, end, .. } => {
+            // Corruption guard: parallel to `EventKind::ProduceWindow`
+            // above. The parser already rejects spans larger than
+            // `MAX_LEADER_WINDOW_SPAN`, but defending here keeps the
+            // invariant local to the aggregator for any direct-event
+            // call sites (tests, future ingest paths) that bypass the
+            // parser.
+            if end < start || end.saturating_sub(start) > MAX_LEADER_WINDOW_SPAN {
+                state.overall.malformed_unable_to_produce_window = state
+                    .overall
+                    .malformed_unable_to_produce_window
+                    .saturating_add(1);
+                return;
+            }
             // Rare ERROR — leader-side window abandonment. Counter-only at
             // the aggregator level; Live tab consumes the event directly.
             state.overall.unable_to_produce_window_count = state

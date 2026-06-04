@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::aggregator::MAX_LEADER_WINDOW_SPAN;
 use crate::parser::{must_compile, EventKind, SLOT_DIGITS};
 
 pub fn parse_body(body: &str) -> Option<EventKind> {
@@ -22,10 +23,14 @@ pub fn parse_body(body: &str) -> Option<EventKind> {
 
 fn parse_unable_to_produce_window(event: &str) -> Option<EventKind> {
     let caps = re_unable_to_produce_window().captures(event)?;
-    let start = caps.get(1)?.as_str().parse().ok()?;
-    let end = caps.get(2)?.as_str().parse().ok()?;
+    let start: u64 = caps.get(1)?.as_str().parse().ok()?;
+    let end: u64 = caps.get(2)?.as_str().parse().ok()?;
     let reason = caps.get(3)?.as_str().trim().to_owned();
-    if end < start {
+    // Corruption guard: same rationale as `MAX_LEADER_WINDOW_SPAN` on
+    // `EventKind::ProduceWindow` in the aggregator. A truncated end digit
+    // (e.g. `0-18446744073709551615`) would otherwise let downstream
+    // consumers iterate an unbounded `start..=end` range.
+    if end < start || end.saturating_sub(start) > MAX_LEADER_WINDOW_SPAN {
         return None;
     }
     Some(EventKind::UnableToProduceWindow { start, end, reason })
@@ -84,6 +89,32 @@ mod tests {
             "Unable to produce window 100-99, skipping window: PohRecorder(WindowMovedOn(99))",
         );
         assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn unbounded_range_rejected() {
+        // Regression for WIN-02. A truncated end digit (`u64::MAX`) on
+        // an `Unable to produce window` line must be rejected by the
+        // parser. Without this cap, downstream consumers that iterate
+        // `start..=end` would block on a 2^64-element range.
+        let s = body("Unable to produce window 0-18446744073709551615, skipping window: Boom");
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn span_at_max_accepted_span_above_max_rejected() {
+        // Sanity boundary: a span of exactly `MAX_LEADER_WINDOW_SPAN`
+        // is accepted; one slot wider is rejected.
+        let s_ok = body(&format!(
+            "Unable to produce window 100-{}, skipping window: x",
+            100 + MAX_LEADER_WINDOW_SPAN
+        ));
+        assert!(parse_body(&s_ok).is_some());
+        let s_bad = body(&format!(
+            "Unable to produce window 100-{}, skipping window: x",
+            100 + MAX_LEADER_WINDOW_SPAN + 1
+        ));
+        assert!(parse_body(&s_bad).is_none());
     }
 
     #[test]

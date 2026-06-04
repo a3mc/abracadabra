@@ -40,7 +40,6 @@ const MARK_BARS: [&str; 9] = [" ", "·", "·", "•", "•", "•", "●", "●"
 
 const COL_GOOD: Color = Color::Green;
 const COL_WARN: Color = Color::Yellow;
-const COL_BAD: Color = Color::Red;
 const COL_FEC: Color = Color::LightBlue;
 
 /// Rolling window for the snapshot row's percentages. 64 slots ≈ 25 s
@@ -154,7 +153,6 @@ pub struct SlotLifecyclePane {
     /// Per-slot cross-reference for direct canonical-skip detection.
     /// Bounded by [`SLOT_RECORDS_CAPACITY`]; oldest dropped on insert.
     slot_records: BTreeMap<u64, SlotRec>,
-    now: Instant,
 }
 
 impl SlotLifecyclePane {
@@ -168,7 +166,6 @@ impl SlotLifecyclePane {
             history: VecDeque::with_capacity(ROLLING_WINDOW),
             last_fec_per_slot: None,
             slot_records: BTreeMap::new(),
-            now,
         }
     }
 
@@ -179,19 +176,23 @@ impl SlotLifecyclePane {
         let rec = self.slot_records.entry(slot).or_default();
         mark(rec);
         while self.slot_records.len() > SLOT_RECORDS_CAPACITY {
-            if let Some(&oldest) = self.slot_records.keys().next() {
-                self.slot_records.remove(&oldest);
-            }
+            // `BTreeMap::pop_first` removes the smallest key in one
+            // O(log n) call; the previous `keys().next() + remove()`
+            // pair did the same work in two calls with an extra key
+            // materialisation.
+            self.slot_records.pop_first();
         }
     }
 
     /// Number of slots in retention for which we voted skip AND
     /// `Finalized` fired directly. See [`SlotRec`] for caveats.
     fn canonical_skip_count(&self) -> u64 {
-        self.slot_records
+        let n = self
+            .slot_records
             .values()
             .filter(|r| r.voted_skip && r.finalized)
-            .count() as u64
+            .count();
+        u64::try_from(n).unwrap_or(u64::MAX)
     }
 
     const fn lane_ref(&self, lane: Lane) -> &LaneSpark {
@@ -215,11 +216,17 @@ impl SlotLifecyclePane {
             return 0;
         }
         let hits = self.history.iter().filter(|o| **o == want).count();
-        (hits as u64 * 100) / self.history.len() as u64
+        let hits_u64 = u64::try_from(hits).unwrap_or(u64::MAX);
+        let len_u64 = u64::try_from(self.history.len()).unwrap_or(u64::MAX);
+        hits_u64
+            .saturating_mul(100)
+            .checked_div(len_u64)
+            .unwrap_or(0)
     }
 
     fn skip_count(&self) -> u64 {
-        self.history.iter().filter(|o| **o == Outcome::Skip).count() as u64
+        let n = self.history.iter().filter(|o| **o == Outcome::Skip).count();
+        u64::try_from(n).unwrap_or(u64::MAX)
     }
 }
 
@@ -231,6 +238,24 @@ impl Default for SlotLifecyclePane {
 
 impl Pane for SlotLifecyclePane {
     fn on_event(&mut self, ev: &Event) {
+        // `EventKind::local_skip_vote_slot` matches both round-1 and
+        // fallback-round skip votes — a future third skip variant
+        // would slot in without touching the per-pane match arms.
+        // The lane/history increments are gated on a first-time-for-
+        // this-slot check (SKIP-02): the protocol allows both round-1
+        // and fallback votes to be cast for the same slot, but the
+        // operator-facing skip rate counts that situation as a single
+        // skip outcome. `slot_records[slot].voted_skip` is the dedupe
+        // key; `touch_slot` itself is idempotent.
+        if let Some(slot) = ev.kind.local_skip_vote_slot() {
+            let already = self.slot_records.get(&slot).is_some_and(|r| r.voted_skip);
+            if !already {
+                self.skip.accumulate(1);
+                self.record_outcome(Outcome::Skip);
+            }
+            self.touch_slot(slot, |r| r.voted_skip = true);
+            return;
+        }
         match &ev.kind {
             EventKind::Finalized { slot, fast, .. } => {
                 if *fast {
@@ -241,11 +266,6 @@ impl Pane for SlotLifecyclePane {
                     self.record_outcome(Outcome::Slow);
                 }
                 self.touch_slot(*slot, |r| r.finalized = true);
-            }
-            EventKind::VotingSkip { slot } => {
-                self.skip.accumulate(1);
-                self.record_outcome(Outcome::Skip);
-                self.touch_slot(*slot, |r| r.voted_skip = true);
             }
             EventKind::Metric(MetricEvent::ShredInsertIsFull { num_recovered, .. })
                 if *num_recovered > 0 =>
@@ -259,7 +279,6 @@ impl Pane for SlotLifecyclePane {
     }
 
     fn tick(&mut self, now: Instant) {
-        self.now = now;
         self.fast.advance(now);
         self.slow.advance(now);
         self.skip.advance(now);
@@ -324,6 +343,13 @@ impl SlotLifecyclePane {
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(Paragraph::new(self.snapshot_line()), area);
+    }
+
+    /// Compose the snapshot `Line`. Extracted from `render_snapshot`
+    /// for direct test coverage of the label vocabulary (no frame
+    /// roundtripping required).
+    fn snapshot_line(&self) -> Line<'static> {
         let fast_pct = self.ratio_pct(Outcome::Fast);
         let slow_pct = self.ratio_pct(Outcome::Slow);
         let skips = self.skip_count();
@@ -333,7 +359,7 @@ impl SlotLifecyclePane {
             .map_or_else(|| "—".to_owned(), |n| format!("{n}"));
 
         let window_n = self.history.len().min(ROLLING_WINDOW);
-        let line = Line::from(vec![
+        Line::from(vec![
             Span::styled(
                 format!(" {fast_pct}%"),
                 Style::default().fg(COL_GOOD).add_modifier(Modifier::BOLD),
@@ -360,15 +386,17 @@ impl SlotLifecyclePane {
             ),
             Span::styled(" skip", theme::label_style()),
             sep(),
+            // `CSKIP` is the canonical-skip label across the TUI;
+            // matches the Slots tab legend and the chain pane.
             Span::styled(
                 format!("{canon_skips}"),
                 if canon_skips > 0 {
-                    Style::default().fg(COL_BAD).add_modifier(Modifier::BOLD)
+                    theme::bad_style().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            Span::styled(" canon✗", theme::label_style()),
+            Span::styled(" CSKIP", theme::label_style()),
             sep(),
             Span::styled(
                 format!("last {window_n} slots"),
@@ -379,8 +407,7 @@ impl SlotLifecyclePane {
             sep(),
             Span::styled("fec ", theme::label_style()),
             Span::styled(fec, Style::default().fg(COL_FEC)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        ])
     }
 }
 
@@ -679,5 +706,70 @@ mod tests {
         spark.current = 0;
         // mean nonzero = 6 → 2× = 12
         assert_eq!(stable_max(&spark), 12);
+    }
+
+    #[test]
+    fn voting_skip_fallback_drives_skip_lane_and_canonical_join() {
+        // Regression for SKIP-01. `VotingSkipFallback` must drive the
+        // skip lane and the canonical-skip cross-reference identically
+        // to `VotingSkip`. The pane previously only matched the
+        // round-1 variant; a fallback-only skip on a finalised slot
+        // would not surface in `CSKIP`.
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::VotingSkipFallback { slot: 100 }));
+        assert_eq!(p.skip.current, 1);
+        assert_eq!(p.history.back(), Some(&Outcome::Skip));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "h".into(),
+            fast: true,
+        }));
+        assert_eq!(p.canonical_skip_count(), 1);
+    }
+
+    #[test]
+    fn dual_variant_skip_vote_counts_once_per_slot() {
+        // Regression for SKIP-02. The protocol allows both
+        // `VotingSkip` (round 1) and `VotingSkipFallback` (fallback)
+        // to be cast for the same slot. Pre-fix, the SKIP-01
+        // consolidation routed both through `local_skip_vote_slot()`
+        // and incremented `skip.accumulate(1)` / `record_outcome` for
+        // each — inflating the lane and history counters by one per
+        // dual-vote slot. The lane/history increments are now gated
+        // on a first-time check; `canonical_skip_count` already used
+        // the idempotent `voted_skip` flag.
+        let mut p = SlotLifecyclePane::new();
+        p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
+        p.on_event(&mk(EventKind::VotingSkipFallback { slot: 100 }));
+        assert_eq!(p.skip.current, 1, "lane double-charged for dual vote");
+        assert_eq!(p.history.len(), 1, "history double-pushed for dual vote");
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "h".into(),
+            fast: true,
+        }));
+        assert_eq!(
+            p.canonical_skip_count(),
+            1,
+            "canonical-skip should count slot 100 once",
+        );
+    }
+
+    #[test]
+    fn snapshot_line_uses_cskip_label_not_canon_x() {
+        // UX-04: the canonical-skip label was `canon✗`. Unified to
+        // `CSKIP` to match Slots tab + chain pane vocabulary.
+        let p = SlotLifecyclePane::new();
+        let text: String = p
+            .snapshot_line()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains(" CSKIP"), "snapshot missing CSKIP: {text:?}");
+        assert!(
+            !text.contains("canon✗"),
+            "snapshot still uses canon✗: {text:?}"
+        );
     }
 }

@@ -84,6 +84,31 @@ fn produce_window_accepts_max_allowed_span() {
 }
 
 #[test]
+fn unable_to_produce_window_rejects_oversized_span() {
+    // Regression for DEAD-02: the aggregator's `UnableToProduceWindow`
+    // arm mirrors the corruption guard on `ProduceWindow`. The parser
+    // (`block_creation_loop.rs`) rejects oversized spans before they
+    // reach this point, so the guard only fires on synthetic
+    // direct-constructed events. This test exercises that defense and
+    // proves `malformed_unable_to_produce_window` is reachable.
+    let mut state = State::default();
+    let ts = time::macros::datetime!(2026-05-23 16:00:07 UTC);
+    ingest(
+        &mut state,
+        Event {
+            ts,
+            kind: EventKind::UnableToProduceWindow {
+                start: 0,
+                end: u64::MAX,
+                reason: "synthetic".to_owned(),
+            },
+        },
+    );
+    assert_eq!(state.overall.malformed_unable_to_produce_window, 1);
+    assert_eq!(state.overall.unable_to_produce_window_count, 0);
+}
+
+#[test]
 fn produce_window_rejects_inverted_range() {
     // end < start is also corruption — reject and count, do not iterate
     // an empty range silently.

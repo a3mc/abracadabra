@@ -347,12 +347,12 @@ pub enum MetricEvent {
     /// `broadcast_us` is `slot_broadcast_time` (µs); `None` when the
     /// line is the `-interrupted-stats` variant (which emits
     /// `slot_broadcast_time=-1` for slots the validator abandoned
-    /// mid-broadcast). `interrupted` flags that variant.
+    /// mid-broadcast). Consumers infer interruption from
+    /// `broadcast_us.is_none()`; no separate flag is carried.
     BroadcastShreds {
         slot: u64,
         broadcast_us: Option<u64>,
         num_data_shreds: u64,
-        interrupted: bool,
     },
     /// `banking_stage_scheduler_slot_counts` — per-slot tally from the
     /// banking-stage scheduler. `num_finished` is txns that completed
@@ -372,6 +372,23 @@ pub enum MetricEvent {
         leader_handover_sad: bool,
         replay_is_behind_count: u64,
     },
+}
+
+impl EventKind {
+    /// Slot on which this validator cast a skip vote, if the event is
+    /// either a round-1 `Voting skip` or the fallback-round `Voting
+    /// skip-fallback`. Both signal the same operational fact (we did
+    /// not notarise this slot locally); callers that classify "the
+    /// local validator missed this slot" should consume both via this
+    /// helper rather than matching one variant and silently dropping
+    /// the other.
+    #[must_use]
+    pub const fn local_skip_vote_slot(&self) -> Option<u64> {
+        match self {
+            Self::VotingSkip { slot } | Self::VotingSkipFallback { slot } => Some(*slot),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of trying to parse a single log line.
@@ -781,5 +798,29 @@ mod tests {
             panic!("expected Parsed::Issue, got {parsed:?}");
         };
         assert_eq!(body, "pre[31mpost");
+    }
+
+    #[test]
+    fn local_skip_vote_slot_returns_slot_for_both_skip_variants() {
+        // Regression guard for SKIP-01: the helper that unifies the
+        // two skip-vote variants must return the slot for both, and
+        // `None` for any other variant. Adding a future third skip
+        // variant should extend this match arm at one place.
+        assert_eq!(
+            EventKind::VotingSkip { slot: 100 }.local_skip_vote_slot(),
+            Some(100),
+        );
+        assert_eq!(
+            EventKind::VotingSkipFallback { slot: 101 }.local_skip_vote_slot(),
+            Some(101),
+        );
+        assert_eq!(
+            EventKind::VotingFinalize { slot: 102 }.local_skip_vote_slot(),
+            None,
+        );
+        assert_eq!(
+            EventKind::FirstShred { slot: 103 }.local_skip_vote_slot(),
+            None
+        );
     }
 }

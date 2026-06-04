@@ -386,11 +386,8 @@ fn render_legend(filters: SlotFilters, frame: &mut Frame<'_>, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
-            Span::styled("LSKIP", theme::accent_style()),
-            Span::styled(
-                " our leader slot, we voted skip (window abandoned)",
-                theme::label_style(),
-            ),
+            Span::styled("LSKIP", theme::bad_style()),
+            Span::styled(" our leader slot, we voted skip", theme::label_style()),
         ]),
         Line::from(vec![
             Span::styled(TAG_INDENT, theme::label_style()),
@@ -583,15 +580,16 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
     // Color-banding for the status cell:
     //   FastFinalized / SlowFinalized → green (healthy outcome)
     //   Skipped + CanonicalSkip (proven bad)      → red (real failure)
-    //   Skipped + we_are_leader (LSKIP, our skip) → accent (our action,
-    //                                              honestly tagged)
+    //   Skipped + we_are_leader (LSKIP, our skip) → red (we missed
+    //                                              our own leader window —
+    //                                              operationally bad)
     //   Skipped + Indeterminate/NotSkipped (VSKIP) → yellow (unverified;
     //                                              could be right or canonical)
     //   Pending → gray (no terminal state yet)
     let status_style = match s.status {
         SlotStatus::FastFinalized | SlotStatus::SlowFinalized => theme::good_style(),
         SlotStatus::Skipped if s.skip_classification.is_canonical_skip() => theme::bad_style(),
-        SlotStatus::Skipped if s.we_are_leader => theme::accent_style(),
+        SlotStatus::Skipped if s.we_are_leader => theme::bad_style(),
         SlotStatus::Skipped => theme::warn_style(),
         SlotStatus::Pending => theme::label_style(),
     };

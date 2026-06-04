@@ -212,19 +212,26 @@ pub struct OverallStats {
     /// regime described above.
     pub parent_ready_recoveries: u64,
 
-    /// Number of `Parent ready N (P, hash)` lines observed (normal-path
-    /// `ParentReadyTracker` emit). One per leader-window first-slot in
-    /// steady state. Counter-only; the Live tab consumes the event
-    /// directly from the stream for per-window timing analysis.
-    pub parent_ready_normal: u64,
-
     /// Number of `Unable to produce window N-M, skipping window: ...`
     /// ERROR lines from `solana_core::block_creation_loop`. Each line
-    /// signals that the validator abandoned an entire leader window
-    /// without producing any slot — unambiguously "our fault" rather
-    /// than the leader's. Empirically rare (~10 per 24h log on the
-    /// production cluster); raise this if it spikes.
+    /// signals that this slot range was abandoned by our own
+    /// block-creation loop — distinct from cluster-side skip votes
+    /// against another leader's slot (we ARE the leader in this
+    /// case). Empirically rare (~10 per 24h log on the production
+    /// cluster); raise this if it spikes.
     pub unable_to_produce_window_count: u64,
+    /// `Unable to produce window` lines rejected by the parser because
+    /// `end - start` exceeded `MAX_LEADER_WINDOW_SPAN`. Symmetric to
+    /// `malformed_produce_window`: a truncated digit could otherwise
+    /// force live panes to iterate an unbounded `start..=end` range.
+    ///
+    /// Intentionally NOT surfaced in any TUI panel or summary yet —
+    /// reserved for future ingest-corruption monitoring (same
+    /// disposition as `malformed_produce_window`). A non-zero count
+    /// signals truncated log lines or an upstream agave bug. Do not
+    /// remove; cost is one `u64`, write is a single `saturating_add`
+    /// on the ingest path.
+    pub malformed_unable_to_produce_window: u64,
 
     // Bank.
     pub bank_frozen_count: u64,

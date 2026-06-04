@@ -11,17 +11,28 @@ use std::path::PathBuf;
 
 use abracadabra::parser::{parse, EventKind, MetricEvent, Parsed};
 
-fn captured_log() -> Option<PathBuf> {
+/// Probe for either of the two captured-log fixtures the operator
+/// workflow uses. `new-log-to-debug.log` is the pinned-count fixture
+/// the `assert_eq!` block below is calibrated against;
+/// `agave-validator.log` is the operator's rolling reference and
+/// changes between captures. We return the path *and* whether it is
+/// the pinned fixture so the caller can decide which assertions to
+/// run. Skipped silently when neither is present.
+fn captured_log() -> Option<(PathBuf, bool)> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(PathBuf::from)?;
-    let p = repo_root.join("log").join("new-log-to-debug.log");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
+    let log_dir = repo_root.join("log");
+    let pinned = log_dir.join("new-log-to-debug.log");
+    if pinned.exists() {
+        return Some((pinned, true));
     }
+    let rolling = log_dir.join("agave-validator.log");
+    if rolling.exists() {
+        return Some((rolling, false));
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -74,29 +85,64 @@ fn ingest(path: &PathBuf) -> Counts {
 
 #[test]
 fn parser_recognises_expected_metric_counts() {
-    let Some(path) = captured_log() else {
-        eprintln!("[skip] log/new-log-to-debug.log not present; skipping empirical check");
+    let Some((path, is_pinned_fixture)) = captured_log() else {
+        eprintln!(
+            "[skip] neither log/new-log-to-debug.log nor log/agave-validator.log present; \
+             skipping empirical check",
+        );
         return;
     };
     let c = ingest(&path);
 
-    // Expected counts come from `grep -c "datapoint: <name> " <log>`
-    // — see scripts/check-metric-counts.sh. Discrepancies usually mean
-    // the parser's name dispatch is wrong, the datapoint format
-    // shifted upstream, or a required field disappeared. The numbers
-    // below are pinned to the captured log; update them and the
-    // script together if the log fixture is regenerated.
-    assert_eq!(c.shred_fetch, 5461, "shred_fetch");
-    assert_eq!(c.shred_fetch_repair, 4632, "shred_fetch_repair");
-    assert_eq!(c.shred_sigverify, 7963, "shred_sigverify");
-    assert_eq!(c.recv_window_insert, 8037, "recv-window-insert-shreds");
-    assert_eq!(c.blockstore_insert, 8037, "blockstore-insert-shreds");
-    assert_eq!(c.shred_recovery, 8037, "shred-recovery");
-    assert_eq!(c.shred_insert_is_full, 13_759, "shred_insert_is_full");
-    assert_eq!(c.retransmit_first_shred, 13_623, "retransmit-first-shred");
-    assert_eq!(
-        c.retransmit_slot_stats, 13_623,
-        "retransmit-stage-slot-stats"
+    if is_pinned_fixture {
+        // Expected counts come from `grep -c "datapoint: <name> " <log>`
+        // — see scripts/check-metric-counts.sh. Discrepancies usually
+        // mean the parser's name dispatch is wrong, the datapoint
+        // format shifted upstream, or a required field disappeared.
+        // The numbers below are pinned to `new-log-to-debug.log`;
+        // update them and the script together if that fixture is
+        // regenerated. Skipped when running against the rolling
+        // `agave-validator.log` capture, whose counts drift between
+        // refreshes.
+        assert_eq!(c.shred_fetch, 5461, "shred_fetch");
+        assert_eq!(c.shred_fetch_repair, 4632, "shred_fetch_repair");
+        assert_eq!(c.shred_sigverify, 7963, "shred_sigverify");
+        assert_eq!(c.recv_window_insert, 8037, "recv-window-insert-shreds");
+        assert_eq!(c.blockstore_insert, 8037, "blockstore-insert-shreds");
+        assert_eq!(c.shred_recovery, 8037, "shred-recovery");
+        assert_eq!(c.shred_insert_is_full, 13_759, "shred_insert_is_full");
+        assert_eq!(c.retransmit_first_shred, 13_623, "retransmit-first-shred");
+        assert_eq!(
+            c.retransmit_slot_stats, 13_623,
+            "retransmit-stage-slot-stats"
+        );
+        assert_eq!(c.slot_tracking, 14_827, "event_handler_slot_tracking");
+    }
+
+    // The four metric variants added with the live-tab rebuild
+    // (`leader-slot-start-to-cleared-elapsed-ms`,
+    // `broadcast-process-shreds-stats[+ -interrupted-stats]`,
+    // `banking_stage_scheduler_slot_counts`, `slot-metrics`) are
+    // present in any non-trivial validator log (operator's reference
+    // `agave-validator.log` shows ≥1900 of each). These `>0`
+    // assertions run against either fixture and catch the regression
+    // the audit flagged: a parser change that drops every datapoint
+    // of one of these families would make the corresponding count
+    // fall to 0, failing this assertion.
+    assert!(
+        c.leader_slot_elapsed > 0,
+        "leader-slot-start-to-cleared-elapsed-ms parser dropped every datapoint"
     );
-    assert_eq!(c.slot_tracking, 14_827, "event_handler_slot_tracking");
+    assert!(
+        c.broadcast_shreds > 0,
+        "broadcast-process-shreds-stats parser dropped every datapoint"
+    );
+    assert!(
+        c.banking_scheduler > 0,
+        "banking_stage_scheduler_slot_counts parser dropped every datapoint"
+    );
+    assert!(
+        c.slot_metrics > 0,
+        "slot-metrics parser dropped every datapoint"
+    );
 }

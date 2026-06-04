@@ -7,10 +7,12 @@
 //! - A spinner and the **tip slot number** at the top, proving the
 //!   stream is live and giving the operator a slot counter.
 //! - A four-row **live timing table** (p50 / p95 in ms) for the four
-//!   stage-delta families the Windows tab also reports — cluster
-//!   slot cadence, assembly, consensus, lifecycle. Definitions match
-//!   [`crate::model::analysis::LatencyStages`] exactly so the live
-//!   numbers are directly comparable to the Windows-tab snapshot.
+//!   stage-delta families the Windows tab also reports — local slot
+//!   cadence (bank-frozen inter-arrival at this node, used as a
+//!   proxy for cluster cadence), assembly, consensus, lifecycle.
+//!   Definitions match [`crate::model::analysis::LatencyStages`]
+//!   exactly so the live numbers are directly comparable to the
+//!   Windows-tab snapshot.
 //!
 //! The underlying graph model tracks every `Block` / `Finalized` /
 //! `VotingSkip` / `VotingNotarize` / `SettingRoot` event:
@@ -29,6 +31,15 @@
 //!   time the skip is classified (see below).
 //!
 //! Snapshot row tallies canonical-skip / indeterminate counts.
+//!
+//! Label vocabulary matches the Slots tab: `CSKIP` is the canonical-skip
+//! term across the whole TUI. The Live-tab chain pane uses the same
+//! token; see `tui/panel/slots.rs` for the legend that defines it.
+//!
+//! Note: `ParentReady` and `SettingRoot` events are intentionally not
+//! surfaced in this pane — operator deemed them low-signal noise.
+//! Earlier iterations carried a scrolling event log; that pane was
+//! removed and the timing table + snapshot row replaced it.
 //!
 //! Classification (mirrors the aggregator):
 //!
@@ -52,7 +63,7 @@
 //! anchors walking backwards through observed parent edges.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -61,7 +72,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use time::OffsetDateTime;
 
-use crate::live::animation::Pane;
+use crate::live::animation::{spinner_frame, Pane};
 use crate::parser::{Event, EventKind};
 use crate::tui::theme;
 
@@ -151,24 +162,28 @@ pub struct ChainPane {
     /// Set of `(slot, hash)` pairs proven canonical, anchored by
     /// `Finalized` events and walked back through `parents`.
     canonical: HashSet<BlockId>,
+    /// Slot-only projection of `canonical`. Used by `classify_skip`
+    /// for O(1) lookup; previously a linear scan of `canonical` per
+    /// skipped slot per render frame. Kept synchronised with
+    /// `canonical` in [`Self::mark_canonical_and_walk_back`] and
+    /// [`Self::prune`].
+    canonical_slots: HashSet<u64>,
+    /// Count of malformed parent edges seen during walk-back
+    /// (`parent.0 >= current.0`). Surfaced on the snapshot row only
+    /// when nonzero so the operator notices upstream parser regressions
+    /// rather than silently degrading canonical-skip detection.
+    walk_back_anomalies: u64,
     last_root: Option<u64>,
     /// Count of events observed since the pane was constructed.
     /// Drives the spinner — every Nth event ticks one frame, so the
     /// spinner pauses when the stream is silent (honest liveness).
     event_count: u64,
     /// Wall-clock instant of the most recent event observation. The
-    /// spinner only advances if events arrived within the last
-    /// [`SPINNER_LIVE_WINDOW`]; otherwise the cell freezes.
+    /// spinner only advances if events arrived within the shared
+    /// liveness window; otherwise the cell freezes.
     last_event_at: Option<Instant>,
 }
 
-const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-/// Wall-clock window over which event arrivals still count as
-/// "stream live". Past this, the spinner freezes on its last frame.
-const SPINNER_LIVE_WINDOW: Duration = Duration::from_millis(750);
-/// Events per spinner frame. Each event nudges the spinner by one
-/// step; 4 → calm cadence under steady streams.
-const SPINNER_EVENTS_PER_FRAME: u64 = 4;
 /// BankFrozen inter-arrival deltas spanning more than this many slots
 /// are treated as skip runs and excluded from cluster-cadence
 /// percentiles. Mirrors the same defence in [`crate::live::scenes::leader`].
@@ -202,7 +217,6 @@ type StagePercentiles = Option<(i64, i64)>;
 /// Sort `samples` in place and return `(p50_ms, p95_ms)` derived from
 /// integer positional percentiles. Inputs are microseconds; output is
 /// milliseconds. `None` when the input is empty.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn percentiles_ms(samples: &mut [i64]) -> StagePercentiles {
     if samples.is_empty() {
         return None;
@@ -210,6 +224,9 @@ fn percentiles_ms(samples: &mut [i64]) -> StagePercentiles {
     samples.sort_unstable();
     let pick = |frac: f64| -> i64 {
         let n = samples.len();
+        // Invariant: `n <= HISTORY_CAPACITY` (512), so `n as f64` is
+        // exact and the `f64 → usize` cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let idx = ((frac * n as f64).ceil() as usize)
             .saturating_sub(1)
             .min(n - 1);
@@ -224,6 +241,8 @@ impl ChainPane {
             slots: VecDeque::with_capacity(HISTORY_CAPACITY),
             parents: HashMap::with_capacity(EDGES_CAPACITY),
             canonical: HashSet::with_capacity(EDGES_CAPACITY),
+            canonical_slots: HashSet::with_capacity(EDGES_CAPACITY),
+            walk_back_anomalies: 0,
             last_root: None,
             event_count: 0,
             last_event_at: None,
@@ -235,6 +254,17 @@ impl ChainPane {
     }
 
     fn upsert_slot(&mut self, slot: u64) -> &mut SlotState {
+        // Sorted-by-slot invariant on `self.slots` is preserved by:
+        // - tip-extension (`slot > last.slot`) appends at the back,
+        // - tip-match returns the existing back entry,
+        // - out-of-order arrival inserts at `partition_point`.
+        //
+        // Out-of-order is genuine: `Block` / `Finalized` can arrive
+        // for slots older than the current tip (different threads,
+        // and the `Finalized`-before-`Block` retroactive path in
+        // `on_event`). `VecDeque::insert` is O(N) shifts but no
+        // allocation and no sort — dramatically cheaper than the
+        // previous drain+sort+extend on `HISTORY_CAPACITY = 512`.
         let idx = match self.slots.back() {
             None => {
                 self.slots.push_back(SlotState::new(slot));
@@ -246,23 +276,31 @@ impl ChainPane {
             }
             Some(last) if slot == last.slot => self.slots.len() - 1,
             Some(_) => {
-                if let Some(i) = self.slots.iter().position(|s| s.slot == slot) {
-                    i
-                } else {
-                    self.slots.push_back(SlotState::new(slot));
-                    let mut v: Vec<_> = self.slots.drain(..).collect();
-                    v.sort_by_key(|s| s.slot);
-                    self.slots.extend(v);
-                    self.slots.iter().position(|s| s.slot == slot).unwrap_or(0)
+                let pos = self.slots.partition_point(|s| s.slot < slot);
+                let already_present = pos < self.slots.len() && self.slots[pos].slot == slot;
+                if !already_present {
+                    self.slots.insert(pos, SlotState::new(slot));
                 }
+                pos
             }
         };
+        debug_assert!(
+            self.slots.iter().map(|s| s.slot).is_sorted(),
+            "slots must remain sorted by slot after upsert_slot"
+        );
         &mut self.slots[idx]
     }
 
     /// Mark `(slot, hash)` canonical and walk back through parent
     /// edges, marking every ancestor canonical. Stops at edges we
     /// don't have (chain root or out-of-window slots).
+    ///
+    /// Increments [`Self::walk_back_anomalies`] when a parent edge
+    /// violates the `parent.0 < current.0` invariant. That state
+    /// indicates either a parser regression upstream or a corrupt
+    /// `(slot, hash) → (parent_slot, parent_hash)` mapping; surfacing
+    /// it as a counter avoids silently degrading the canonical-skip
+    /// detection rate.
     fn mark_canonical_and_walk_back(&mut self, slot: u64, hash: String) {
         let mut current = (slot, hash);
         loop {
@@ -270,10 +308,13 @@ impl ChainPane {
                 // Already canonical — chain explored, stop.
                 break;
             }
+            self.canonical_slots.insert(current.0);
             match self.parents.get(&current) {
                 Some(parent) => {
                     if parent.0 >= current.0 {
-                        // Sanity: parent should be older.
+                        // Malformed parent edge — parent must be older.
+                        // Stop walk-back and surface as an anomaly.
+                        self.walk_back_anomalies = self.walk_back_anomalies.saturating_add(1);
                         break;
                     }
                     current = parent.clone();
@@ -288,35 +329,33 @@ impl ChainPane {
     /// `OnCanonical` iff any hash for the slot is in the canonical
     /// set (direct `Finalized` or via walk-back through observed
     /// parent edges). Everything else is `Indeterminate`.
+    ///
+    /// Uses the [`Self::canonical_slots`] projection so the lookup is
+    /// O(1) per call rather than O(|canonical|).
     fn classify_skip(&self, slot: u64) -> SkipClass {
-        if self.canonical.iter().any(|(s, _)| *s == slot) {
+        if self.canonical_slots.contains(&slot) {
             SkipClass::OnCanonical
         } else {
             SkipClass::Indeterminate
         }
     }
 
+    /// NIT-02: a skip-vote upsert for a slot below the cutoff will be
+    /// evicted on the same call. Currently mitigated by the
+    /// `skip_to_present` cursor (`live/scenes/mod.rs:96`) on
+    /// resume-after-pause; protocol-side voting is recent-slot only.
     fn prune(&mut self) {
         while self.slots.len() > HISTORY_CAPACITY {
             if let Some(s) = self.slots.pop_front() {
-                for hash in &s.hashes {
-                    let key = (s.slot, hash.clone());
-                    self.parents.remove(&key);
-                    self.canonical.remove(&key);
-                }
+                self.evict_slot_indexes(&s);
             }
         }
         if let Some(root) = self.last_root {
             let cutoff = root.saturating_sub(ROOT_TRAILING_SLOTS);
             while let Some(s) = self.slots.front() {
                 if s.slot < cutoff {
-                    let dropped = self.slots.pop_front();
-                    if let Some(s) = dropped {
-                        for hash in &s.hashes {
-                            let key = (s.slot, hash.clone());
-                            self.parents.remove(&key);
-                            self.canonical.remove(&key);
-                        }
+                    if let Some(s) = self.slots.pop_front() {
+                        self.evict_slot_indexes(&s);
                     }
                 } else {
                     break;
@@ -325,23 +364,60 @@ impl ChainPane {
         }
     }
 
+    /// Drop secondary indexes (`parents`, `canonical`, `canonical_slots`)
+    /// for an evicted `SlotState`. Keeps the secondary indexes
+    /// consistent with the primary `slots` deque.
+    fn evict_slot_indexes(&mut self, s: &SlotState) {
+        for hash in &s.hashes {
+            let key = (s.slot, hash.clone());
+            self.parents.remove(&key);
+            self.canonical.remove(&key);
+        }
+        // Drop the slot-only projection entry too; no remaining
+        // `SlotState` carries this slot, so the projection cannot be
+        // out of sync after this point.
+        self.canonical_slots.remove(&s.slot);
+    }
+
     fn fork_count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_forked()).count()
     }
 
+    #[cfg(test)]
     fn canonical_skip_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.skipped && self.classify_skip(s.slot) == SkipClass::OnCanonical)
-            .count()
+        self.skip_tallies().0
+    }
+
+    /// Single-pass tally `(canonical_skips, indeterminate_skips)` over
+    /// the retained slot deque. The snapshot row needs both counters;
+    /// folding them into one walk halves the per-frame cost.
+    fn skip_tallies(&self) -> (usize, usize) {
+        let mut canon = 0usize;
+        let mut indet = 0usize;
+        for s in &self.slots {
+            if !s.skipped {
+                continue;
+            }
+            match self.classify_skip(s.slot) {
+                SkipClass::OnCanonical => canon += 1,
+                SkipClass::Indeterminate => indet += 1,
+            }
+        }
+        (canon, indet)
     }
 
     /// Sample `(p50, p95)` (ms) for every stage-delta family the chain
     /// pane surfaces. Definitions:
     ///
-    /// - `cluster` — `bank_frozen_at[N] → bank_frozen_at[N+gap]`
-    ///   divided by `gap`, treating gaps larger than [`MAX_SLOT_GAP`]
-    ///   as skip runs (excluded). Reflects observed cluster slot cadence.
+    /// - `slot cadence` (internal field name: `cluster`) —
+    ///   `bank_frozen_at[N] → bank_frozen_at[N+gap]` divided by `gap`,
+    ///   treating gaps larger than [`MAX_SLOT_GAP`] as skip runs
+    ///   (excluded). Measured at OUR node: `bank_frozen_at` fires
+    ///   when our replay finishes freezing the bank, so the value is
+    ///   influenced by network transit time of shreds to us and by
+    ///   our own replay throughput. In steady state this approximates
+    ///   the true cluster cadence; a node behind on replay would
+    ///   inflate the value without that being visible in this row.
     /// - `assembly` — `first_shred_at → block_emitted_at` per slot.
     /// - `consensus` — `block_emitted_at → finalized_at` per slot.
     /// - `lifecycle` — `first_shred_at → finalized_at` per slot.
@@ -391,11 +467,9 @@ impl ChainPane {
         }
     }
 
+    #[cfg(test)]
     fn indeterminate_skip_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.skipped && self.classify_skip(s.slot) == SkipClass::Indeterminate)
-            .count()
+        self.skip_tallies().1
     }
 }
 
@@ -409,6 +483,15 @@ impl Pane for ChainPane {
     fn on_event(&mut self, ev: &Event) {
         self.event_count = self.event_count.saturating_add(1);
         self.last_event_at = Some(Instant::now());
+        // `EventKind::local_skip_vote_slot` matches both round-1 and
+        // fallback-round skip votes — a future third skip variant
+        // would slot in without touching the per-pane match arms.
+        if let Some(slot) = ev.kind.local_skip_vote_slot() {
+            let s = self.upsert_slot(slot);
+            s.skipped = true;
+            self.prune();
+            return;
+        }
         match &ev.kind {
             EventKind::Block {
                 slot,
@@ -461,15 +544,13 @@ impl Pane for ChainPane {
                 let s = self.upsert_slot(*slot);
                 s.notarized = true;
             }
-            EventKind::VotingSkip { slot } => {
-                let s = self.upsert_slot(*slot);
-                s.skipped = true;
-            }
             EventKind::SettingRoot { slot } | EventKind::NewRoot { slot } => {
                 self.last_root = Some(*slot);
             }
             // ProduceWindow is consumed by the block-production pane;
             // leader-window events do not belong in the chain log.
+            // Skip-vote variants are handled by the
+            // `local_skip_vote_slot` fast-path above.
             _ => return,
         }
         self.prune();
@@ -511,16 +592,7 @@ impl Pane for ChainPane {
 
 impl ChainPane {
     fn render_tip(&self, frame: &mut Frame<'_>, area: Rect) {
-        let spinner_idx = if self
-            .last_event_at
-            .is_some_and(|t| Instant::now().duration_since(t) < SPINNER_LIVE_WINDOW)
-        {
-            usize::try_from(self.event_count / SPINNER_EVENTS_PER_FRAME).unwrap_or(0)
-                % SPINNER.len()
-        } else {
-            0
-        };
-        let spinner = SPINNER[spinner_idx];
+        let spinner = spinner_frame(self.event_count, self.last_event_at);
         let tip = self
             .tip_slot()
             .map_or_else(|| "—".to_owned(), |s| s.to_string());
@@ -557,7 +629,7 @@ impl ChainPane {
         // Order: cluster (network cadence), then assembly → consensus
         // → lifecycle (stage breakdown matching Windows-tab semantics).
         let rows: [(&str, StagePercentiles); 4] = [
-            ("cluster slot", table.cluster),
+            ("slot cadence", table.cluster),
             ("assembly", table.assembly),
             ("consensus", table.consensus),
             ("lifecycle", table.lifecycle),
@@ -583,8 +655,14 @@ impl ChainPane {
     }
 
     fn render_snapshot(&self, frame: &mut Frame<'_>, area: Rect) {
-        let canonical_skips = self.canonical_skip_count();
-        let indeterminate = self.indeterminate_skip_count();
+        frame.render_widget(Paragraph::new(self.snapshot_line()), area);
+    }
+
+    /// Compose the snapshot `Line`. Extracted from `render_snapshot`
+    /// for direct test coverage of the label vocabulary (no frame
+    /// roundtripping required).
+    fn snapshot_line(&self) -> Line<'static> {
+        let (canonical_skips, indeterminate) = self.skip_tallies();
         let forks = self.fork_count();
 
         let range = match (self.slots.front(), self.slots.back()) {
@@ -593,8 +671,8 @@ impl ChainPane {
             _ => "—".to_owned(),
         };
 
-        let canon_style = if canonical_skips > 0 {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        let cskip_style = if canonical_skips > 0 {
+            theme::bad_style().add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -606,7 +684,9 @@ impl ChainPane {
             Style::default().fg(Color::DarkGray)
         };
 
-        let line = Line::from(vec![
+        // `CSKIP` matches the Slots tab vocabulary (see slots.rs:303,384
+        // and tui/view.rs status_str — single token across the TUI).
+        let mut spans = vec![
             Span::styled(" slots ", theme::label_style()),
             Span::styled(
                 range,
@@ -615,8 +695,8 @@ impl ChainPane {
                     .add_modifier(Modifier::BOLD),
             ),
             sep(),
-            Span::styled(canonical_skips.to_string(), canon_style),
-            Span::styled(" canon", theme::label_style()),
+            Span::styled(canonical_skips.to_string(), cskip_style),
+            Span::styled(" CSKIP", theme::label_style()),
             sep(),
             Span::styled(
                 indeterminate.to_string(),
@@ -626,8 +706,20 @@ impl ChainPane {
             sep(),
             Span::styled(forks.to_string(), fork_style),
             Span::styled(" forks", theme::label_style()),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        ];
+        // Walk-back anomalies are only surfaced when nonzero — silence
+        // is the correct default for a healthy stream (no-explanatory-UX
+        // policy). When nonzero, surface as a red-bold counter so the
+        // operator notices upstream parser regressions.
+        if self.walk_back_anomalies > 0 {
+            spans.push(sep());
+            spans.push(Span::styled(
+                self.walk_back_anomalies.to_string(),
+                theme::bad_style().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" anom", theme::label_style()));
+        }
+        Line::from(spans)
     }
 }
 
@@ -954,5 +1046,200 @@ mod tests {
         let mut p = ChainPane::new();
         p.on_event(&mk(EventKind::SettingRoot { slot: 95 }));
         assert_eq!(p.last_root, Some(95));
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn snapshot_line_uses_cskip_label_not_canon() {
+        // UX-04: chain pane previously labelled the canonical-skip
+        // count as ` canon`. Unified across the TUI to `CSKIP` to
+        // match the Slots tab and status bar vocabulary.
+        let p = ChainPane::new();
+        let text = line_text(&p.snapshot_line());
+        assert!(text.contains(" CSKIP"), "snapshot missing CSKIP: {text:?}");
+        assert!(
+            !text.contains(" canon"),
+            "snapshot still uses ` canon` label: {text:?}"
+        );
+    }
+
+    #[test]
+    fn voting_skip_fallback_classifies_canonical_when_finalized() {
+        // Regression for SKIP-01. The fallback-round skip vote must
+        // drive the same `skipped` flag as round-1 `VotingSkip`. A
+        // slot we skipped via fallback alone that subsequently
+        // finalises is a canonical-skip — matching only `VotingSkip`
+        // would let it evade `canonical_skip_count()`.
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::VotingSkipFallback { slot: 100 }));
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        assert_eq!(p.classify_skip(100), SkipClass::OnCanonical);
+        assert_eq!(p.canonical_skip_count(), 1);
+    }
+
+    #[test]
+    fn upsert_slot_preserves_sorted_invariant_on_out_of_order_insert() {
+        // PERF-03: the previous drain+sort+extend path is gone; the
+        // new code inserts at `partition_point`. Verify the resulting
+        // deque stays sorted across mixed-order arrivals.
+        let mut p = ChainPane::new();
+        // Arrival order: 105, 100, 103, 102, 110 — only 105 and 110
+        // are tip-extensions; 100/103/102 hit the out-of-order branch.
+        for slot in [105, 100, 103, 102, 110] {
+            p.upsert_slot(slot);
+        }
+        let observed: Vec<u64> = p.slots.iter().map(|s| s.slot).collect();
+        assert_eq!(observed, vec![100, 102, 103, 105, 110]);
+    }
+
+    #[test]
+    fn upsert_slot_returning_index_points_at_inserted_or_existing_slot() {
+        // The `&mut SlotState` returned by `upsert_slot` is used to
+        // mutate the just-inserted (or pre-existing) slot. The
+        // partition_point return path must point at the correct entry,
+        // not at slot 0 like the previous `.unwrap_or(0)` fallback did.
+        let mut p = ChainPane::new();
+        // Tip extension at 100; then out-of-order at 50.
+        p.upsert_slot(100).hashes.push("a".into());
+        p.upsert_slot(50).hashes.push("b".into());
+        // Out-of-order re-touch of slot 100 — must return the slot-100
+        // entry, not slot-50 or slot-0.
+        p.upsert_slot(100).hashes.push("c".into());
+        let slot_100 = p.slots.iter().find(|s| s.slot == 100).unwrap();
+        let slot_50 = p.slots.iter().find(|s| s.slot == 50).unwrap();
+        assert_eq!(slot_100.hashes, vec!["a".to_owned(), "c".to_owned()]);
+        assert_eq!(slot_50.hashes, vec!["b".to_owned()]);
+    }
+
+    #[test]
+    fn timing_table_excludes_inter_arrival_when_gap_exceeds_max() {
+        // TEST-02: gap > MAX_SLOT_GAP (= 8) is treated as a skip run
+        // and the sample MUST be excluded from cluster percentiles.
+        // Two samples spaced by gap = 9 — no cluster percentile emitted.
+        let mut p = ChainPane::new();
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        p.on_event(&Event {
+            ts: t0,
+            kind: EventKind::BankFrozen {
+                slot: 100,
+                hash: "h".into(),
+                signature_count: 1,
+            },
+        });
+        p.on_event(&Event {
+            ts: t0 + time::Duration::milliseconds(400),
+            kind: EventKind::BankFrozen {
+                slot: 109, // gap = 9 > MAX_SLOT_GAP
+                hash: "h".into(),
+                signature_count: 1,
+            },
+        });
+        assert!(
+            p.timing_table().cluster.is_none(),
+            "gap > MAX_SLOT_GAP must be excluded from cluster percentiles"
+        );
+    }
+
+    #[test]
+    fn timing_table_includes_inter_arrival_when_gap_equals_max() {
+        // TEST-02: gap exactly equal to MAX_SLOT_GAP (= 8) is the
+        // boundary case — INCLUDED in cluster percentiles. The check
+        // is `gap <= MAX_SLOT_GAP`, so 8 must pass.
+        let mut p = ChainPane::new();
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        p.on_event(&Event {
+            ts: t0,
+            kind: EventKind::BankFrozen {
+                slot: 100,
+                hash: "h".into(),
+                signature_count: 1,
+            },
+        });
+        p.on_event(&Event {
+            ts: t0 + time::Duration::milliseconds(800),
+            kind: EventKind::BankFrozen {
+                slot: 108, // gap = 8 == MAX_SLOT_GAP
+                hash: "h".into(),
+                signature_count: 1,
+            },
+        });
+        let (p50, _) = p
+            .timing_table()
+            .cluster
+            .expect("gap = MAX_SLOT_GAP must be included");
+        // 800 ms across 8 slots = 100 ms per slot.
+        assert_eq!(p50, 100);
+    }
+
+    #[test]
+    fn walk_back_anomaly_counter_increments_on_invalid_parent_edge() {
+        // CORRECT-01: a parent edge with `parent.0 >= current.0` must
+        // increment the anomaly counter. Construct a corrupt graph
+        // directly so the walk-back hits the invalid edge.
+        let mut p = ChainPane::new();
+        // Block(100, "a") with a parent at the same slot (corrupt).
+        // Then Finalize(100, "a") triggers walk-back into the bad edge.
+        p.on_event(&block_ev(100, "a", 100, "self-loop"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        assert_eq!(p.walk_back_anomalies, 1);
+    }
+
+    #[test]
+    fn walk_back_anomaly_stays_zero_on_well_formed_chain() {
+        // Negative case for CORRECT-01: a well-formed chain must not
+        // increment the anomaly counter.
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&block_ev(101, "b", 100, "a"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 101,
+            hash: "b".into(),
+            fast: true,
+        }));
+        assert_eq!(p.walk_back_anomalies, 0);
+    }
+
+    #[test]
+    fn snapshot_line_surfaces_anomaly_only_when_nonzero() {
+        // CORRECT-01 display policy: silence on a healthy stream,
+        // surface a red ` anom` segment only when anomalies were seen.
+        let mut p = ChainPane::new();
+        let text = line_text(&p.snapshot_line());
+        assert!(
+            !text.contains(" anom"),
+            "snapshot must stay silent on healthy stream: {text:?}"
+        );
+        // Inject a corrupt parent edge and finalise to trip the
+        // anomaly path.
+        p.on_event(&block_ev(100, "a", 100, "self-loop"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        let text = line_text(&p.snapshot_line());
+        assert!(
+            text.contains(" anom"),
+            "snapshot must surface anomaly counter when nonzero: {text:?}"
+        );
+        assert!(
+            text.contains("1 anom"),
+            "anomaly count missing in snapshot: {text:?}"
+        );
     }
 }
