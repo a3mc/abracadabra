@@ -437,15 +437,20 @@ mod tests {
     }
 
     #[test]
-    fn header_line_drops_skip_and_fork_counters() {
-        // Counters (CSKIP / indet / forks) were moved off the
-        // header in step 3 because the bucket itself paints those
-        // classes with `▴ ▾ ⊕` glyphs — a numeric count duplicates
-        // signal the eye already absorbs from the matrix. The
-        // header now carries spinner + tip + cannon glyph only
-        // (plus the silent-default ` anom` segment).
+    fn header_line_is_just_spinner_tip_and_optional_anom() {
+        // After LIVE-53 the header is centred horizontally and
+        // carries spinner + tip slot only. The cannon glyph moved
+        // into the visualisation area (painted at world (0.5, 0.0)
+        // by `render::render_cannon`) so the header text has no
+        // glyph dependencies. CSKIP / indeterminate-skip / forks
+        // counters stay off the header because the bucket renders
+        // those classes visually.
         let p = ChainPane::new();
         let text = line_text(&header_line(&p));
+        assert!(
+            text.contains("tip"),
+            "header must carry the `tip` label: {text:?}"
+        );
         assert!(
             !text.contains("CSKIP"),
             "header must not surface CSKIP counter: {text:?}"
@@ -459,8 +464,8 @@ mod tests {
             "header must not surface forks counter: {text:?}"
         );
         assert!(
-            text.contains('▶'),
-            "header must show the cannon glyph: {text:?}"
+            !text.contains('▶') && !text.contains('▼'),
+            "cannon glyph belongs in viz area, not header: {text:?}"
         );
     }
 

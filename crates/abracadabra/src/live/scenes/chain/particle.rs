@@ -31,19 +31,26 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// World-space cannon position (normalised, top-left origin). Tuned
-/// so the spawn point sits roughly under the header text's `▶`
-/// glyph — the header cannon is decorative and the actual emitter
-/// is a few rows lower, near the top of the visualisation area.
-pub(super) const CANNON_X: f32 = 0.08;
-pub(super) const CANNON_Y: f32 = 0.02;
+/// World-space cannon position (normalised, top-left origin).
+/// Top-centre of the visualisation area — the cannon glyph `▼` is
+/// painted at world `(0.5, 0.0)` and particles spawn one row below
+/// so they appear to drop from beneath the cannon.
+pub(super) const CANNON_X: f32 = 0.50;
+pub(super) const CANNON_Y: f32 = 0.06;
 
-/// World-space landing-cluster centre. Particles fly here and the
-/// landed slot is appended to the bucket on TTL expiry — the
-/// per-cell visual position is computed by the matrix renderer from
-/// the slot's index in the page, not from this point.
+/// World-space landing-cluster centre. Bucket is centred vertically
+/// AND horizontally in viz, so the cluster centre sits at the
+/// middle of the viz rect. Per-particle horizontal jitter (see
+/// [`Self::fire`]) spreads trajectories around this point so a
+/// burst doesn't collapse into one column.
 const LANDING_X: f32 = 0.50;
-const LANDING_Y: f32 = 0.75;
+const LANDING_Y: f32 = 0.55;
+
+/// Maximum normalised horizontal offset added to a particle's
+/// landing target. Slot-deterministic so the same slot always takes
+/// the same path, but distinct slots fan out across the bucket
+/// width. ±0.18 keeps the fan well inside the bucket area.
+const LANDING_X_JITTER: f32 = 0.18;
 
 /// How long a particle spends in flight before landing. ~700 ms keeps
 /// the motion legible at 30 fps (~21 frames) without feeling sluggish
@@ -125,7 +132,17 @@ impl CannonSystem {
             self.particles.remove(0);
         }
         let ttl_secs = FLIGHT_DURATION.as_secs_f32();
-        let vx = (LANDING_X - CANNON_X) / ttl_secs;
+        // Slot-deterministic horizontal jitter so different slots
+        // fan out across the bucket width instead of stacking on
+        // the same column. A prime modulus gives reasonable spread
+        // across consecutive slots without needing a real RNG
+        // (which is unavailable from the Pane trait anyway).
+        #[allow(clippy::cast_precision_loss)]
+        let jitter_unit = (slot % 17) as f32 / 17.0 - 0.5;
+        let target_x = (jitter_unit * LANDING_X_JITTER)
+            .mul_add(2.0, LANDING_X)
+            .clamp(0.0, 1.0);
+        let vx = (target_x - CANNON_X) / ttl_secs;
         let vy = (LANDING_Y - CANNON_Y) / ttl_secs;
         self.particles.push(ChainParticle {
             slot,

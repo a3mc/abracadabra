@@ -22,7 +22,7 @@
 //! scales them at render time so the system is layout-agnostic —
 //! resizing the terminal does not break the trajectories.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -42,10 +42,9 @@ use super::state::ChainPane;
 /// is only consulted by the vertical-stack fallback.
 pub const PANE_HEIGHT: u16 = 12;
 
-/// Glyph painted at the end of the header — the cannon that "fires"
-/// particles. Decorative; the actual particle origin is in the
-/// visualisation area but visually anchored under this glyph.
-const CANNON_GLYPH: &str = "▶";
+/// Cannon glyph painted at the top-centre of the visualisation
+/// area. Points down — particles fall vertically into the bucket.
+const CANNON_GLYPH: char = '▼';
 
 /// Default bucket width in cells. 25 × 4 = 100 = [`PAGE_CAPACITY`].
 const DEFAULT_BUCKET_COLS: usize = 25;
@@ -93,12 +92,12 @@ pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
 /// Compose the header `Line`. Extracted from `render_header` for
 /// direct test coverage.
 ///
-/// Content: spinner + tip slot + cannon glyph. Optional ` ⚠ N anom`
-/// segment when parser walk-back anomalies have fired (silent by
-/// default — non-zero is the signal). CSKIP / indeterminate-skip /
-/// fork counts are NOT shown here; the bucket renders those classes
-/// directly with `▴ ▾ ⊕` glyphs, so a numeric count would duplicate
-/// signal the eye can already absorb.
+/// Content: spinner + tip slot. Optional ` ⚠ N anom` segment when
+/// parser walk-back anomalies have fired (silent by default).
+/// CSKIP / indeterminate-skip / fork counts are not shown — the
+/// bucket renders those classes visually. The cannon glyph is
+/// painted in the visualisation area (not the header) by
+/// [`render_cannon`] so particles can spawn directly beneath it.
 pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
     let spinner = spinner_frame(pane.event_count, pane.last_event_at);
     let tip = pane
@@ -106,7 +105,6 @@ pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
         .map_or_else(|| "—".to_owned(), |s| s.to_string());
 
     let mut spans = vec![
-        Span::raw(" "),
         Span::styled(
             spinner.to_owned(),
             Style::default()
@@ -120,13 +118,7 @@ pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" tip ", theme::label_style()),
-        Span::styled(
-            CANNON_GLYPH,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" tip", theme::label_style()),
     ];
     if pane.walk_back_anomalies > 0 {
         spans.push(sep());
@@ -140,7 +132,10 @@ pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
 }
 
 fn render_header(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Paragraph::new(header_line(pane)), area);
+    frame.render_widget(
+        Paragraph::new(header_line(pane)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 /// Compose the timing strip `Line`. Extracted from `render_timing`
@@ -161,7 +156,7 @@ pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
         ("consensus", table.consensus),
         ("lifecycle", table.lifecycle),
     ];
-    let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut first = true;
     for (label, pct) in stages {
         if !first {
@@ -183,33 +178,59 @@ pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
 }
 
 fn render_timing(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Paragraph::new(timing_line(pane)), area);
+    frame.render_widget(
+        Paragraph::new(timing_line(pane)).alignment(Alignment::Center),
+        area,
+    );
 }
 
-/// Lay out the visualisation area: in-flight particles drawn across
-/// the FULL `viz` rect, the bucket centred horizontally inside a
-/// sub-rect at the bottom. Particle world-space spans the full
-/// `viz`, so a particle launched at the cannon position lands
-/// visually inside the bucket area.
+/// Lay out the visualisation area: cannon glyph at the top-centre,
+/// in-flight particles falling toward the bucket, bucket centred
+/// both horizontally and vertically inside `viz`. Particle
+/// world-space spans the full `viz`, so a particle launched at
+/// `(CANNON_X, CANNON_Y)` ends up at world `(LANDING_X, LANDING_Y)`
+/// — the centre of the bucket area — at TTL expiry.
 fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     if viz.width == 0 || viz.height == 0 {
         return;
     }
-    let bucket_area = compute_bucket_area(viz);
+    render_cannon(frame, viz);
     render_particles(pane, frame, viz);
+    let bucket_area = compute_bucket_area(viz);
     render_bucket(pane, frame, bucket_area, Instant::now());
 }
 
+/// Paint the cannon `▼` at world `(CANNON_X, 0.0)` — top-centre of
+/// the viz area. Static glyph; future steps could add a muzzle-
+/// flash flicker on particle spawn.
+fn render_cannon(frame: &mut Frame<'_>, viz: Rect) {
+    let Some((cx, cy)) = world_to_screen(viz, super::particle::CANNON_X, 0.0) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
+    buf[(cx, cy)].set_char(CANNON_GLYPH).set_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 /// Position a centred bucket sub-rect inside `viz`. Aims for the
-/// default 25×4 grid; falls back to whatever fits inside `viz`
-/// when narrower.
+/// default 25×4 grid; falls back to whatever fits when the viz
+/// width is narrower. Centred both horizontally AND vertically so
+/// the bucket reads as a contained "inner widget" with breathing
+/// margin above (where particles fly) and below.
 fn compute_bucket_area(viz: Rect) -> Rect {
     let want_w = u16::try_from(DEFAULT_BUCKET_COLS).unwrap_or(u16::MAX) * BUCKET_STRIDE;
     let want_h = u16::try_from(DEFAULT_BUCKET_ROWS).unwrap_or(u16::MAX);
     let w = want_w.min(viz.width);
     let h = want_h.min(viz.height);
     let x_offset = viz.width.saturating_sub(w) / 2;
-    let y_offset = viz.height.saturating_sub(h);
+    // Vertically centre. When the available height is odd, the
+    // extra row goes ABOVE the bucket (giving particles more arena)
+    // so the bottom margin stays tight; matches the operator's
+    // mockup where the top margin breathes more than the bottom.
+    let y_offset = viz.height.saturating_sub(h) / 2 + viz.height.saturating_sub(h) % 2;
     Rect::new(viz.x + x_offset, viz.y + y_offset, w, h)
 }
 
@@ -388,9 +409,12 @@ mod tests {
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 50);
         assert_eq!(b.height, 4);
-        // Centred horizontally; bottom-aligned vertically.
+        // Centred horizontally.
         assert_eq!(b.x, 15);
-        assert_eq!(b.y, 4);
+        // Vertically centred — viz_height - bucket_height = 4 → 2
+        // rows of margin total, biased upward (top gets the extra
+        // row when odd) so bucket sits at row 2.
+        assert_eq!(b.y, 2);
     }
 
     #[test]
@@ -401,6 +425,16 @@ mod tests {
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 30);
         assert_eq!(b.height, 4);
+    }
+
+    #[test]
+    fn compute_bucket_area_biases_top_margin_when_height_is_odd() {
+        // viz_height (9) − bucket_height (4) = 5 → split 3 above / 2
+        // below so the particles have more arena to fall through.
+        let viz = Rect::new(0, 0, 80, 9);
+        let b = compute_bucket_area(viz);
+        assert_eq!(b.height, 4);
+        assert_eq!(b.y, 3, "top margin should take the extra row");
     }
 
     #[test]
