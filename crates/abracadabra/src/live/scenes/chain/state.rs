@@ -150,6 +150,27 @@ impl ChainPane {
         self.slots.back().map(|s| s.slot)
     }
 
+    /// Look up a slot's state in the retained deque. Returns `None`
+    /// when the slot has been pruned or was never observed. The
+    /// classifier ([`super::glyph::classify_slot`]) calls this once
+    /// per visible matrix cell per frame, so the implementation is
+    /// O(log N) via [`VecDeque::binary_search_by_key`] against the
+    /// sorted-by-slot invariant `upsert_slot` maintains.
+    pub(super) fn slot_state(&self, slot: u64) -> Option<&SlotState> {
+        let (front, back) = self.slots.as_slices();
+        // VecDeque does not expose binary_search directly across the
+        // wrap boundary, so search the two contiguous slices and
+        // fall through to the second if the first does not contain
+        // the slot. Both slices stay sorted by `upsert_slot`.
+        if let Ok(idx) = front.binary_search_by_key(&slot, |s| s.slot) {
+            return Some(&front[idx]);
+        }
+        if let Ok(idx) = back.binary_search_by_key(&slot, |s| s.slot) {
+            return Some(&back[idx]);
+        }
+        None
+    }
+
     fn upsert_slot(&mut self, slot: u64) -> &mut SlotState {
         // Sorted-by-slot invariant on `self.slots` is preserved by:
         // - tip-extension (`slot > last.slot`) appends at the back,

@@ -72,6 +72,7 @@
 //!   between state and render.
 
 mod format;
+mod glyph;
 mod particle;
 mod render;
 mod state;
@@ -108,10 +109,12 @@ impl Pane for ChainPane {
 
 #[cfg(test)]
 mod tests {
+    use super::glyph::classify_slot;
     use super::render::header_line;
     use super::state::{ChainPane, SkipClass};
     use crate::live::animation::Pane;
     use crate::parser::{Event, EventKind};
+    use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
 
     fn mk(kind: EventKind) -> Event {
@@ -627,5 +630,112 @@ mod tests {
             text.contains("1 anom"),
             "anomaly count missing in header: {text:?}"
         );
+    }
+
+    // ---- Cell classifier tests --------------------------------------
+
+    #[test]
+    fn classifier_returns_dim_dot_for_unknown_slot() {
+        // Slot never observed → not in the deque → classifier must
+        // return the "unknown" dim dot rather than panicking or
+        // returning a misleading state.
+        let p = ChainPane::new();
+        let cell = classify_slot(&p, 999);
+        assert_eq!(cell.ch, '·');
+        assert_eq!(cell.style.fg, Some(Color::DarkGray));
+        assert!(cell.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn classifier_returns_pending_dot_for_observed_unfinalized_slot() {
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::FirstShred { slot: 100 }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '·');
+        assert_eq!(cell.style.fg, Some(Color::DarkGray));
+        assert!(
+            !cell.style.add_modifier.contains(Modifier::DIM),
+            "pending (observed) must be brighter than unknown (unobserved): \
+             {:?}",
+            cell.style
+        );
+    }
+
+    #[test]
+    fn classifier_returns_bold_green_square_for_canonical_fast_finalized() {
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '■');
+        assert_eq!(cell.style.fg, Some(Color::Green));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_returns_half_circle_for_slow_finalized() {
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: false,
+        }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '◐');
+        assert_eq!(cell.style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn classifier_returns_bold_red_up_triangle_for_canonical_skip() {
+        // Canonical-skip: chain kept the slot, we voted skip — the
+        // bad signal that anchors the operator's eye. Up triangle
+        // mirrors the b8ec4ed event log vocabulary.
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '▴');
+        assert_eq!(cell.style.fg, Some(Color::Red));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_returns_plain_red_down_triangle_for_indeterminate_skip() {
+        // We voted skip but no canonical evidence on either fork —
+        // softer signal than canonical-skip, no BOLD.
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '▾');
+        assert_eq!(cell.style.fg, Some(Color::Red));
+        assert!(
+            !cell.style.add_modifier.contains(Modifier::BOLD),
+            "indeterminate skip must not be BOLD: {:?}",
+            cell.style
+        );
+    }
+
+    #[test]
+    fn classifier_returns_bold_yellow_circled_plus_for_fork() {
+        // Two distinct hashes on the same slot ⇒ fork. The fork
+        // glyph beats canonical-skip precedence so a forked slot
+        // that also has a skip vote still renders as ⊕.
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&block_ev(100, "b", 99, "root"));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '⊕');
+        assert_eq!(cell.style.fg, Some(Color::Yellow));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
     }
 }

@@ -33,6 +33,7 @@ use crate::live::animation::spinner_frame;
 use crate::tui::theme;
 
 use super::format::StagePercentiles;
+use super::glyph::{classify_slot, CellGlyph};
 use super::particle::{CANNON_X, CANNON_Y};
 use super::state::ChainPane;
 
@@ -44,14 +45,6 @@ pub const PANE_HEIGHT: u16 = 12;
 /// Glyph painted at the cannon position. Static — does not animate
 /// in the spike. Future: muzzle-flash flicker on spawn.
 const CANNON_GLYPH: &str = "▶";
-
-/// Glyph painted for an in-flight particle. Future: vary per
-/// trajectory class.
-const PARTICLE_GLYPH: char = '●';
-
-/// Glyph painted for a landed slot cell. Future: per-slot
-/// classifier (`■ ◐ ▴ ⊕ ○ ·`).
-const MATRIX_GLYPH: char = '■';
 
 /// Render the entire pane (border + composition) inside `area`.
 pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
@@ -94,13 +87,21 @@ fn render_timing(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
 
 /// Compose the timing strip `Line`. Extracted from `render_timing`
 /// for direct test coverage.
+///
+/// Format: each stage renders as `<name> <p50>/<p95>ms`. Full words
+/// match the Windows-tab labels (`cadence` / `assembly` /
+/// `consensus` / `lifecycle`) — opaque 2-3 letter abbreviations
+/// (`asm`, `cons`, `lc`) drop legibility for almost no width win at
+/// the half-pane widths the chain pane runs at. Trailing `ms` is
+/// shown once per value, not once per stage — both percentiles
+/// share the unit.
 pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
     let table = pane.timing_table();
     let stages: [(&str, StagePercentiles); 4] = [
-        ("cluster", table.cluster),
-        ("asm", table.assembly),
-        ("cons", table.consensus),
-        ("lc", table.lifecycle),
+        ("cadence", table.cluster),
+        ("assembly", table.assembly),
+        ("consensus", table.consensus),
+        ("lifecycle", table.lifecycle),
     ];
     let mut spans: Vec<Span<'static>> = vec![Span::raw("   ")];
     let mut first = true;
@@ -110,8 +111,8 @@ pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
         }
         spans.push(Span::styled(format!("{label} "), theme::label_style()));
         match pct {
-            Some((p50, _)) => {
-                spans.push(Span::styled(format!("{p50}"), theme::value_style()));
+            Some((p50, p95)) => {
+                spans.push(Span::styled(format!("{p50}/{p95}"), theme::value_style()));
                 spans.push(Span::styled("ms", theme::label_style()));
             }
             None => {
@@ -239,32 +240,50 @@ fn render_cannon(frame: &mut Frame<'_>, viz: Rect) {
     );
 }
 
-/// Paint every in-flight particle as a single glyph at its current
-/// world position. The spike paints every particle the same colour;
-/// step 2 will vary per `ChainParticle.kind`.
+/// Paint every in-flight particle as the classifier's chosen glyph
+/// at its current world position. The classifier looks at the
+/// particle's slot in the pane's current state on EVERY frame, so a
+/// particle launched as `·` (pending) can mutate mid-flight to `■`
+/// (canonical fast-finalised) the moment its `Finalized` event
+/// lands — the user sees the trajectory's colour and glyph change
+/// in real time.
 fn render_particles(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     let buf = frame.buffer_mut();
-    let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
     for p in &pane.cannon.particles {
-        if let Some((px, py)) = world_to_screen(viz, p.x, p.y) {
-            buf[(px, py)].set_char(PARTICLE_GLYPH).set_style(style);
-        }
+        let Some((px, py)) = world_to_screen(viz, p.x, p.y) else {
+            continue;
+        };
+        let CellGlyph { ch, style } = classify_slot(pane, p.slot);
+        buf[(px, py)].set_char(ch).set_style(style);
     }
 }
 
-/// Paint landed-slot cells into the matrix area. Each cell occupies
-/// a 2-cell stride (`glyph + space`) so the grid breathes — packed
-/// solid `■■■■` reads as a bar, with spaces it reads as discrete
-/// cells. Cells are laid out newest-LAST so the leading edge is at
-/// the bottom-right of the matrix; the eye anchors on the freshest
-/// slot.
+/// Paint landed-slot cells into the matrix area.
+///
+/// **Layout: bottom-up cup fill.** The oldest landed slot sits at
+/// the bottom-left; each subsequent slot fills left-to-right across
+/// the bottom row, then rows above. The newest slot is at the
+/// top-right (when the matrix is full) or in the top-most partial
+/// row. Mirrors the "filling cup" metaphor the operator asked for —
+/// new arrivals stack ON TOP of older ones.
+///
+/// **Stride.** 2-cell wide per slot: glyph + one space. Packed solid
+/// reads as a bar; spaced cells read as discrete slots.
+///
+/// **Age decay.** Cells dim in three tiers by their depth in the
+/// landed deque:
+///
+/// - newest 15%: full classifier style (often BOLD)
+/// - middle: classifier style without the BOLD modifier
+/// - oldest 20%: DIM modifier and BOLD stripped
+///
+/// The decay band makes the leading edge visually anchor while old
+/// history visibly fades — the user can tell at a glance which cells
+/// are fresh signal vs settled history.
 fn render_matrix(pane: &ChainPane, frame: &mut Frame<'_>, matrix_area: Rect) {
     if matrix_area.width == 0 || matrix_area.height == 0 {
         return;
     }
-    // 2-cell stride per slot: a `■` glyph + a single-space gap.
     let stride: u16 = 2;
     let cols = matrix_area.width / stride;
     if cols == 0 {
@@ -275,28 +294,44 @@ fn render_matrix(pane: &ChainPane, frame: &mut Frame<'_>, matrix_area: Rect) {
     if capacity == 0 {
         return;
     }
-    // Take only the most-recent `capacity` slots so older history
-    // beyond what fits in the grid is silently dropped from view —
-    // the matrix is bounded by what is on screen.
+
     let visible_count = pane.cannon.matrix.len().min(capacity);
     let start = pane.cannon.matrix.len() - visible_count;
+    // Decay band thresholds. Computed once per render so the per-cell
+    // loop only does an integer comparison.
+    let fresh_cutoff = visible_count.saturating_sub(visible_count * 15 / 100);
+    let stale_cutoff = visible_count * 20 / 100;
     let buf = frame.buffer_mut();
-    let style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    for (i, _slot) in pane.cannon.matrix.iter().skip(start).enumerate() {
-        // Lay out top-to-bottom, left-to-right; the latest slot
-        // (last entry of the iterator) ends up at the highest index,
-        // i.e. the bottom-right of the grid.
+    for (i, slot) in pane.cannon.matrix.iter().skip(start).enumerate() {
+        // Bottom-up: oldest at row=rows-1 (bottom), newest at row=0
+        // (top). Column fills left-to-right within each row.
         #[allow(clippy::cast_possible_truncation)]
         let col = (i % usize::from(cols)) as u16;
         #[allow(clippy::cast_possible_truncation)]
-        let row = (i / usize::from(cols)) as u16;
+        let row_from_bottom = (i / usize::from(cols)) as u16;
+        if row_from_bottom >= rows {
+            // Defence-in-depth: capacity guard above should prevent
+            // this, but if `visible_count` ever exceeds `capacity`
+            // we'd paint outside the area.
+            break;
+        }
+        let row = rows - 1 - row_from_bottom;
         let x = matrix_area.x + col * stride;
         let y = matrix_area.y + row;
-        if x < matrix_area.x + matrix_area.width && y < matrix_area.y + matrix_area.height {
-            buf[(x, y)].set_char(MATRIX_GLYPH).set_style(style);
+
+        let CellGlyph { ch, mut style } = classify_slot(pane, *slot);
+        if i >= fresh_cutoff {
+            // Newest band — keep classifier style as-is.
+        } else if i < stale_cutoff {
+            // Oldest band — dim and strip bold.
+            style = style.remove_modifier(Modifier::BOLD);
+            style = style.add_modifier(Modifier::DIM);
+        } else {
+            // Middle band — strip bold so only the fresh tier reads
+            // as the brightest. Keep the classifier colour intact.
+            style = style.remove_modifier(Modifier::BOLD);
         }
+        buf[(x, y)].set_char(ch).set_style(style);
     }
 }
 
