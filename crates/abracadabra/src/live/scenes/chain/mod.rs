@@ -366,10 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn produce_window_event_is_ignored_by_chain_pane() {
-        // Leader-window events belong to the block-production pane.
-        // The chain pane must NOT surface them — duplicating data
-        // across panes is the bug LIVE-37 fixed.
+    fn produce_window_event_marks_each_slot_as_our_leader() {
+        // LIVE-56: chain pane now consumes ProduceWindow so the
+        // bucket can surface own leader slots with ★. The previous
+        // "ignored" assertion was a deliberate scope split before
+        // step LIVE-56 added the leader-glyph branch to the
+        // classifier; bringing the event back does NOT re-introduce
+        // the duplication LIVE-37 fixed because the block-production
+        // pane carries its own leader-window state independently.
         let mut p = ChainPane::new();
         p.on_event(&mk(EventKind::ProduceWindow {
             start: 200,
@@ -377,8 +381,40 @@ mod tests {
             parent_slot: 199,
             parent_hash: "x".into(),
         }));
+        // Every slot in the window must exist and be flagged ours.
+        for slot in 200..=203 {
+            let s = p
+                .slots
+                .iter()
+                .find(|s| s.slot == slot)
+                .unwrap_or_else(|| panic!("slot {slot} should be in deque"));
+            assert!(
+                s.we_are_leader,
+                "slot {slot} from ProduceWindow must be flagged ours: {s:?}"
+            );
+        }
+        // ProduceWindow alone does not invent forks or skips.
         assert_eq!(p.fork_count(), 0);
         assert_eq!(p.canonical_skip_count(), 0);
+    }
+
+    #[test]
+    fn produce_window_with_oversized_span_is_rejected() {
+        // Malformed windows (end - start > MAX_LEADER_WINDOW_SPAN)
+        // are treated as parser regressions and dropped — better
+        // than upserting hundreds of garbage slots into the deque.
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::ProduceWindow {
+            start: 100,
+            end: 100 + 50, // way above the leader-window ceiling
+            parent_slot: 99,
+            parent_hash: "x".into(),
+        }));
+        assert!(
+            p.slots.is_empty(),
+            "oversized window must be dropped, not iterated: {:?}",
+            p.slots
+        );
     }
 
     #[test]
@@ -779,8 +815,9 @@ mod tests {
     #[test]
     fn classifier_returns_bold_yellow_circled_plus_for_fork() {
         // Two distinct hashes on the same slot ⇒ fork. The fork
-        // glyph beats canonical-skip precedence so a forked slot
-        // that also has a skip vote still renders as ⊕.
+        // glyph beats canonical-skip precedence AND own-leader
+        // precedence so a forked slot — even one of ours —
+        // still renders as ⊕.
         let mut p = ChainPane::new();
         p.on_event(&block_ev(100, "a", 99, "root"));
         p.on_event(&block_ev(100, "b", 99, "root"));
@@ -788,6 +825,94 @@ mod tests {
         assert_eq!(cell.ch, '⊕');
         assert_eq!(cell.style.fg, Some(Color::Yellow));
         assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // ---- Own-leader ★ branch tests ----------------------------------
+
+    fn produce_window_ev(start: u64, end: u64) -> Event {
+        mk(EventKind::ProduceWindow {
+            start,
+            end,
+            parent_slot: start.saturating_sub(1),
+            parent_hash: "root".into(),
+        })
+    }
+
+    #[test]
+    fn classifier_returns_magenta_star_for_our_canonical_fast_slot() {
+        // Successful own leader slot — canonical AND fast-finalized
+        // ⇒ ★ magenta BOLD. The most-positive signal in the bucket.
+        let mut p = ChainPane::new();
+        p.on_event(&produce_window_ev(100, 103));
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '★');
+        assert_eq!(cell.style.fg, Some(Color::Magenta));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_returns_yellow_star_for_our_slow_finalized_slot() {
+        // Own leader slot finalized slow (2-round) ⇒ ★ yellow BOLD.
+        let mut p = ChainPane::new();
+        p.on_event(&produce_window_ev(100, 103));
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: false,
+        }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '★');
+        assert_eq!(cell.style.fg, Some(Color::Yellow));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_returns_red_star_for_our_skipped_slot() {
+        // LSKIP — we voted skip on our own leader slot. Worst
+        // signal in the chain pane. ★ red BOLD.
+        let mut p = ChainPane::new();
+        p.on_event(&produce_window_ev(100, 103));
+        p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '★');
+        assert_eq!(cell.style.fg, Some(Color::Red));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_returns_cyan_star_while_our_slot_is_pending() {
+        // ProduceWindow arrived but no Block/Finalized/skip yet —
+        // outcome is genuinely pending. ★ cyan BOLD anchors the
+        // operator's eye on their own slots even before any
+        // resolving event lands.
+        let mut p = ChainPane::new();
+        p.on_event(&produce_window_ev(100, 103));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '★');
+        assert_eq!(cell.style.fg, Some(Color::Cyan));
+        assert!(cell.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn classifier_keeps_fork_precedence_over_our_leader_star() {
+        // A fork on our own slot is still painted ⊕ — the fork
+        // shape carries safety information the magenta ★ would
+        // hide. Both signals matter, but the fork shape is more
+        // important to surface (rare, dangerous).
+        let mut p = ChainPane::new();
+        p.on_event(&produce_window_ev(100, 103));
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&block_ev(100, "b", 99, "root"));
+        let cell = classify_slot(&p, 100);
+        assert_eq!(cell.ch, '⊕');
+        assert_eq!(cell.style.fg, Some(Color::Yellow));
     }
 
     // ---- Bucket glyph cache tests -----------------------------------

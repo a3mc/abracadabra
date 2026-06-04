@@ -8,6 +8,11 @@
 //!
 //! | Glyph | Colour | Meaning |
 //! |-------|--------|---------|
+//! | `★`   | magenta BOLD | OUR leader slot — canonical + fast-finalised (success) |
+//! | `★`   | yellow BOLD  | OUR leader slot — canonical + slow-finalised |
+//! | `★`   | green DIM    | OUR leader slot — canonical by walk-back only (banked) |
+//! | `★`   | red BOLD     | OUR leader slot — we voted skip (LSKIP) |
+//! | `★`   | cyan BOLD    | OUR leader slot — pending (no canonical / no skip yet) |
 //! | `■`   | green BOLD | canonical + fast-finalised |
 //! | `■`   | green DIM  | canonical + no fast/slow yet (notarised silent) |
 //! | `◐`   | yellow     | canonical + slow-finalised (Finalized.fast == false) |
@@ -21,14 +26,18 @@
 //! Precedence (top → bottom, first match wins):
 //!
 //! 1. `Unknown` — slot pruned out of the deque.
-//! 2. `Fork` — `len(hashes) >= 2`.
-//! 3. `CanonicalSkip` — skipped AND in `canonical_slots`.
-//! 4. `VoteSkip` — skipped, no canonical evidence.
-//! 5. `FastFinal` — canonical AND `fast_finalized == Some(true)`.
-//! 6. `SlowFinal` — canonical AND `fast_finalized == Some(false)`.
-//! 7. `Notarised` — canonical AND we observed VotingNotarize.
-//! 8. `CanonicalSilent` — canonical via walk-back, no direct event.
-//! 9. `Pending` — slot seen, no canonical evidence yet.
+//! 2. `Fork` — `len(hashes) >= 2` (kept above `we_are_leader` so a
+//!    fork on our own slot still surfaces with the ⊕ shape).
+//! 3. `OwnLeader{Skip,Fast,Slow,Banked,Pending}` — substate of our
+//!    own leader slot, painted as `★` in a colour that encodes the
+//!    outcome.
+//! 4. `CanonicalSkip` — skipped AND in `canonical_slots`.
+//! 5. `VoteSkip` — skipped, no canonical evidence.
+//! 6. `FastFinal` — canonical AND `fast_finalized == Some(true)`.
+//! 7. `SlowFinal` — canonical AND `fast_finalized == Some(false)`.
+//! 8. `Notarised` — canonical AND we observed VotingNotarize.
+//! 9. `CanonicalSilent` — canonical via walk-back, no direct event.
+//! 10. `Pending` — slot seen, no canonical evidence yet.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -69,11 +78,60 @@ pub(super) fn classify_known(pane: &ChainPane, slot: u64) -> Option<CellGlyph> {
 /// `canonical_slots` projection and so cannot call the
 /// [`classify_slot`] helper that takes the whole `ChainPane`.
 pub(super) fn classify_slot_state(s: &SlotState, is_canonical: bool) -> CellGlyph {
+    // Fork is the highest-priority shape — even on our own slot a
+    // ⊕ surfaces because two distinct hashes on the same slot is
+    // operationally significant regardless of whose slot it is.
     if s.hashes.len() >= 2 {
         return CellGlyph {
             ch: '⊕',
             style: Style::default()
                 .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        };
+    }
+    // OUR leader slot — paint as ★ with a colour that encodes the
+    // substate. Sits above the generic skip / canonical branches
+    // so own slots ALWAYS stand out in the bucket.
+    if s.we_are_leader {
+        if s.skipped {
+            // LSKIP — we voted skip on our own leader window. The
+            // worst-case signal in the chain pane.
+            return CellGlyph {
+                ch: '★',
+                style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            };
+        }
+        if is_canonical {
+            return match s.fast_finalized {
+                Some(true) => CellGlyph {
+                    ch: '★',
+                    style: Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                },
+                Some(false) => CellGlyph {
+                    ch: '★',
+                    style: Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                },
+                None => CellGlyph {
+                    // Canonical via walk-back, no direct Finalized
+                    // event yet. Dim green ★ reads as "banked but
+                    // outcome not yet sealed".
+                    ch: '★',
+                    style: Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::DIM),
+                },
+            };
+        }
+        // We are leader, no canonical evidence and no skip vote yet
+        // — the window just opened. Cyan BOLD ★ — outcome pending.
+        return CellGlyph {
+            ch: '★',
+            style: Style::default()
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         };
     }

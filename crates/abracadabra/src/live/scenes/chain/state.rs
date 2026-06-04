@@ -25,6 +25,13 @@ pub(super) const ROOT_TRAILING_SLOTS: u64 = 64;
 /// percentiles. Mirrors the same defence in [`crate::live::scenes::leader`].
 pub(super) const MAX_SLOT_GAP: u64 = 8;
 
+/// Maximum `end - start` we will accept on a `ProduceWindow` event
+/// before treating it as malformed (parser regression or upstream
+/// corruption). Solana leader windows are 4 slots; the leader pane
+/// uses the same upper bound — 8 slots is a generous ceiling that
+/// still catches anything outside Alpenglow's window range.
+const MAX_LEADER_WINDOW_SPAN: u64 = 8;
+
 #[derive(Debug, Clone)]
 pub(super) struct SlotState {
     pub(super) slot: u64,
@@ -46,6 +53,11 @@ pub(super) struct SlotState {
     pub(super) block_emitted_at: Option<OffsetDateTime>,
     pub(super) bank_frozen_at: Option<OffsetDateTime>,
     pub(super) finalized_at: Option<OffsetDateTime>,
+    /// `true` once a `ProduceWindow` event has covered this slot —
+    /// our validator is the leader for it. Drives the ★ branch in
+    /// [`super::glyph::classify_slot_state`] so own leader slots
+    /// stand out from regular network slots in the bucket.
+    pub(super) we_are_leader: bool,
 }
 
 impl SlotState {
@@ -60,6 +72,7 @@ impl SlotState {
             block_emitted_at: None,
             bank_frozen_at: None,
             finalized_at: None,
+            we_are_leader: false,
         }
     }
 
@@ -411,6 +424,31 @@ impl ChainPane {
             self.prune();
             return;
         }
+        // ProduceWindow is window-spanning — handle ahead of the
+        // single-slot match. Mark every slot in the window as ours
+        // and fire a cannon particle for each so the bucket surfaces
+        // own leader slots even before any Block / Finalized event
+        // arrives for them.
+        if let EventKind::ProduceWindow { start, end, .. } = &ev.kind {
+            let start = *start;
+            let end = *end;
+            if end < start || end.saturating_sub(start) > MAX_LEADER_WINDOW_SPAN {
+                return;
+            }
+            for slot in start..=end {
+                let s = self.upsert_slot(slot);
+                s.we_are_leader = true;
+            }
+            // Two-pass: upsert above borrows `self.slots` mutably
+            // through `upsert_slot`; the cannon spawn below borrows
+            // `self.cannon` mutably. Splitting the loops keeps both
+            // borrows simple and avoids a borrow-checker dance.
+            for slot in start..=end {
+                self.cannon.fire(slot);
+            }
+            self.prune();
+            return;
+        }
         // Slot the event addresses, captured for the cannon spawn at
         // the bottom of the function so each arm doesn't repeat the
         // `cannon.fire()` call. `None` for non-slot events (roots).
@@ -475,10 +513,9 @@ impl ChainPane {
                 self.last_root = Some(*slot);
                 None
             }
-            // ProduceWindow is consumed by the block-production pane;
-            // leader-window events do not belong in the chain log.
-            // Skip-vote variants are handled by the
-            // `local_skip_vote_slot` fast-path above.
+            // `ProduceWindow` is handled by the window-spanning fast
+            // path above. Skip-vote variants are handled by
+            // `local_skip_vote_slot`. Everything else is ignored.
             _ => return,
         };
         if let Some(slot) = particle_slot {
