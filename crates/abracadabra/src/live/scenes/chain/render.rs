@@ -1,27 +1,26 @@
-//! Ratatui rendering for the chain pane — cannon-particle spike.
+//! Ratatui rendering for the chain pane.
 //!
 //! Layout (top → bottom inside the border):
 //!
-//! 1. **Header** — one line: spinner · tip slot · `CSKIP` · `indet`
-//!    · `forks` · (optional) `anom`. Compact so the rest of the
-//!    pane is animation space.
-//! 2. **Arena** — empty area above the matrix where in-flight
-//!    cannon particles travel. Cannon glyph `▶` anchors the top-left.
-//! 3. **Matrix** — grid of cells, one per slot that has landed.
-//!    Each cell's glyph + colour is derived from the slot's current
-//!    [`super::state::SlotState`] so subsequent events (finalize
-//!    arriving after landing, fork detected after landing) visibly
-//!    update the cell colour.
+//! 1. **Header line 1** — `<spinner> <tip> tip ▶` (plus `⚠ N anom`
+//!    when parser anomalies have fired). The `▶` cannon glyph anchors
+//!    the operator's eye to the particle origin; counters previously
+//!    on this line (`CSKIP`, `indet`, `forks`) were dropped because
+//!    the matrix itself surfaces those classes visually.
+//! 2. **Header line 2** — timing strip `cadence p50/p95ms · …`.
+//! 3. **Arena** — empty area above the bucket where in-flight
+//!    cannon particles travel.
+//! 4. **Bucket** — fixed 100-cell grid laid out in a centred 25×4
+//!    block (or the largest grid that fits when the area is
+//!    narrower). Cells are placed at **static positions** and never
+//!    move until the page wipes; when the 100th slot lands, a left-
+//!    to-right **magic-wipe** sweep clears the bucket over ~500 ms
+//!    and the next page begins from cell 0.
 //!
 //! **World-space → screen-space.** Particles carry normalised
 //! `(x, y) ∈ [0, 1]²` coordinates. The visualisation area's `Rect`
 //! scales them at render time so the system is layout-agnostic —
 //! resizing the terminal does not break the trajectories.
-//!
-//! **No real classifier yet.** The matrix paints every landed slot
-//! the same colour (`■` cyan) and the cannon glyph is static. Step 2
-//! of the rebuild will swap in the per-slot classifier from the
-//! previous chain pane's event-log vocabulary (`■ ◐ ▴ ⊕ ○ ·`).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,12 +28,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use std::time::Instant;
+
 use crate::live::animation::spinner_frame;
 use crate::tui::theme;
 
 use super::format::StagePercentiles;
 use super::glyph::{classify_slot, CellGlyph};
-use super::particle::{CANNON_X, CANNON_Y};
 use super::state::ChainPane;
 
 /// Logical pane height advertised to the scene engine. Real layout
@@ -42,9 +42,23 @@ use super::state::ChainPane;
 /// is only consulted by the vertical-stack fallback.
 pub const PANE_HEIGHT: u16 = 12;
 
-/// Glyph painted at the cannon position. Static — does not animate
-/// in the spike. Future: muzzle-flash flicker on spawn.
+/// Glyph painted at the end of the header — the cannon that "fires"
+/// particles. Decorative; the actual particle origin is in the
+/// visualisation area but visually anchored under this glyph.
 const CANNON_GLYPH: &str = "▶";
+
+/// Default bucket width in cells. 25 × 4 = 100 = [`PAGE_CAPACITY`].
+const DEFAULT_BUCKET_COLS: usize = 25;
+/// Default bucket height in rows.
+const DEFAULT_BUCKET_ROWS: usize = 4;
+/// Per-cell horizontal stride: `glyph + space`. Packed solid the
+/// grid reads as a bar; spaced cells read as discrete slots.
+const BUCKET_STRIDE: u16 = 2;
+
+/// Magic-wipe per-column flash window as a fraction of the wipe
+/// duration. A cell flashes between `column_progress` and
+/// `column_progress + WIPE_FLASH_WINDOW`, then renders blank.
+const WIPE_FLASH_WINDOW: f32 = 0.12;
 
 /// Render the entire pane (border + composition) inside `area`.
 pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
@@ -64,10 +78,10 @@ pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // top blank
-            Constraint::Length(1), // header line 1: spinner + tip + counters
+            Constraint::Length(1), // header line 1: spinner + tip + cannon
             Constraint::Length(1), // header line 2: timing percentiles
             Constraint::Length(1), // blank
-            Constraint::Min(1),    // visualisation (arena + matrix)
+            Constraint::Min(1),    // visualisation (arena + bucket)
         ])
         .split(inner);
 
@@ -76,13 +90,57 @@ pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
     render_visualisation(pane, frame, chunks[4]);
 }
 
-/// Compact 1-line timing strip: `cluster N · asm N · cons N · lc N`
-/// (p50 ms each). p95 is intentionally dropped from the strip so it
-/// fits a single row — operators who want the full distribution have
-/// the Windows tab. Stages with no samples render as `—` placeholders
-/// so the strip width stays stable.
-fn render_timing(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Paragraph::new(timing_line(pane)), area);
+/// Compose the header `Line`. Extracted from `render_header` for
+/// direct test coverage.
+///
+/// Content: spinner + tip slot + cannon glyph. Optional ` ⚠ N anom`
+/// segment when parser walk-back anomalies have fired (silent by
+/// default — non-zero is the signal). CSKIP / indeterminate-skip /
+/// fork counts are NOT shown here; the bucket renders those classes
+/// directly with `▴ ▾ ⊕` glyphs, so a numeric count would duplicate
+/// signal the eye can already absorb.
+pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
+    let spinner = spinner_frame(pane.event_count, pane.last_event_at);
+    let tip = pane
+        .tip_slot()
+        .map_or_else(|| "—".to_owned(), |s| s.to_string());
+
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            spinner.to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            tip,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" tip ", theme::label_style()),
+        Span::styled(
+            CANNON_GLYPH,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if pane.walk_back_anomalies > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            pane.walk_back_anomalies.to_string(),
+            theme::bad_style().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" anom", theme::label_style()));
+    }
+    Line::from(spans)
+}
+
+fn render_header(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Paragraph::new(header_line(pane)), area);
 }
 
 /// Compose the timing strip `Line`. Extracted from `render_timing`
@@ -124,120 +182,35 @@ pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Compact 1-line header: spinner + tip slot + counters. Replaces
-/// the previous 4-row timing table. Timing percentiles will return
-/// in step 2 as a second header line when the pane is tall enough.
-fn render_header(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Paragraph::new(header_line(pane)), area);
+fn render_timing(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Paragraph::new(timing_line(pane)), area);
 }
 
-/// Compose the header `Line`. Extracted from `render_header` for
-/// direct test coverage of the label vocabulary (no frame
-/// roundtripping required).
-pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
-    let spinner = spinner_frame(pane.event_count, pane.last_event_at);
-    let tip = pane
-        .tip_slot()
-        .map_or_else(|| "—".to_owned(), |s| s.to_string());
-    let (canonical_skips, indeterminate) = pane.skip_tallies();
-    let forks = pane.fork_count();
-
-    let cskip_style = if canonical_skips > 0 {
-        theme::bad_style().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let fork_style = if forks > 0 {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            spinner.to_owned(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            tip,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" tip", theme::label_style()),
-        sep(),
-        Span::styled(canonical_skips.to_string(), cskip_style),
-        Span::styled(" CSKIP", theme::label_style()),
-        sep(),
-        Span::styled(
-            indeterminate.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" indet", theme::label_style()),
-        sep(),
-        Span::styled(forks.to_string(), fork_style),
-        Span::styled(" forks", theme::label_style()),
-    ];
-    if pane.walk_back_anomalies > 0 {
-        spans.push(sep());
-        spans.push(Span::styled(
-            pane.walk_back_anomalies.to_string(),
-            theme::bad_style().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(" anom", theme::label_style()));
-    }
-    Line::from(spans)
-}
-
-/// Paint the cannon + in-flight particles + landing matrix inside
-/// `viz`. Splits `viz` vertically into an arena (top) and a matrix
-/// area (bottom). Particle world-space spans the FULL `viz` so a
-/// particle launched at `(CANNON_X, CANNON_Y)` ends up landing in
-/// the matrix half of the rect at TTL expiry.
+/// Lay out the visualisation area: in-flight particles drawn across
+/// the FULL `viz` rect, the bucket centred horizontally inside a
+/// sub-rect at the bottom. Particle world-space spans the full
+/// `viz`, so a particle launched at the cannon position lands
+/// visually inside the bucket area.
 fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     if viz.width == 0 || viz.height == 0 {
         return;
     }
-    // Matrix gets the bottom 60% (rounded) so a typical 6-row viz
-    // area gives ~2 rows of arena and ~4 rows of matrix. Below 4
-    // rows the matrix takes priority — the cannon is decorative,
-    // the matrix carries the data.
-    let matrix_height = (u32::from(viz.height) * 6 / 10) as u16;
-    let matrix_height = matrix_height.max(1).min(viz.height);
-    let arena_height = viz.height.saturating_sub(matrix_height);
-    let arena = Rect::new(viz.x, viz.y, viz.width, arena_height);
-    let matrix = Rect::new(viz.x, viz.y + arena_height, viz.width, matrix_height);
-
-    render_cannon(frame, viz);
+    let bucket_area = compute_bucket_area(viz);
     render_particles(pane, frame, viz);
-    render_matrix(pane, frame, matrix);
-    // arena is currently passive — kept as a named binding so step 2
-    // can layer arena decorations (tracer trails, edge caret) without
-    // re-deriving the rect.
-    let _ = arena;
+    render_bucket(pane, frame, bucket_area, Instant::now());
 }
 
-/// Paint a static cannon glyph at `(CANNON_X, CANNON_Y)` in the
-/// `viz` rect. Future: animate on spawn for muzzle-flash.
-fn render_cannon(frame: &mut Frame<'_>, viz: Rect) {
-    let Some((cx, cy)) = world_to_screen(viz, CANNON_X, CANNON_Y) else {
-        return;
-    };
-    let buf = frame.buffer_mut();
-    buf.set_string(
-        cx,
-        cy,
-        CANNON_GLYPH,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+/// Position a centred bucket sub-rect inside `viz`. Aims for the
+/// default 25×4 grid; falls back to whatever fits inside `viz`
+/// when narrower.
+fn compute_bucket_area(viz: Rect) -> Rect {
+    let want_w = u16::try_from(DEFAULT_BUCKET_COLS).unwrap_or(u16::MAX) * BUCKET_STRIDE;
+    let want_h = u16::try_from(DEFAULT_BUCKET_ROWS).unwrap_or(u16::MAX);
+    let w = want_w.min(viz.width);
+    let h = want_h.min(viz.height);
+    let x_offset = viz.width.saturating_sub(w) / 2;
+    let y_offset = viz.height.saturating_sub(h);
+    Rect::new(viz.x + x_offset, viz.y + y_offset, w, h)
 }
 
 /// Paint every in-flight particle as the classifier's chosen glyph
@@ -258,80 +231,94 @@ fn render_particles(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     }
 }
 
-/// Paint landed-slot cells into the matrix area.
+/// Paint the bucket inside `bucket_area`.
 ///
-/// **Layout: bottom-up cup fill.** The oldest landed slot sits at
-/// the bottom-left; each subsequent slot fills left-to-right across
-/// the bottom row, then rows above. The newest slot is at the
-/// top-right (when the matrix is full) or in the top-most partial
-/// row. Mirrors the "filling cup" metaphor the operator asked for —
-/// new arrivals stack ON TOP of older ones.
+/// **Static positions.** A slot landing at bucket index `i` always
+/// renders at `(col = i % cols, row = i / cols)` until the page
+/// wipes. The grid never shifts — the eye locks onto specific cells
+/// and absorbs per-slot signal one cell at a time.
 ///
-/// **Stride.** 2-cell wide per slot: glyph + one space. Packed solid
-/// reads as a bar; spaced cells read as discrete slots.
+/// **Bottom-up fill within the grid.** Slot 0 of a page lands at
+/// the bottom-left, slot `cols-1` at the bottom-right, slot `cols`
+/// at the second-from-bottom row's left column, and so on. The
+/// 100th slot lands at the top-right. Mirrors the "cup filling"
+/// metaphor.
 ///
-/// **Age decay.** Cells dim in three tiers by their depth in the
-/// landed deque:
+/// **Magic wipe.** When the bucket reaches [`PAGE_CAPACITY`] the
+/// cannon system starts a wipe. Per-cell wipe state machine:
 ///
-/// - newest 15%: full classifier style (often BOLD)
-/// - middle: classifier style without the BOLD modifier
-/// - oldest 20%: DIM modifier and BOLD stripped
-///
-/// The decay band makes the leading edge visually anchor while old
-/// history visibly fades — the user can tell at a glance which cells
-/// are fresh signal vs settled history.
-fn render_matrix(pane: &ChainPane, frame: &mut Frame<'_>, matrix_area: Rect) {
-    if matrix_area.width == 0 || matrix_area.height == 0 {
+/// - column progress `cp = col / (cols - 1)` ∈ `[0, 1]`
+/// - elapsed wipe progress `p` ∈ `[0, 1]` from the cannon system
+/// - if `p < cp`: render normally (sweep front hasn't reached this column)
+/// - if `cp ≤ p < cp + WIPE_FLASH_WINDOW`: render WHITE BOLD inverse
+///   — the bright sweep front passing this column
+/// - if `p ≥ cp + WIPE_FLASH_WINDOW`: render blank — column has
+///   been swept
+fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now: Instant) {
+    if bucket_area.width == 0 || bucket_area.height == 0 {
         return;
     }
-    let stride: u16 = 2;
-    let cols = matrix_area.width / stride;
+    let cols = bucket_area.width / BUCKET_STRIDE;
     if cols == 0 {
         return;
     }
-    let rows = matrix_area.height;
+    let rows = bucket_area.height;
     let capacity = usize::from(cols) * usize::from(rows);
     if capacity == 0 {
         return;
     }
-
-    let visible_count = pane.cannon.matrix.len().min(capacity);
-    let start = pane.cannon.matrix.len() - visible_count;
-    // Decay band thresholds. Computed once per render so the per-cell
-    // loop only does an integer comparison.
-    let fresh_cutoff = visible_count.saturating_sub(visible_count * 15 / 100);
-    let stale_cutoff = visible_count * 20 / 100;
+    let wipe_progress = pane.cannon.wipe_progress(now);
     let buf = frame.buffer_mut();
-    for (i, slot) in pane.cannon.matrix.iter().skip(start).enumerate() {
-        // Bottom-up: oldest at row=rows-1 (bottom), newest at row=0
-        // (top). Column fills left-to-right within each row.
+    let cols_minus_one = u16::max(cols, 1) - 1;
+
+    for (i, slot) in pane.cannon.bucket.iter().enumerate() {
+        if i >= capacity {
+            break;
+        }
         #[allow(clippy::cast_possible_truncation)]
         let col = (i % usize::from(cols)) as u16;
         #[allow(clippy::cast_possible_truncation)]
         let row_from_bottom = (i / usize::from(cols)) as u16;
         if row_from_bottom >= rows {
-            // Defence-in-depth: capacity guard above should prevent
-            // this, but if `visible_count` ever exceeds `capacity`
-            // we'd paint outside the area.
             break;
         }
         let row = rows - 1 - row_from_bottom;
-        let x = matrix_area.x + col * stride;
-        let y = matrix_area.y + row;
+        let x = bucket_area.x + col * BUCKET_STRIDE;
+        let y = bucket_area.y + row;
 
-        let CellGlyph { ch, mut style } = classify_slot(pane, *slot);
-        if i >= fresh_cutoff {
-            // Newest band — keep classifier style as-is.
-        } else if i < stale_cutoff {
-            // Oldest band — dim and strip bold.
-            style = style.remove_modifier(Modifier::BOLD);
-            style = style.add_modifier(Modifier::DIM);
-        } else {
-            // Middle band — strip bold so only the fresh tier reads
-            // as the brightest. Keep the classifier colour intact.
-            style = style.remove_modifier(Modifier::BOLD);
-        }
-        buf[(x, y)].set_char(ch).set_style(style);
+        let CellGlyph { ch, style } = classify_slot(pane, *slot);
+
+        let (ch_out, style_out) = wipe_progress.map_or((ch, style), |p| {
+            wipe_cell(ch, style, col, cols_minus_one, p)
+        });
+        buf[(x, y)].set_char(ch_out).set_style(style_out);
+    }
+}
+
+/// Apply the magic-wipe sweep transform to a single cell. Returns
+/// the glyph + style to paint given the wipe progress `p` and the
+/// cell's column index. Pure function — easy to unit-test.
+fn wipe_cell(ch: char, style: Style, col: u16, cols_minus_one: u16, p: f32) -> (char, Style) {
+    // Column progress: 0.0 at leftmost column, 1.0 at rightmost.
+    let cp = if cols_minus_one == 0 {
+        0.0
+    } else {
+        f32::from(col) / f32::from(cols_minus_one)
+    };
+    if p < cp {
+        // Sweep hasn't reached this column yet.
+        (ch, style)
+    } else if p < cp + WIPE_FLASH_WINDOW {
+        // Sweep front passing — bright flash.
+        (
+            ch,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        // Column has been swept — blank cell.
+        (' ', Style::default())
     }
 }
 
@@ -345,8 +332,6 @@ fn world_to_screen(area: Rect, x: f32, y: f32) -> Option<(u16, u16)> {
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    // Clamp to `[0, 1]` so transient float drift past the bounds
-    // does not lead to a wraparound cast.
     let xc = x.clamp(0.0, 1.0);
     let yc = y.clamp(0.0, 1.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -379,9 +364,7 @@ mod tests {
     #[test]
     fn world_to_screen_clamps_out_of_bounds_values() {
         let area = Rect::new(0, 0, 20, 10);
-        // Past the right/bottom edge — clamped, not wrapped.
         assert_eq!(world_to_screen(area, 1.5, 1.5), Some((19, 9)));
-        // Negative — clamped to origin.
         assert_eq!(world_to_screen(area, -0.5, -0.5), Some((0, 0)));
     }
 
@@ -396,5 +379,52 @@ mod tests {
         let area = Rect::new(0, 0, 10, 10);
         assert!(world_to_screen(area, f32::NAN, 0.5).is_none());
         assert!(world_to_screen(area, 0.5, f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn compute_bucket_area_targets_default_size_when_room() {
+        // 25 cols × 2 stride = 50; 4 rows. Plenty of room in 80×8.
+        let viz = Rect::new(0, 0, 80, 8);
+        let b = compute_bucket_area(viz);
+        assert_eq!(b.width, 50);
+        assert_eq!(b.height, 4);
+        // Centred horizontally; bottom-aligned vertically.
+        assert_eq!(b.x, 15);
+        assert_eq!(b.y, 4);
+    }
+
+    #[test]
+    fn compute_bucket_area_falls_back_when_narrow() {
+        // Viz tighter than the default 50-cell width: bucket
+        // shrinks to fit.
+        let viz = Rect::new(0, 0, 30, 4);
+        let b = compute_bucket_area(viz);
+        assert_eq!(b.width, 30);
+        assert_eq!(b.height, 4);
+    }
+
+    #[test]
+    fn wipe_cell_passes_through_when_sweep_not_reached() {
+        // Sweep at 10%, column at 50% → cell renders normally.
+        let style = Style::default().fg(Color::Green);
+        let (ch, _) = wipe_cell('■', style, 12, 24, 0.1);
+        assert_eq!(ch, '■');
+    }
+
+    #[test]
+    fn wipe_cell_flashes_white_when_sweep_front_passes() {
+        // Column at 50%, sweep at 52% → within flash window.
+        let style = Style::default().fg(Color::Green);
+        let (_, out_style) = wipe_cell('■', style, 12, 24, 0.52);
+        assert_eq!(out_style.fg, Some(Color::White));
+        assert!(out_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wipe_cell_blanks_after_sweep_passes() {
+        // Column at 0%, sweep at 80% → far past, cell is blank.
+        let style = Style::default().fg(Color::Green);
+        let (ch, _) = wipe_cell('■', style, 0, 24, 0.8);
+        assert_eq!(ch, ' ');
     }
 }

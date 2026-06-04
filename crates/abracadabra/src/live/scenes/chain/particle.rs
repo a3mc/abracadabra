@@ -1,51 +1,69 @@
 //! Cannon-particle system for the chain pane visualization.
 //!
 //! Each new slot the pane observes spawns one particle at the cannon
-//! (top-left of the pane). Particles fly across the canvas to a
-//! landing zone, then the slot's identity is appended to the matrix
-//! ring buffer. The matrix renderer looks up each slot's current
-//! `SlotState` and chooses glyph + colour from the classifier in
-//! [`super::glyph`] (added in step 2 of the rebuild).
+//! position (anchored to the header's `▶` glyph). Particles fly to a
+//! landing point in the bucket area, then the slot identity is
+//! appended to the **paged bucket** ring.
+//!
+//! **Paged bucket.** The bucket holds exactly [`PAGE_CAPACITY`] = 100
+//! slots arranged in a fixed grid. Once a slot lands at a cell that
+//! cell **never moves** until the page completes. When the 100th slot
+//! lands the system starts a **magic wipe** animation (left-to-right
+//! sweep, ~500 ms) that flashes each column white then clears it.
+//! After the wipe completes the bucket is empty and the next page
+//! begins from cell 0.
+//!
+//! The fixed-position design was deliberate: the previous sliding
+//! window with eviction caused every visible cell to shift one slot
+//! per arrival — the eye reads it as the whole grid moving, even
+//! though only one cell really changed. Paged static positions let
+//! the eye lock onto the grid and absorb the per-slot signal one
+//! cell at a time.
 //!
 //! **Coordinates.** World-space is normalised `[0.0, 1.0]` on both
-//! axes so the system is layout-agnostic: the render path scales
-//! `(x, y)` to the inner area's cell rect. Cannon sits near the
-//! top-left (`(CANNON_X, CANNON_Y)`); particles travel toward
-//! `(MATRIX_CENTRE_X, MATRIX_CENTRE_Y)` — a single canonical landing
-//! point for the spike. Step 2 will vary per-particle target columns
-//! so the eye can follow each slot to its specific cell.
+//! axes so the system is layout-agnostic. The render path scales
+//! `(x, y)` to the inner area's cell rect.
 //!
-//! **Spawn dedupe.** A `HashSet<u64>` tracks slots that have already
-//! fired so duplicate events (e.g. `Block` then `Finalized` for the
-//! same slot, or `FirstShred` then `Block`) do not double-spawn.
+//! **Spawn dedupe.** A `HashSet<u64>` tracks slots fired during the
+//! current page so duplicate events for the same slot don't double-
+//! spawn. The set clears on each wipe.
 
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// World-space cannon position (normalised, top-left origin).
-pub(super) const CANNON_X: f32 = 0.04;
-pub(super) const CANNON_Y: f32 = 0.15;
+/// World-space cannon position (normalised, top-left origin). Tuned
+/// so the spawn point sits roughly under the header text's `▶`
+/// glyph — the header cannon is decorative and the actual emitter
+/// is a few rows lower, near the top of the visualisation area.
+pub(super) const CANNON_X: f32 = 0.08;
+pub(super) const CANNON_Y: f32 = 0.02;
 
-/// World-space landing point — middle of the matrix area for the
-/// spike. Step 2 will replace this with a per-particle target column
-/// so the trajectories fan out.
-const MATRIX_CENTRE_X: f32 = 0.55;
-const MATRIX_CENTRE_Y: f32 = 0.55;
+/// World-space landing-cluster centre. Particles fly here and the
+/// landed slot is appended to the bucket on TTL expiry — the
+/// per-cell visual position is computed by the matrix renderer from
+/// the slot's index in the page, not from this point.
+const LANDING_X: f32 = 0.50;
+const LANDING_Y: f32 = 0.75;
 
 /// How long a particle spends in flight before landing. ~700 ms keeps
-/// the motion legible at 30 fps (≈21 frames) without feeling sluggish
+/// the motion legible at 30 fps (~21 frames) without feeling sluggish
 /// against Solana's 400 ms slot cadence.
 const FLIGHT_DURATION: Duration = Duration::from_millis(700);
 
-/// Maximum number of slot identities the landing matrix retains.
-/// Sized for a typical 60-col × 5-row matrix; the render path clips
-/// to whatever area the layout grants and the rest is held in reserve
-/// so a window resize does not erase visible history.
-pub(super) const MATRIX_CAPACITY: usize = 320;
+/// Slots per bucket page. Fixed at 100 per the operator's spec —
+/// "100 cells fixed is enough". Renderer arranges them in a 25×4
+/// grid by default but may fall back to other aspect ratios when
+/// the available area can't host 25 columns.
+pub(super) const PAGE_CAPACITY: usize = 100;
 
-/// Soft cap on in-flight particles. If a burst exceeds this we drop
-/// the oldest — particles in flight are visual only, so losing one
-/// is preferable to unbounded memory growth.
+/// Magic-wipe sweep duration. Long enough for the column-by-column
+/// flash to read as a wave; short enough that the next page can
+/// start before the next slot event arrives.
+const WIPE_DURATION: Duration = Duration::from_millis(500);
+
+/// Soft cap on in-flight particles. Excess drops the oldest in
+/// flight — particles are visual only, losing one is preferable to
+/// unbounded memory growth.
 const MAX_IN_FLIGHT: usize = 128;
 
 /// One in-flight slot marker.
@@ -65,10 +83,20 @@ pub(super) struct ChainParticle {
 #[derive(Debug)]
 pub(super) struct CannonSystem {
     pub(super) particles: Vec<ChainParticle>,
-    /// Slot identities that have already landed in the matrix, oldest
-    /// first. Render looks each slot up in [`super::state::ChainPane`]
-    /// to choose its glyph and style.
-    pub(super) matrix: VecDeque<u64>,
+    /// Landed slots for the **current page**, oldest first. Capped
+    /// at [`PAGE_CAPACITY`]; reaching the cap triggers a wipe.
+    pub(super) bucket: VecDeque<u64>,
+    /// Slots that landed while a wipe was in progress. Applied to
+    /// the next page once the wipe completes — keeps the new-page
+    /// alignment honest even if particle TTL races the wipe.
+    pending_landed: Vec<u64>,
+    /// `Some(start_instant)` while the magic-wipe animation is in
+    /// progress. `None` when the bucket is in normal fill mode.
+    pub(super) wipe_started_at: Option<Instant>,
+    /// Slots fired in the current page — dedupe within a page only.
+    /// Cleared on every wipe so the same slot can re-fire if it
+    /// reappears in a later page (very rare; the upstream prune
+    /// usually drops re-occurring slots before that).
     fired_slots: HashSet<u64>,
     last_tick: Instant,
 }
@@ -77,26 +105,28 @@ impl CannonSystem {
     pub(super) fn new() -> Self {
         Self {
             particles: Vec::with_capacity(32),
-            matrix: VecDeque::with_capacity(MATRIX_CAPACITY),
-            fired_slots: HashSet::with_capacity(MATRIX_CAPACITY),
+            bucket: VecDeque::with_capacity(PAGE_CAPACITY),
+            pending_landed: Vec::with_capacity(8),
+            wipe_started_at: None,
+            fired_slots: HashSet::with_capacity(PAGE_CAPACITY * 2),
             last_tick: Instant::now(),
         }
     }
 
-    /// Spawn one particle for `slot` if it has not been fired yet.
-    /// Returns `true` if a new particle was launched.
+    /// Spawn one particle for `slot` if it has not been fired in the
+    /// current page yet. Returns `true` if a new particle was launched.
     pub(super) fn fire(&mut self, slot: u64) -> bool {
         if !self.fired_slots.insert(slot) {
             return false;
         }
         if self.particles.len() >= MAX_IN_FLIGHT {
             // Drop the oldest in-flight particle — its slot still
-            // gets a matrix cell on the next tick that lands.
+            // gets a bucket cell on the next tick that lands.
             self.particles.remove(0);
         }
         let ttl_secs = FLIGHT_DURATION.as_secs_f32();
-        let vx = (MATRIX_CENTRE_X - CANNON_X) / ttl_secs;
-        let vy = (MATRIX_CENTRE_Y - CANNON_Y) / ttl_secs;
+        let vx = (LANDING_X - CANNON_X) / ttl_secs;
+        let vy = (LANDING_Y - CANNON_Y) / ttl_secs;
         self.particles.push(ChainParticle {
             slot,
             x: CANNON_X,
@@ -109,19 +139,40 @@ impl CannonSystem {
         true
     }
 
-    /// Advance every particle by `(now - last_tick)`. Particles whose
-    /// age has reached `ttl` are appended to the landing matrix and
-    /// dropped from the in-flight set.
+    /// Advance every particle by `(now - last_tick)`, drive the
+    /// page lifecycle (fill → wipe → reset), and append expired
+    /// particles to the bucket (or queue them if a wipe is active).
     pub(super) fn tick(&mut self, now: Instant) {
+        // 1. Complete any in-progress wipe whose duration has
+        //    elapsed. After the clear, drain any slots that landed
+        //    during the wipe into the new page.
+        if let Some(start) = self.wipe_started_at {
+            if now.saturating_duration_since(start) >= WIPE_DURATION {
+                self.bucket.clear();
+                self.fired_slots.clear();
+                self.wipe_started_at = None;
+                // Move slots that arrived during the wipe into the
+                // fresh page. `pending_landed` is drained — re-firing
+                // would be wrong because the particles already flew.
+                for slot in self.pending_landed.drain(..) {
+                    self.fired_slots.insert(slot);
+                    self.bucket.push_back(slot);
+                }
+            }
+        }
+
+        // 2. Advance particle positions.
         let dt = now.saturating_duration_since(self.last_tick).as_secs_f32();
         self.last_tick = now;
         for p in &mut self.particles {
             p.x = p.vx.mul_add(dt, p.x);
             p.y = p.vy.mul_add(dt, p.y);
         }
-        // Two-step partition: capture landed slots in order, then
-        // retain only the still-in-flight ones. Preserves insertion
-        // order in the matrix without an allocator-thrash sort.
+
+        // 3. Land expired particles. During an active wipe, queue
+        //    them in `pending_landed` so they enter the FRESH page
+        //    after the wipe completes (rather than crowding the
+        //    page that just finished).
         let mut landed: Vec<u64> = Vec::new();
         self.particles.retain(|p| {
             if now.saturating_duration_since(p.born) >= p.ttl {
@@ -132,18 +183,27 @@ impl CannonSystem {
             }
         });
         for slot in landed {
-            if self.matrix.len() >= MATRIX_CAPACITY {
-                let evicted = self.matrix.pop_front();
-                // Allow the evicted slot to be re-fired if the chain
-                // re-encounters it (unlikely with the upstream prune,
-                // but the semantic is "matrix and fired-set evict
-                // together").
-                if let Some(s) = evicted {
-                    self.fired_slots.remove(&s);
-                }
+            if self.wipe_started_at.is_some() {
+                self.pending_landed.push(slot);
+            } else {
+                self.bucket.push_back(slot);
             }
-            self.matrix.push_back(slot);
         }
+
+        // 4. Start a wipe if the bucket just filled.
+        if self.bucket.len() >= PAGE_CAPACITY && self.wipe_started_at.is_none() {
+            self.wipe_started_at = Some(now);
+        }
+    }
+
+    /// Wipe progress in `[0.0, 1.0]` when active. `None` when no
+    /// wipe is in progress. Used by the matrix renderer to drive the
+    /// left-to-right sweep flash.
+    pub(super) fn wipe_progress(&self, now: Instant) -> Option<f32> {
+        let start = self.wipe_started_at?;
+        let elapsed = now.saturating_duration_since(start).as_secs_f32();
+        let total = WIPE_DURATION.as_secs_f32();
+        Some((elapsed / total).clamp(0.0, 1.0))
     }
 }
 
@@ -184,25 +244,79 @@ mod tests {
     }
 
     #[test]
-    fn ttl_expiry_moves_slot_to_matrix() {
+    fn ttl_expiry_moves_slot_into_bucket() {
         let mut sys = CannonSystem::new();
         sys.fire(100);
-        // Force the particle past its TTL by advancing `now`.
         let past_ttl = Instant::now() + FLIGHT_DURATION + Duration::from_millis(10);
         sys.tick(past_ttl);
         assert!(sys.particles.is_empty(), "expired particle must despawn");
-        assert_eq!(sys.matrix.back().copied(), Some(100));
+        assert_eq!(sys.bucket.back().copied(), Some(100));
+        assert!(
+            sys.wipe_started_at.is_none(),
+            "single landing must not trigger a wipe"
+        );
     }
 
     #[test]
-    fn matrix_capacity_evicts_oldest() {
+    fn filling_page_capacity_triggers_wipe() {
         let mut sys = CannonSystem::new();
-        for slot in 0..MATRIX_CAPACITY as u64 + 5 {
+        let past_ttl = Instant::now() + FLIGHT_DURATION + Duration::from_millis(10);
+        for slot in 0..PAGE_CAPACITY as u64 {
             sys.fire(slot);
-            sys.tick(Instant::now() + FLIGHT_DURATION + Duration::from_millis(1));
         }
-        assert_eq!(sys.matrix.len(), MATRIX_CAPACITY);
-        assert_eq!(sys.matrix.front().copied(), Some(5));
-        assert_eq!(sys.matrix.back().copied(), Some(MATRIX_CAPACITY as u64 + 4));
+        sys.tick(past_ttl);
+        assert_eq!(sys.bucket.len(), PAGE_CAPACITY);
+        assert!(
+            sys.wipe_started_at.is_some(),
+            "100th landing must start a wipe"
+        );
+    }
+
+    #[test]
+    fn wipe_completion_clears_bucket_and_applies_pending() {
+        let mut sys = CannonSystem::new();
+        // Land 100 slots → wipe triggers.
+        let landing = Instant::now() + FLIGHT_DURATION + Duration::from_millis(10);
+        for slot in 0..PAGE_CAPACITY as u64 {
+            sys.fire(slot);
+        }
+        sys.tick(landing);
+        assert!(sys.wipe_started_at.is_some());
+
+        // Fire one more slot and land it during the wipe.
+        sys.fire(999);
+        let mid_wipe = landing + Duration::from_millis(50);
+        sys.tick(mid_wipe);
+        // Particle from slot 999 is still in flight; only the 100
+        // pre-existing landed slots have been touched.
+        let after_landing_999 = landing + FLIGHT_DURATION + Duration::from_millis(60);
+        sys.tick(after_landing_999);
+        // Wipe should have completed and slot 999 entered the fresh
+        // page (the wipe duration is 500 ms < landing-to-landing
+        // time so by the time slot 999 lands the wipe is done).
+        assert!(sys.wipe_started_at.is_none(), "wipe should have completed");
+        assert_eq!(
+            sys.bucket.back().copied(),
+            Some(999),
+            "slot landing post-wipe enters fresh page"
+        );
+    }
+
+    #[test]
+    fn wipe_progress_advances_linearly() {
+        let mut sys = CannonSystem::new();
+        let landing = Instant::now() + FLIGHT_DURATION + Duration::from_millis(10);
+        for slot in 0..PAGE_CAPACITY as u64 {
+            sys.fire(slot);
+        }
+        sys.tick(landing);
+        let start = sys.wipe_started_at.expect("wipe should be active");
+        // Halfway through.
+        let half = start + WIPE_DURATION / 2;
+        let p = sys.wipe_progress(half).expect("progress while active");
+        assert!(
+            (p - 0.5).abs() < 0.05,
+            "halfway progress should be ~0.5: {p}"
+        );
     }
 }

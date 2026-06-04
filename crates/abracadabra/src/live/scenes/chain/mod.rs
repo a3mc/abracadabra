@@ -437,16 +437,30 @@ mod tests {
     }
 
     #[test]
-    fn header_line_uses_cskip_label_not_canon() {
-        // UX-04: chain pane previously labelled the canonical-skip
-        // count as ` canon`. Unified across the TUI to `CSKIP` to
-        // match the Slots tab and status bar vocabulary.
+    fn header_line_drops_skip_and_fork_counters() {
+        // Counters (CSKIP / indet / forks) were moved off the
+        // header in step 3 because the bucket itself paints those
+        // classes with `▴ ▾ ⊕` glyphs — a numeric count duplicates
+        // signal the eye already absorbs from the matrix. The
+        // header now carries spinner + tip + cannon glyph only
+        // (plus the silent-default ` anom` segment).
         let p = ChainPane::new();
         let text = line_text(&header_line(&p));
-        assert!(text.contains(" CSKIP"), "header missing CSKIP: {text:?}");
         assert!(
-            !text.contains(" canon"),
-            "header still uses ` canon` label: {text:?}"
+            !text.contains("CSKIP"),
+            "header must not surface CSKIP counter: {text:?}"
+        );
+        assert!(
+            !text.contains("indet"),
+            "header must not surface indet counter: {text:?}"
+        );
+        assert!(
+            !text.contains("forks"),
+            "header must not surface forks counter: {text:?}"
+        );
+        assert!(
+            text.contains('▶'),
+            "header must show the cannon glyph: {text:?}"
         );
     }
 

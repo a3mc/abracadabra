@@ -63,6 +63,7 @@ impl SlotState {
         }
     }
 
+    #[cfg(test)]
     pub(super) const fn is_forked(&self) -> bool {
         self.hashes.len() >= 2
     }
@@ -82,6 +83,13 @@ impl SlotState {
 /// (direct `Finalized` or reached via walk-back through observed
 /// parent edges). Everything else is `Indeterminate` — we have no
 /// positive proof the canonical chain bypassed the slot.
+///
+/// **Test-only API** since LIVE-52 — the header dropped the CSKIP
+/// counter (visible from the bucket glyphs instead) so prod code
+/// no longer materialises the classification. Kept compiled under
+/// `#[cfg(test)]` because the walk-back invariant tests pin behaviour
+/// here, not in the renderer.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SkipClass {
     /// Slot has a canonical block (direct `Finalized` or via parent
@@ -250,6 +258,9 @@ impl ChainPane {
     ///
     /// Uses the [`Self::canonical_slots`] projection so the lookup is
     /// O(1) per call rather than O(|canonical|).
+    ///
+    /// **Test-only API** since LIVE-52 — see [`SkipClass`] note.
+    #[cfg(test)]
     pub(super) fn classify_skip(&self, slot: u64) -> SkipClass {
         if self.canonical_slots.contains(&slot) {
             SkipClass::OnCanonical
@@ -297,6 +308,8 @@ impl ChainPane {
         self.canonical_slots.remove(&s.slot);
     }
 
+    /// **Test-only API** since LIVE-52.
+    #[cfg(test)]
     pub(super) fn fork_count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_forked()).count()
     }
@@ -307,8 +320,12 @@ impl ChainPane {
     }
 
     /// Single-pass tally `(canonical_skips, indeterminate_skips)` over
-    /// the retained slot deque. The snapshot row needs both counters;
-    /// folding them into one walk halves the per-frame cost.
+    /// the retained slot deque.
+    ///
+    /// **Test-only API** since LIVE-52 — the header dropped the
+    /// CSKIP/indet counters in favour of the bucket glyphs that
+    /// surface those classes visually.
+    #[cfg(test)]
     pub(super) fn skip_tallies(&self) -> (usize, usize) {
         let mut canon = 0usize;
         let mut indet = 0usize;
