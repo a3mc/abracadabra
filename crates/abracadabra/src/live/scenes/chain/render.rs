@@ -213,7 +213,21 @@ fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     render_particles(pane, frame, viz);
     let bucket_area = compute_bucket_area(viz);
     render_bucket(pane, frame, bucket_area, Instant::now());
+    let stream_area = compute_tx_stream_area(viz, bucket_area);
+    render_tx_stream(pane, frame, stream_area);
 }
+
+/// Width budget for the left-side tx stream — `slot bar count`
+/// fits in this many cells. Below the configured minimum the
+/// stream is skipped entirely (returns zero-area rect).
+const TX_STREAM_MAX_WIDTH: u16 = 14;
+const TX_STREAM_MIN_WIDTH: u16 = 10;
+
+/// 9-level horizontal-bar glyphs for the tx-stream column. Cell 0
+/// is blank (renders only when the slot's count is missing or
+/// genuinely zero); cells 1..8 are filled at increasing block
+/// heights so the eye reads them as a tiny histogram.
+const STREAM_BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Position a bucket sub-rect inside `viz`. Aims for the default
 /// 25×8 grid; falls back to whatever fits when the viz width is
@@ -229,6 +243,24 @@ fn compute_bucket_area(viz: Rect) -> Rect {
     let x_offset = viz.width.saturating_sub(w) / 2;
     let y_offset = viz.height.saturating_sub(h);
     Rect::new(viz.x + x_offset, viz.y + y_offset, w, h)
+}
+
+/// Position the left-side tx-stream rect: the strip between the
+/// left edge of `viz` and the left edge of `bucket`, with one
+/// column of breathing space before the bucket. Returns a zero-area
+/// rect when the available width is below [`TX_STREAM_MIN_WIDTH`]
+/// (chain pane too narrow — drop the stream rather than crowd the
+/// bucket).
+fn compute_tx_stream_area(viz: Rect, bucket: Rect) -> Rect {
+    if bucket.x <= viz.x {
+        return Rect::new(viz.x, viz.y, 0, 0);
+    }
+    let raw_w = bucket.x.saturating_sub(viz.x).saturating_sub(1);
+    let w = raw_w.min(TX_STREAM_MAX_WIDTH);
+    if w < TX_STREAM_MIN_WIDTH {
+        return Rect::new(viz.x, viz.y, 0, 0);
+    }
+    Rect::new(viz.x, viz.y, w, viz.height)
 }
 
 /// Paint every in-flight particle as the classifier's chosen glyph
@@ -314,6 +346,131 @@ fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now
             wipe_cell(ch, style, col, cols_minus_one, p)
         });
         buf[(x, y)].set_char(ch_out).set_style(style_out);
+    }
+}
+
+/// Paint the left-side tx stream inside `area`. Each row shows one
+/// recent slot whose `BankFrozen` carried a `signature_count`,
+/// newest at top:
+///
+/// ```text
+///  535928 ▆ 67k
+///  535927 ▂  8k
+///  535926 ▁  2k
+/// ```
+///
+/// Three styled fields per row:
+///
+/// - **slot** — dim gray, fixed 6-cell right-aligned column.
+/// - **bar** — cyan single-cell glyph from [`STREAM_BARS`]; height
+///   scales against the max count in the visible window so a
+///   pressure spike pops without flattening the rest.
+/// - **count** — bold white compact integer (`67k`-style). Aligned
+///   right inside whatever cells remain after slot + bar + spacing.
+///
+/// Slots without a captured `signature_count` are skipped so a
+/// pending slot doesn't leave a zero-height gap above its block-
+/// frozen successors.
+fn render_tx_stream(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+    if area.width < TX_STREAM_MIN_WIDTH || area.height == 0 {
+        return;
+    }
+    let rows = usize::from(area.height);
+    // Walk the deque newest-first, collecting (slot, sigs) for the
+    // first `rows` slots that have a captured count.
+    let recent: Vec<(u64, u64)> = pane
+        .slots
+        .iter()
+        .rev()
+        .filter_map(|s| s.signature_count.map(|c| (s.slot, c)))
+        .take(rows)
+        .collect();
+    if recent.is_empty() {
+        return;
+    }
+    // Bar scale: max sig count in the visible window, clamped to ≥1
+    // to avoid div-by-zero when every visible slot carries zero.
+    let max_count = recent.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
+    let buf = frame.buffer_mut();
+    let dim_gray = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let bar_style = Style::default().fg(Color::Cyan);
+    let count_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    for (row_idx, (slot, count)) in recent.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let y = area.y + row_idx as u16;
+        let slot_field = format!("{slot:>6}");
+        // Bar level: 0..8 from the relative magnitude. `count == 0`
+        // explicitly maps to the blank glyph so the eye distinguishes
+        // "real-zero" from missing.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let bar_idx = if *count == 0 {
+            0
+        } else {
+            (((*count as f64 / max_count as f64) * 8.0).round() as usize).clamp(1, 8)
+        };
+        let bar_glyph = STREAM_BARS[bar_idx];
+        let count_text = compact_count(*count);
+        // Cell layout: " 535928 ▆  67k" — 1 pad + 6 slot + 1 sp + 1
+        // bar + 1 sp + count (right-aligned in remaining cells).
+        let mut x = area.x;
+        // Leading space — keeps stream off the very left edge so it
+        // doesn't look glued to the pane border.
+        if area.width >= 1 {
+            buf[(x, y)].set_char(' ');
+            x = x.saturating_add(1);
+        }
+        // Slot number (right-aligned in 6 cells).
+        for ch in slot_field.chars().take(6) {
+            buf[(x, y)].set_char(ch).set_style(dim_gray);
+            x = x.saturating_add(1);
+        }
+        // Spacer.
+        buf[(x, y)].set_char(' ');
+        x = x.saturating_add(1);
+        // Bar.
+        buf[(x, y)].set_char(bar_glyph).set_style(bar_style);
+        x = x.saturating_add(1);
+        // Spacer + count right-aligned in remaining cells.
+        let end = area.x + area.width;
+        if x < end {
+            buf[(x, y)].set_char(' ');
+            x = x.saturating_add(1);
+        }
+        // Right-align: pad the count into the remaining width.
+        #[allow(clippy::cast_possible_truncation)]
+        let remaining = end.saturating_sub(x) as usize;
+        if remaining == 0 {
+            continue;
+        }
+        let count_chars: Vec<char> = count_text.chars().collect();
+        let pad = remaining.saturating_sub(count_chars.len());
+        for _ in 0..pad {
+            buf[(x, y)].set_char(' ');
+            x = x.saturating_add(1);
+        }
+        for ch in count_chars.into_iter().take(remaining) {
+            buf[(x, y)].set_char(ch).set_style(count_style);
+            x = x.saturating_add(1);
+        }
+    }
+}
+
+/// Compact `N` → `Nk` once it crosses 1 000, mirrors the leader
+/// pane's `format_count_compact` style. Inline here to avoid a
+/// cross-module dependency on `leader::format`.
+fn compact_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{}k", n / 1_000)
     }
 }
 
@@ -416,6 +573,33 @@ mod tests {
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 30);
         assert_eq!(b.height, 5);
+    }
+
+    #[test]
+    fn compute_tx_stream_area_fills_left_margin_with_breathing_gap() {
+        // Bucket centred in an 80-wide viz: 50 cols centred ⇒ left
+        // edge at x=15. Stream should take cols 0..(15-1=14), capped
+        // at TX_STREAM_MAX_WIDTH = 14. The 1-cell gap between
+        // stream and bucket keeps them from touching.
+        let viz = Rect::new(0, 0, 80, 9);
+        let bucket = compute_bucket_area(viz);
+        assert_eq!(bucket.x, 15);
+        let stream = compute_tx_stream_area(viz, bucket);
+        assert_eq!(stream.x, 0);
+        assert_eq!(stream.width, 14);
+        assert_eq!(stream.height, viz.height);
+    }
+
+    #[test]
+    fn compute_tx_stream_area_returns_zero_when_margin_too_narrow() {
+        // Narrow viz: bucket would take the whole width, leaving no
+        // left margin. Stream must drop out (zero-area) rather than
+        // squeeze into 2-3 cells where the slot column alone can't
+        // fit.
+        let viz = Rect::new(0, 0, 30, 9);
+        let bucket = compute_bucket_area(viz);
+        let stream = compute_tx_stream_area(viz, bucket);
+        assert_eq!(stream.width, 0, "no room ⇒ no stream: {stream:?}");
     }
 
     #[test]

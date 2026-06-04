@@ -58,6 +58,12 @@ pub(super) struct SlotState {
     /// [`super::glyph::classify_slot_state`] so own leader slots
     /// stand out from regular network slots in the bucket.
     pub(super) we_are_leader: bool,
+    /// `signature_count` field from the `bank frozen N hash …` log
+    /// line (user + vote txs combined). `None` until `BankFrozen`
+    /// fires for the slot. Drives the left-side tx stream rendered
+    /// alongside the bucket — gives the operator a rolling view of
+    /// per-block "weight" without leaving the chain pane.
+    pub(super) signature_count: Option<u64>,
 }
 
 impl SlotState {
@@ -73,6 +79,7 @@ impl SlotState {
             bank_frozen_at: None,
             finalized_at: None,
             we_are_leader: false,
+            signature_count: None,
         }
     }
 
@@ -498,10 +505,21 @@ impl ChainPane {
                 s.first_shred_at.get_or_insert(ts);
                 Some(*slot)
             }
-            EventKind::BankFrozen { slot, .. } => {
+            EventKind::BankFrozen {
+                slot,
+                signature_count,
+                ..
+            } => {
                 let ts = ev.ts;
                 let s = self.upsert_slot(*slot);
                 s.bank_frozen_at.get_or_insert(ts);
+                // First BankFrozen for the slot wins — protocol
+                // emits one per (slot, hash) pair so on a fork we
+                // keep the first count rather than overwrite. The
+                // bucket renders a ⊕ fork glyph anyway, so the tx
+                // stream value for a forked slot is informative not
+                // authoritative.
+                s.signature_count.get_or_insert(*signature_count);
                 Some(*slot)
             }
             EventKind::VotingNotarize { slot, .. } => {

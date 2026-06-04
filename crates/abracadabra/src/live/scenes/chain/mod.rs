@@ -901,6 +901,31 @@ mod tests {
     }
 
     #[test]
+    fn bank_frozen_captures_signature_count_into_slot_state() {
+        // LIVE-58: BankFrozen now writes `signature_count` into the
+        // slot record so the left-side tx stream has data to paint.
+        // First write wins (fork-safe) — repeated BankFrozen for the
+        // same slot must NOT overwrite the captured count.
+        let mut p = ChainPane::new();
+        p.on_event(&mk(EventKind::BankFrozen {
+            slot: 200,
+            hash: "a".into(),
+            signature_count: 67_000,
+        }));
+        let s = p.slots.iter().find(|s| s.slot == 200).unwrap();
+        assert_eq!(s.signature_count, Some(67_000));
+        // Second BankFrozen for the same slot (fork sibling) keeps
+        // the original count rather than overwriting.
+        p.on_event(&mk(EventKind::BankFrozen {
+            slot: 200,
+            hash: "b".into(),
+            signature_count: 999_999,
+        }));
+        let s = p.slots.iter().find(|s| s.slot == 200).unwrap();
+        assert_eq!(s.signature_count, Some(67_000), "first count wins");
+    }
+
+    #[test]
     fn classifier_keeps_fork_precedence_over_our_leader_star() {
         // A fork on our own slot is still painted ⊕ — the fork
         // shape carries safety information the magenta ★ would
