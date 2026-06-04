@@ -110,7 +110,7 @@ impl Pane for ChainPane {
 #[cfg(test)]
 mod tests {
     use super::glyph::classify_slot;
-    use super::render::header_line;
+    use super::render::slot_chip_line;
     use super::state::{ChainPane, SkipClass};
     use crate::live::animation::Pane;
     use crate::parser::{Event, EventKind};
@@ -437,35 +437,33 @@ mod tests {
     }
 
     #[test]
-    fn header_line_is_just_spinner_tip_and_optional_anom() {
-        // After LIVE-53 the header is centred horizontally and
-        // carries spinner + tip slot only. The cannon glyph moved
-        // into the visualisation area (painted at world (0.5, 0.0)
-        // by `render::render_cannon`) so the header text has no
-        // glyph dependencies. CSKIP / indeterminate-skip / forks
-        // counters stay off the header because the bucket renders
-        // those classes visually.
-        let p = ChainPane::new();
-        let text = line_text(&header_line(&p));
+    fn slot_chip_carries_spinner_and_slot_no_tip_word() {
+        // After LIVE-54 the slot chip drops the `tip` label entirely
+        // — the slot number is self-explanatory — and never carries
+        // the cannon glyph (it's a separate layout row beneath the
+        // chip). CSKIP / indeterminate-skip / forks counters stay
+        // off the chip because the bucket paints those classes
+        // visually.
+        let mut p = ChainPane::new();
+        p.on_event(&block_ev(521598, "a", 521597, "root"));
+        let text = line_text(&slot_chip_line(&p));
         assert!(
-            text.contains("tip"),
-            "header must carry the `tip` label: {text:?}"
+            text.contains("521598"),
+            "slot chip must show the tip slot number: {text:?}"
         );
         assert!(
-            !text.contains("CSKIP"),
-            "header must not surface CSKIP counter: {text:?}"
+            !text.contains("tip"),
+            "slot chip must not carry the `tip` label after LIVE-54: \
+             {text:?}"
         );
         assert!(
-            !text.contains("indet"),
-            "header must not surface indet counter: {text:?}"
-        );
-        assert!(
-            !text.contains("forks"),
-            "header must not surface forks counter: {text:?}"
+            !text.contains("CSKIP") && !text.contains("indet") && !text.contains("forks"),
+            "slot chip must not surface skip / fork counters: {text:?}"
         );
         assert!(
             !text.contains('▶') && !text.contains('▼'),
-            "cannon glyph belongs in viz area, not header: {text:?}"
+            "cannon glyph belongs in its own layout row, not the slot chip: \
+             {text:?}"
         );
     }
 
@@ -623,14 +621,14 @@ mod tests {
     }
 
     #[test]
-    fn header_line_surfaces_anomaly_only_when_nonzero() {
+    fn slot_chip_surfaces_anomaly_only_when_nonzero() {
         // CORRECT-01 display policy: silence on a healthy stream,
         // surface a red ` anom` segment only when anomalies were seen.
         let mut p = ChainPane::new();
-        let text = line_text(&header_line(&p));
+        let text = line_text(&slot_chip_line(&p));
         assert!(
             !text.contains(" anom"),
-            "header must stay silent on healthy stream: {text:?}"
+            "slot chip must stay silent on healthy stream: {text:?}"
         );
         // Inject a corrupt parent edge and finalise to trip the
         // anomaly path.
@@ -640,14 +638,14 @@ mod tests {
             hash: "a".into(),
             fast: true,
         }));
-        let text = line_text(&header_line(&p));
+        let text = line_text(&slot_chip_line(&p));
         assert!(
             text.contains(" anom"),
-            "header must surface anomaly counter when nonzero: {text:?}"
+            "slot chip must surface anomaly counter when nonzero: {text:?}"
         );
         assert!(
             text.contains("1 anom"),
-            "anomaly count missing in header: {text:?}"
+            "anomaly count missing in slot chip: {text:?}"
         );
     }
 

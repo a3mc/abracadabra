@@ -42,14 +42,14 @@ use super::state::ChainPane;
 /// is only consulted by the vertical-stack fallback.
 pub const PANE_HEIGHT: u16 = 12;
 
-/// Cannon glyph painted at the top-centre of the visualisation
-/// area. Points down — particles fall vertically into the bucket.
+/// Cannon glyph painted just below the slot chip — points down,
+/// particles fall vertically into the bucket.
 const CANNON_GLYPH: char = '▼';
 
-/// Default bucket width in cells. 25 × 4 = 100 = [`PAGE_CAPACITY`].
+/// Default bucket width in cells. 25 × 8 = 200 = [`PAGE_CAPACITY`].
 const DEFAULT_BUCKET_COLS: usize = 25;
 /// Default bucket height in rows.
-const DEFAULT_BUCKET_ROWS: usize = 4;
+const DEFAULT_BUCKET_ROWS: usize = 8;
 /// Per-cell horizontal stride: `glyph + space`. Packed solid the
 /// grid reads as a bar; spaced cells read as discrete slots.
 const BUCKET_STRIDE: u16 = 2;
@@ -58,6 +58,17 @@ const BUCKET_STRIDE: u16 = 2;
 /// duration. A cell flashes between `column_progress` and
 /// `column_progress + WIPE_FLASH_WINDOW`, then renders blank.
 const WIPE_FLASH_WINDOW: f32 = 0.12;
+
+/// Chip background colours. Pre-built once and cloned into Style
+/// each call so the render loop allocates only the `format!`
+/// strings — `Style` is `Copy` so the colour values themselves
+/// don't allocate.
+const CHIP_LABEL_BG: Color = Color::Rgb(46, 54, 68);
+const CHIP_LABEL_FG: Color = Color::Rgb(168, 180, 198);
+const CHIP_VALUE_BG: Color = Color::Rgb(76, 110, 148);
+const CHIP_VALUE_FG: Color = Color::Rgb(244, 248, 255);
+const SLOT_CHIP_BG: Color = Color::Rgb(36, 50, 76);
+const SLOT_CHIP_FG: Color = Color::Rgb(252, 252, 255);
 
 /// Render the entire pane (border + composition) inside `area`.
 pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
@@ -76,79 +87,31 @@ pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // top blank
-            Constraint::Length(1), // header line 1: spinner + tip + cannon
-            Constraint::Length(1), // header line 2: timing percentiles
+            Constraint::Length(1), // status chips (timing)
             Constraint::Length(1), // blank
+            Constraint::Length(1), // spinner + slot chip
+            Constraint::Length(1), // cannon ▼
             Constraint::Min(1),    // visualisation (arena + bucket)
         ])
         .split(inner);
 
-    render_header(pane, frame, chunks[1]);
-    render_timing(pane, frame, chunks[2]);
+    render_status(pane, frame, chunks[0]);
+    render_slot_chip(pane, frame, chunks[2]);
+    render_cannon_row(frame, chunks[3]);
     render_visualisation(pane, frame, chunks[4]);
 }
 
-/// Compose the header `Line`. Extracted from `render_header` for
-/// direct test coverage.
+/// Compose the top status `Line` — four chip pairs, one per
+/// percentile stage. Each chip is a `[label][value]` pair with
+/// distinct background colours so the eye reads them as discrete
+/// pills. Stages with no samples render their value as `—`.
 ///
-/// Content: spinner + tip slot. Optional ` ⚠ N anom` segment when
-/// parser walk-back anomalies have fired (silent by default).
-/// CSKIP / indeterminate-skip / fork counts are not shown — the
-/// bucket renders those classes visually. The cannon glyph is
-/// painted in the visualisation area (not the header) by
-/// [`render_cannon`] so particles can spawn directly beneath it.
-pub(super) fn header_line(pane: &ChainPane) -> Line<'static> {
-    let spinner = spinner_frame(pane.event_count, pane.last_event_at);
-    let tip = pane
-        .tip_slot()
-        .map_or_else(|| "—".to_owned(), |s| s.to_string());
-
-    let mut spans = vec![
-        Span::styled(
-            spinner.to_owned(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            tip,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" tip", theme::label_style()),
-    ];
-    if pane.walk_back_anomalies > 0 {
-        spans.push(sep());
-        spans.push(Span::styled(
-            pane.walk_back_anomalies.to_string(),
-            theme::bad_style().add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(" anom", theme::label_style()));
-    }
-    Line::from(spans)
-}
-
-fn render_header(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(
-        Paragraph::new(header_line(pane)).alignment(Alignment::Center),
-        area,
-    );
-}
-
-/// Compose the timing strip `Line`. Extracted from `render_timing`
-/// for direct test coverage.
-///
-/// Format: each stage renders as `<name> <p50>/<p95>ms`. Full words
-/// match the Windows-tab labels (`cadence` / `assembly` /
-/// `consensus` / `lifecycle`) — opaque 2-3 letter abbreviations
-/// (`asm`, `cons`, `lc`) drop legibility for almost no width win at
-/// the half-pane widths the chain pane runs at. Trailing `ms` is
-/// shown once per value, not once per stage — both percentiles
-/// share the unit.
-pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
+/// The trailing `ms` unit is dropped from each value to keep the
+/// line under ~78 cols (half-pane width) — operators familiar
+/// with the timing-percentile vocabulary read the values as
+/// milliseconds. The exact units are documented at
+/// [`crate::live::scenes::chain::state::ChainPane::timing_table`].
+pub(super) fn status_line(pane: &ChainPane) -> Line<'static> {
     let table = pane.timing_table();
     let stages: [(&str, StagePercentiles); 4] = [
         ("cadence", table.cluster),
@@ -156,81 +119,115 @@ pub(super) fn timing_line(pane: &ChainPane) -> Line<'static> {
         ("consensus", table.consensus),
         ("lifecycle", table.lifecycle),
     ];
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(stages.len() * 3);
     let mut first = true;
     for (label, pct) in stages {
         if !first {
-            spans.push(sep());
+            spans.push(Span::raw(" "));
         }
-        spans.push(Span::styled(format!("{label} "), theme::label_style()));
-        match pct {
-            Some((p50, p95)) => {
-                spans.push(Span::styled(format!("{p50}/{p95}"), theme::value_style()));
-                spans.push(Span::styled("ms", theme::label_style()));
-            }
-            None => {
-                spans.push(Span::styled("—", Style::default().fg(Color::DarkGray)));
-            }
-        }
+        spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default().fg(CHIP_LABEL_FG).bg(CHIP_LABEL_BG),
+        ));
+        let value_text = match pct {
+            Some((p50, p95)) => format!(" {p50}/{p95} "),
+            None => "  —  ".to_owned(),
+        };
+        spans.push(Span::styled(
+            value_text,
+            Style::default()
+                .fg(CHIP_VALUE_FG)
+                .bg(CHIP_VALUE_BG)
+                .add_modifier(Modifier::BOLD),
+        ));
         first = false;
     }
     Line::from(spans)
 }
 
-fn render_timing(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+fn render_status(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
-        Paragraph::new(timing_line(pane)).alignment(Alignment::Center),
+        Paragraph::new(status_line(pane)).alignment(Alignment::Center),
         area,
     );
 }
 
-/// Lay out the visualisation area: cannon glyph at the top-centre,
-/// in-flight particles falling toward the bucket, bucket centred
-/// both horizontally and vertically inside `viz`. Particle
-/// world-space spans the full `viz`, so a particle launched at
-/// `(CANNON_X, CANNON_Y)` ends up at world `(LANDING_X, LANDING_Y)`
-/// — the centre of the bucket area — at TTL expiry.
+/// Compose the slot chip `Line` — spinner + tip slot number on a
+/// dark slate background, plus an optional `⚠ N anom` segment when
+/// parser walk-back anomalies have fired. The `tip` label was
+/// dropped (the slot number is self-explanatory) and the chip
+/// background visually binds spinner + slot into one element above
+/// the cannon `▼` on the next row.
+pub(super) fn slot_chip_line(pane: &ChainPane) -> Line<'static> {
+    let spinner = spinner_frame(pane.event_count, pane.last_event_at);
+    let tip = pane
+        .tip_slot()
+        .map_or_else(|| "—".to_owned(), |s| s.to_string());
+    let mut spans = vec![Span::styled(
+        format!("  {spinner} {tip}  "),
+        Style::default()
+            .fg(SLOT_CHIP_FG)
+            .bg(SLOT_CHIP_BG)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if pane.walk_back_anomalies > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" ⚠ {} anom ", pane.walk_back_anomalies),
+            theme::bad_style().add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn render_slot_chip(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(slot_chip_line(pane)).alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// Paint the cannon `▼` centred on its row. Sits one row below the
+/// slot chip with no blank between — the vertical adjacency binds
+/// the two into a single "cannon-loaded-with-slot" visual unit.
+fn render_cannon_row(frame: &mut Frame<'_>, area: Rect) {
+    let line = Line::from(Span::styled(
+        CANNON_GLYPH.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
+}
+
+/// Lay out the visualisation area: in-flight particles drawn
+/// across the full `viz`, bucket centred horizontally and
+/// bottom-aligned vertically inside `viz`. The cannon glyph
+/// itself is one row above `viz` (its own layout chunk above
+/// `viz` in [`render`]), so particles spawn at viz top and visually
+/// drop from beneath the cannon row into the bucket.
 fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     if viz.width == 0 || viz.height == 0 {
         return;
     }
-    render_cannon(frame, viz);
     render_particles(pane, frame, viz);
     let bucket_area = compute_bucket_area(viz);
     render_bucket(pane, frame, bucket_area, Instant::now());
 }
 
-/// Paint the cannon `▼` at world `(CANNON_X, 0.0)` — top-centre of
-/// the viz area. Static glyph; future steps could add a muzzle-
-/// flash flicker on particle spawn.
-fn render_cannon(frame: &mut Frame<'_>, viz: Rect) {
-    let Some((cx, cy)) = world_to_screen(viz, super::particle::CANNON_X, 0.0) else {
-        return;
-    };
-    let buf = frame.buffer_mut();
-    buf[(cx, cy)].set_char(CANNON_GLYPH).set_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-}
-
-/// Position a centred bucket sub-rect inside `viz`. Aims for the
-/// default 25×4 grid; falls back to whatever fits when the viz
-/// width is narrower. Centred both horizontally AND vertically so
-/// the bucket reads as a contained "inner widget" with breathing
-/// margin above (where particles fly) and below.
+/// Position a bucket sub-rect inside `viz`. Aims for the default
+/// 25×8 grid; falls back to whatever fits when the viz width is
+/// narrower. Centred horizontally, **bottom-aligned vertically** —
+/// the bucket sits flush at the bottom of `viz` so the rows above
+/// become the arena where particles fall. Matches the operator's
+/// mockup where the bottom has no empty margin.
 fn compute_bucket_area(viz: Rect) -> Rect {
     let want_w = u16::try_from(DEFAULT_BUCKET_COLS).unwrap_or(u16::MAX) * BUCKET_STRIDE;
     let want_h = u16::try_from(DEFAULT_BUCKET_ROWS).unwrap_or(u16::MAX);
     let w = want_w.min(viz.width);
     let h = want_h.min(viz.height);
     let x_offset = viz.width.saturating_sub(w) / 2;
-    // Vertically centre. When the available height is odd, the
-    // extra row goes ABOVE the bucket (giving particles more arena)
-    // so the bottom margin stays tight; matches the operator's
-    // mockup where the top margin breathes more than the bottom.
-    let y_offset = viz.height.saturating_sub(h) / 2 + viz.height.saturating_sub(h) % 2;
+    let y_offset = viz.height.saturating_sub(h);
     Rect::new(viz.x + x_offset, viz.y + y_offset, w, h)
 }
 
@@ -362,15 +359,6 @@ fn world_to_screen(area: Rect, x: f32, y: f32) -> Option<(u16, u16)> {
     Some((area.x + col, area.y + row))
 }
 
-fn sep() -> Span<'static> {
-    Span::styled(
-        "  ·  ",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,37 +392,36 @@ mod tests {
 
     #[test]
     fn compute_bucket_area_targets_default_size_when_room() {
-        // 25 cols × 2 stride = 50; 4 rows. Plenty of room in 80×8.
-        let viz = Rect::new(0, 0, 80, 8);
+        // 25 cols × 2 stride = 50; 8 rows. Plenty of room in 80×12.
+        let viz = Rect::new(0, 0, 80, 12);
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 50);
-        assert_eq!(b.height, 4);
+        assert_eq!(b.height, 8);
         // Centred horizontally.
         assert_eq!(b.x, 15);
-        // Vertically centred — viz_height - bucket_height = 4 → 2
-        // rows of margin total, biased upward (top gets the extra
-        // row when odd) so bucket sits at row 2.
-        assert_eq!(b.y, 2);
+        // Bottom-aligned vertically — bucket flush with viz bottom
+        // so the arena above gets the full slack.
+        assert_eq!(b.y, 4, "bucket should sit at viz_height - bucket_height");
     }
 
     #[test]
     fn compute_bucket_area_falls_back_when_narrow() {
         // Viz tighter than the default 50-cell width: bucket
         // shrinks to fit.
-        let viz = Rect::new(0, 0, 30, 4);
+        let viz = Rect::new(0, 0, 30, 8);
         let b = compute_bucket_area(viz);
         assert_eq!(b.width, 30);
-        assert_eq!(b.height, 4);
+        assert_eq!(b.height, 8);
     }
 
     #[test]
-    fn compute_bucket_area_biases_top_margin_when_height_is_odd() {
-        // viz_height (9) − bucket_height (4) = 5 → split 3 above / 2
-        // below so the particles have more arena to fall through.
-        let viz = Rect::new(0, 0, 80, 9);
+    fn compute_bucket_area_clamps_height_when_viz_shorter_than_default() {
+        // Viz shorter than the default 8-row bucket: bucket
+        // shrinks to fit and is flush with the bottom.
+        let viz = Rect::new(0, 0, 80, 6);
         let b = compute_bucket_area(viz);
-        assert_eq!(b.height, 4);
-        assert_eq!(b.y, 3, "top margin should take the extra row");
+        assert_eq!(b.height, 6, "bucket clamps to viz height");
+        assert_eq!(b.y, 0, "no top margin when bucket already fills viz");
     }
 
     #[test]

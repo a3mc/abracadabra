@@ -32,19 +32,19 @@ use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// World-space cannon position (normalised, top-left origin).
-/// Top-centre of the visualisation area — the cannon glyph `▼` is
-/// painted at world `(0.5, 0.0)` and particles spawn one row below
-/// so they appear to drop from beneath the cannon.
+/// Particles spawn at the **top of the viz area** (the cannon `▼`
+/// glyph itself is rendered in a layout row directly above viz, so
+/// the spawn point sits flush under the cannon visually).
 pub(super) const CANNON_X: f32 = 0.50;
-pub(super) const CANNON_Y: f32 = 0.06;
+pub(super) const CANNON_Y: f32 = 0.0;
 
-/// World-space landing-cluster centre. Bucket is centred vertically
-/// AND horizontally in viz, so the cluster centre sits at the
-/// middle of the viz rect. Per-particle horizontal jitter (see
-/// [`Self::fire`]) spreads trajectories around this point so a
-/// burst doesn't collapse into one column.
+/// World-space landing-cluster centre. Bucket is bottom-aligned in
+/// viz, so the cluster centre sits near the top of the bucket area
+/// (~75% down the viz rect for the default 25×8 bucket inside a
+/// ~10-row viz). Per-particle horizontal jitter spreads trajectories
+/// so a burst doesn't collapse into one column.
 const LANDING_X: f32 = 0.50;
-const LANDING_Y: f32 = 0.55;
+const LANDING_Y: f32 = 0.70;
 
 /// Maximum normalised horizontal offset added to a particle's
 /// landing target. Slot-deterministic so the same slot always takes
@@ -57,11 +57,12 @@ const LANDING_X_JITTER: f32 = 0.18;
 /// against Solana's 400 ms slot cadence.
 const FLIGHT_DURATION: Duration = Duration::from_millis(700);
 
-/// Slots per bucket page. Fixed at 100 per the operator's spec —
-/// "100 cells fixed is enough". Renderer arranges them in a 25×4
-/// grid by default but may fall back to other aspect ratios when
-/// the available area can't host 25 columns.
-pub(super) const PAGE_CAPACITY: usize = 100;
+/// Slots per bucket page. Bumped to 200 in LIVE-54 to fill the
+/// vertical space the half-pane layout grants — 100 cells in a
+/// 25×4 grid left a large empty bottom margin. The 25×8 = 200 grid
+/// fits comfortably while keeping the wipe cadence visible
+/// (200 × ~0.4 s slot rate ≈ 80 s per page).
+pub(super) const PAGE_CAPACITY: usize = 200;
 
 /// Magic-wipe sweep duration. Long enough for the column-by-column
 /// flash to read as a wave; short enough that the next page can
@@ -70,8 +71,10 @@ const WIPE_DURATION: Duration = Duration::from_millis(500);
 
 /// Soft cap on in-flight particles. Excess drops the oldest in
 /// flight — particles are visual only, losing one is preferable to
-/// unbounded memory growth.
-const MAX_IN_FLIGHT: usize = 128;
+/// unbounded memory growth. Sized at twice [`PAGE_CAPACITY`] so a
+/// burst large enough to fill a whole page in one tick can still
+/// fly every particle without trimming the head.
+const MAX_IN_FLIGHT: usize = PAGE_CAPACITY * 2;
 
 /// One in-flight slot marker.
 #[derive(Debug, Clone, Copy)]
