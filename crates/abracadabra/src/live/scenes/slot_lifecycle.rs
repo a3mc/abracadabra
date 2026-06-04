@@ -41,6 +41,15 @@ const MARK_BARS: [&str; 9] = [" ", "·", "·", "•", "•", "•", "●", "●"
 const COL_GOOD: Color = Color::Green;
 const COL_WARN: Color = Color::Yellow;
 const COL_FEC: Color = Color::LightBlue;
+/// Informational colour for events that are normal protocol
+/// behaviour and **not** a warning. The plain `skip` lane is one of
+/// these — most skip votes are healthy (the network agreed the
+/// prior leader was slow or crashed); only canonical-skips are
+/// operationally bad and those render in `theme::bad_style()` (red)
+/// on the snapshot row. Pre-LIVE-57 the skip lane shared yellow
+/// with the slow lane, so the two were visually indistinguishable
+/// and skip read as a warning when it isn't one.
+const COL_INFO: Color = Color::Magenta;
 
 /// Rolling window for the snapshot row's percentages. 64 slots ≈ 25 s
 /// of cluster activity at Solana's ~400 ms slot time.
@@ -87,12 +96,16 @@ impl Lane {
     const fn colour(self) -> Color {
         match self {
             Self::Fast => COL_GOOD,
-            // Skip vote is normal Alpenglow behavior — most skip votes
-            // are healthy (the network agreed the leader was slow or
-            // crashed). Only canonical-skips (we skipped a slot that
-            // turned out canonical) are bad; those are tracked
-            // separately in the snapshot row.
-            Self::Slow | Self::Skip => COL_WARN,
+            // Slow finalize is the 2-round path — still success but
+            // worth flagging. Yellow.
+            Self::Slow => COL_WARN,
+            // Skip vote is normal Alpenglow behaviour — most skip
+            // votes are healthy (the network agreed the leader was
+            // slow or crashed). Painted magenta so it reads as
+            // informational, distinct from `slow` yellow. Only
+            // canonical-skips are operationally bad and those render
+            // separately on the snapshot row in `bad_style` (red).
+            Self::Skip => COL_INFO,
             Self::Fec => COL_FEC,
         }
     }
@@ -379,7 +392,11 @@ impl SlotLifecyclePane {
             Span::styled(
                 format!("{skips}"),
                 if skips > 0 {
-                    Style::default().fg(COL_WARN).add_modifier(Modifier::BOLD)
+                    // Match the skip lane's chart colour so the eye
+                    // reads count and bars as the same signal class.
+                    // Skip is informational, not a warning — see
+                    // `COL_INFO` docstring.
+                    Style::default().fg(COL_INFO).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 },
@@ -770,6 +787,32 @@ mod tests {
         assert!(
             !text.contains("canon✗"),
             "snapshot still uses canon✗: {text:?}"
+        );
+    }
+
+    #[test]
+    fn lane_colours_distinguish_slow_from_skip() {
+        // LIVE-57 regression: before this change `slow` and `skip`
+        // shared `COL_WARN` (yellow), so the two lanes were visually
+        // indistinguishable on the chart and the snapshot row. Pin
+        // the three constraints the operator asked for:
+        //   1. slow ≠ skip (distinct colours)
+        //   2. skip ≠ red (skip is normal protocol; only CSKIP is bad)
+        //   3. slow stays yellow (warn)
+        assert_ne!(
+            Lane::Slow.colour(),
+            Lane::Skip.colour(),
+            "slow and skip must paint distinct colours"
+        );
+        assert_ne!(
+            Lane::Skip.colour(),
+            Color::Red,
+            "skip must not paint red — only canonical-skip is bad"
+        );
+        assert_eq!(
+            Lane::Slow.colour(),
+            Color::Yellow,
+            "slow stays yellow (warn — 2-round path)"
         );
     }
 }
