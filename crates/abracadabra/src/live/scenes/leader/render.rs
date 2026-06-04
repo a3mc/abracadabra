@@ -128,7 +128,9 @@ fn render_windows(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
     }
     if area.width >= MIN_TWO_CARD_WIDTH {
         // Two cards side by side with a 1-col vertical separator
-        // between them. Newest window on the left.
+        // between them. Newest window on the left. Each card's
+        // CARD_ROW_WIDTH-wide content is horizontally centered inside
+        // its half-area so the right card does not hug the separator.
         let cells = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -137,21 +139,20 @@ fn render_windows(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
                 Constraint::Min(0),
             ])
             .split(area);
-        // Two cards: newest (left) and one prior (right). The cell
-        // array length is the visible-card budget; no per-iteration
-        // bound check is needed.
         let mut iter = pane.windows.iter().rev();
         for cell in &[cells[0], cells[2]] {
             let Some(w) = iter.next() else {
                 break;
             };
-            render_card(frame, *cell, w);
+            render_card(frame, centered_card_area(*cell), w);
         }
         render_separator(frame, cells[1]);
     } else if area.width >= MIN_ONE_CARD_WIDTH {
         // Single-card fallback at narrow widths — newest window only.
+        // Centered horizontally inside the full area for the same
+        // reason as the two-card path.
         if let Some(w) = pane.windows.back() {
-            render_card(frame, area, w);
+            render_card(frame, centered_card_area(area), w);
         }
     } else {
         // Widget too narrow even for one card — surface a one-line
@@ -164,9 +165,23 @@ fn render_windows(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-/// Render a vertical `│` line down the column between the two cards.
-/// Uses the title style so the separator reads as a deliberate divider
-/// rather than ghosted text — visible at normal contrast.
+/// Pull a CARD_ROW_WIDTH-wide sub-rect from the centre of `cell`,
+/// keeping the original top alignment. When `cell.width <= CARD_ROW_WIDTH`
+/// the input area is returned unchanged so narrow paths still render.
+const fn centered_card_area(cell: Rect) -> Rect {
+    let card_w = CARD_ROW_WIDTH as u16;
+    if cell.width <= card_w {
+        return cell;
+    }
+    let offset = (cell.width - card_w) / 2;
+    Rect::new(cell.x + offset, cell.y, card_w, cell.height)
+}
+
+/// Render a dashed gray separator between the two cards. Glyph and
+/// styling mirror the `shred_streams` pane's `CARD_DIVIDER` so all
+/// Live-tab dividers read alike. Height is capped at the card's
+/// content height (`CARD_INNER_HEIGHT`) so the separator does not
+/// extend through the empty space below the cards.
 ///
 /// Writes directly into the frame buffer rather than building a
 /// `Vec<Line>` and a `Paragraph` — the previous form allocated
@@ -175,10 +190,13 @@ fn render_separator(frame: &mut Frame<'_>, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let style = theme::title_style();
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let span = area.height.min(CARD_INNER_HEIGHT);
     let buf = frame.buffer_mut();
-    for dy in 0..area.height {
-        buf.set_string(area.x, area.y + dy, "│", style);
+    for dy in 0..span {
+        buf.set_string(area.x, area.y + dy, "┊", style);
     }
 }
 
