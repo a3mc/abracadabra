@@ -340,7 +340,7 @@ impl TxPressurePane {
                         y1: 0.0,
                         x2: x,
                         y2: y,
-                        color: dim_rgb(thermal_color(t)),
+                        color: thermal_color_dimmed(t),
                     });
                 }
 
@@ -390,19 +390,22 @@ impl TxPressurePane {
             Span::styled(
                 latest,
                 Style::default()
-                    .fg(Color::Rgb(180, 220, 255))
+                    .fg(crate::tui::truecolor::rgb(180, 220, 255))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" sig", theme::label_style()),
             sep(),
             Span::styled("avg ", theme::label_style()),
-            Span::styled(avg, Style::default().fg(Color::Rgb(220, 200, 80))),
+            Span::styled(
+                avg,
+                Style::default().fg(crate::tui::truecolor::rgb(220, 200, 80)),
+            ),
             sep(),
             Span::styled("peak ", theme::label_style()),
             Span::styled(
                 peak,
                 Style::default()
-                    .fg(Color::Rgb(230, 70, 60))
+                    .fg(crate::tui::truecolor::rgb(230, 70, 60))
                     .add_modifier(Modifier::BOLD),
             ),
             sep(),
@@ -428,15 +431,35 @@ fn sep() -> Span<'static> {
 
 /// Three-stop thermal gradient. `t` is the normalized pressure
 /// in `[0, 1]`. Below 0.5 interpolates `COLOR_LOW → COLOR_MID`;
-/// above interpolates `COLOR_MID → COLOR_HIGH`.
+/// above interpolates `COLOR_MID → COLOR_HIGH`. Routed through
+/// [`crate::tui::truecolor::rgb`] so 256-colour terminals receive
+/// the nearest 6×6×6 cube approximation.
 fn thermal_color(t: f64) -> Color {
+    let (r, g, b) = thermal_rgb(t);
+    crate::tui::truecolor::rgb(r, g, b)
+}
+
+/// Dimmed thermal colour for the area fill so the curve on top reads
+/// against it. Dimming happens on the RAW RGB triple BEFORE
+/// quantisation — dimming an already-quantised `Color::Indexed` is a
+/// no-op (the index is a palette pointer, not a brightness), which
+/// would leave the fill region as bright as the curve on macOS
+/// Terminal.app.
+fn thermal_color_dimmed(t: f64) -> Color {
+    let (r, g, b) = dim_rgb_tuple(thermal_rgb(t));
+    crate::tui::truecolor::rgb(r, g, b)
+}
+
+/// Raw `(r, g, b)` thermal gradient — returned as a triple so callers
+/// can apply per-channel transforms (dimming, etc.) before quantising
+/// for the active terminal.
+fn thermal_rgb(t: f64) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t < 0.5 {
+    if t < 0.5 {
         lerp_rgb(COLOR_LOW, COLOR_MID, t / 0.5)
     } else {
         lerp_rgb(COLOR_MID, COLOR_HIGH, (t - 0.5) / 0.5)
-    };
-    Color::Rgb(r, g, b)
+    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -448,18 +471,14 @@ fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     (lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
 }
 
-/// Dim an RGB color for the area fill so the curve on top reads
-/// against it. Non-RGB colors pass through unchanged.
-const fn dim_rgb(c: Color) -> Color {
-    if let Color::Rgb(r, g, b) = c {
-        Color::Rgb(
-            r / FILL_DIM_DIVISOR,
-            g / FILL_DIM_DIVISOR,
-            b / FILL_DIM_DIVISOR,
-        )
-    } else {
-        c
-    }
+/// Divide every channel by `FILL_DIM_DIVISOR` — the dim multiplier
+/// for the area-fill colour underneath the brighter curve.
+const fn dim_rgb_tuple(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    (
+        rgb.0 / FILL_DIM_DIVISOR,
+        rgb.1 / FILL_DIM_DIVISOR,
+        rgb.2 / FILL_DIM_DIVISOR,
+    )
 }
 
 #[cfg(test)]
@@ -558,13 +577,32 @@ mod tests {
     }
 
     #[test]
-    fn dim_rgb_reduces_brightness() {
-        let bright = Color::Rgb(240, 240, 240);
-        let dim = dim_rgb(bright);
-        match dim {
-            Color::Rgb(r, g, b) => assert!(r < 240 && g < 240 && b < 240),
-            _ => panic!("expected RGB"),
-        }
+    fn dim_rgb_tuple_reduces_each_channel_by_divisor() {
+        // LIVE-67: dimming now happens on the raw RGB triple BEFORE
+        // truecolor::rgb() quantises for the active terminal. Pin the
+        // arithmetic so a future divisor change is loud.
+        let (r, g, b) = dim_rgb_tuple((240, 240, 240));
+        assert_eq!(r, 240 / FILL_DIM_DIVISOR);
+        assert_eq!(g, 240 / FILL_DIM_DIVISOR);
+        assert_eq!(b, 240 / FILL_DIM_DIVISOR);
+        // The dim path must produce a darker triple than the bright
+        // input, otherwise the area fill would be as bright as the
+        // curve on top of it.
+        assert!(r < 240 && g < 240 && b < 240);
+    }
+
+    #[test]
+    fn thermal_color_dimmed_applies_dim_before_quantisation() {
+        // Sanity: thermal_color_dimmed at any t produces a darker
+        // colour than thermal_color at the same t when the underlying
+        // gradient is non-zero. Operates on raw triples first so the
+        // result is correct on both truecolor AND 256-colour modes.
+        let bright = thermal_rgb(1.0);
+        let dimmed = dim_rgb_tuple(bright);
+        assert!(
+            dimmed.0 <= bright.0 && dimmed.1 <= bright.1 && dimmed.2 <= bright.2,
+            "dim must be ≤ bright per channel; got bright={bright:?} dimmed={dimmed:?}"
+        );
     }
 
     #[test]

@@ -41,6 +41,10 @@ mod panel;
 // `runner::print_summary` also consumes to keep the text and TUI
 // verdicts in lockstep.
 pub(crate) mod theme;
+// `truecolor` routes Color::Rgb callsites through a runtime detector
+// + 6×6×6 cube fallback so macOS Terminal.app — which misparses 24-bit
+// SGR sequences — still renders the TUI without colour fragmentation.
+pub mod truecolor;
 mod view;
 mod widget;
 

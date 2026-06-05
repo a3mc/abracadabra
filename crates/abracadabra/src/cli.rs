@@ -42,6 +42,18 @@ pub struct Cli {
         value_parser = parse_bucket_duration,
     )]
     pub bucket: i64,
+
+    /// Force the 256-colour ANSI fallback instead of 24-bit RGB.
+    ///
+    /// Use this on terminals that report `TERM=xterm-256color` but do
+    /// not parse 24-bit SGR sequences (most notably the macOS built-in
+    /// Terminal.app, which misparses `\e[38;2;R;G;B m` and renders
+    /// chip backgrounds as fragmented multi-colour text). Auto-detected
+    /// via `COLORTERM` / `TERM_PROGRAM` / `TERM` at startup, so this
+    /// flag is only needed for terminals whose env-var advertisement
+    /// lies about their capabilities.
+    #[arg(long, default_value_t = false)]
+    pub no_truecolor: bool,
 }
 
 /// Parse a duration string of the form `<NN>(s|m|h)` into seconds.

@@ -63,16 +63,29 @@ const BUCKET_STRIDE: u16 = 2;
 /// `column_progress + WIPE_FLASH_WINDOW`, then renders blank.
 const WIPE_FLASH_WINDOW: f32 = 0.12;
 
-/// Chip background colours. Pre-built once and cloned into Style
-/// each call so the render loop allocates only the `format!`
-/// strings — `Style` is `Copy` so the colour values themselves
-/// don't allocate.
-const CHIP_LABEL_BG: Color = Color::Rgb(46, 54, 68);
-const CHIP_LABEL_FG: Color = Color::Rgb(168, 180, 198);
-const CHIP_VALUE_BG: Color = Color::Rgb(76, 110, 148);
-const CHIP_VALUE_FG: Color = Color::Rgb(244, 248, 255);
-const SLOT_CHIP_BG: Color = Color::Rgb(36, 50, 76);
-const SLOT_CHIP_FG: Color = Color::Rgb(252, 252, 255);
+/// Chip colours. Routed through [`crate::tui::truecolor::rgb`] so
+/// terminals that misparse 24-bit SGR sequences (notably macOS
+/// Terminal.app) receive the nearest 6×6×6 cube approximation instead
+/// of the broken truecolor escape. `Color` is `Copy`; the dispatch is
+/// a single atomic load.
+fn chip_label_bg() -> Color {
+    crate::tui::truecolor::rgb(46, 54, 68)
+}
+fn chip_label_fg() -> Color {
+    crate::tui::truecolor::rgb(168, 180, 198)
+}
+fn chip_value_bg() -> Color {
+    crate::tui::truecolor::rgb(76, 110, 148)
+}
+fn chip_value_fg() -> Color {
+    crate::tui::truecolor::rgb(244, 248, 255)
+}
+fn slot_chip_bg() -> Color {
+    crate::tui::truecolor::rgb(36, 50, 76)
+}
+fn slot_chip_fg() -> Color {
+    crate::tui::truecolor::rgb(252, 252, 255)
+}
 
 /// Render the entire pane (border + composition) inside `area`.
 pub(super) fn render(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
@@ -131,7 +144,7 @@ pub(super) fn status_line(pane: &ChainPane) -> Line<'static> {
         }
         spans.push(Span::styled(
             format!(" {label} "),
-            Style::default().fg(CHIP_LABEL_FG).bg(CHIP_LABEL_BG),
+            Style::default().fg(chip_label_fg()).bg(chip_label_bg()),
         ));
         let value_text = match pct {
             Some((p50, p95)) => format!(" {p50}/{p95} "),
@@ -140,8 +153,8 @@ pub(super) fn status_line(pane: &ChainPane) -> Line<'static> {
         spans.push(Span::styled(
             value_text,
             Style::default()
-                .fg(CHIP_VALUE_FG)
-                .bg(CHIP_VALUE_BG)
+                .fg(chip_value_fg())
+                .bg(chip_value_bg())
                 .add_modifier(Modifier::BOLD),
         ));
         first = false;
@@ -170,8 +183,8 @@ pub(super) fn slot_chip_line(pane: &ChainPane) -> Line<'static> {
     let mut spans = vec![Span::styled(
         format!("  {spinner} {tip}  "),
         Style::default()
-            .fg(SLOT_CHIP_FG)
-            .bg(SLOT_CHIP_BG)
+            .fg(slot_chip_fg())
+            .bg(slot_chip_bg())
             .add_modifier(Modifier::BOLD),
     )];
     if pane.walk_back_anomalies > 0 {
