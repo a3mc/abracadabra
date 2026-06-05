@@ -146,10 +146,10 @@ fn fmt_bucket(secs: i64) -> String {
 ///
 /// Bands calibrated against operator-observed cluster performance:
 ///
-/// - `>= FAST_FIN_PERFECT_PCT (98)` → `perfect` green BOLD
-/// - `>= FAST_FIN_GOOD_PCT    (95)` → `OK`      green
-/// - `>= FAST_FIN_WARN_PCT    (80)` → `fine`    yellow
-/// - below                          → `sucks`   red
+/// - `>= FAST_FIN_PERFECT_PCT (98)` → `perfect`  green BOLD
+/// - `>= FAST_FIN_GOOD_PCT    (95)` → `OK`       green
+/// - `>= FAST_FIN_WARN_PCT    (80)` → `fine`     yellow
+/// - below                          → `degraded` red
 fn fast_finalize_verdict(fast_pct: f64) -> (ratatui::style::Style, &'static str, &'static str) {
     if fast_pct >= theme::FAST_FIN_PERFECT_PCT {
         (
@@ -169,7 +169,7 @@ fn fast_finalize_verdict(fast_pct: f64) -> (ratatui::style::Style, &'static str,
         (
             theme::bad_style(),
             "[✗]",
-            "sucks (<80%) — slow path dominant",
+            "degraded (<80%) — slow path dominant",
         )
     }
 }
@@ -784,8 +784,8 @@ mod tests {
         let (_, _, txt_fine) = fast_finalize_verdict(92.35);
         assert_eq!(txt_fine, "fine (>=80%) — slow path active");
 
-        let (_, _, txt_sucks) = fast_finalize_verdict(79.99);
-        assert_eq!(txt_sucks, "sucks (<80%) — slow path dominant");
+        let (_, _, txt_degraded) = fast_finalize_verdict(79.99);
+        assert_eq!(txt_degraded, "degraded (<80%) — slow path dominant");
 
         // Boundary values.
         let (_, _, txt_98) = fast_finalize_verdict(98.0);
@@ -796,22 +796,22 @@ mod tests {
 
     #[test]
     fn fast_finalize_verdict_colours_match_severity_ladder() {
-        // Green for perfect/OK, yellow for fine, red for sucks.
+        // Green for perfect/OK, yellow for fine, red for degraded.
         // Bold reserved for the top tier so the eye lands on
         // "perfect" first when scanning the headline.
         use ratatui::style::Color;
         let (perfect, ..) = fast_finalize_verdict(99.0);
         let (ok, ..) = fast_finalize_verdict(96.0);
         let (fine, ..) = fast_finalize_verdict(85.0);
-        let (sucks, ..) = fast_finalize_verdict(50.0);
+        let (degraded, ..) = fast_finalize_verdict(50.0);
         // Same green hue for perfect + OK; perfect is BOLD on top.
         assert_eq!(perfect.fg, ok.fg);
         assert!(perfect.add_modifier.contains(Modifier::BOLD));
         assert!(!ok.add_modifier.contains(Modifier::BOLD));
         // Distinct colours per band.
         assert_ne!(ok.fg, fine.fg);
-        assert_ne!(fine.fg, sucks.fg);
-        // Red anchors "sucks" — operator's "this is bad" signal.
-        assert_eq!(sucks.fg, Some(Color::Red));
+        assert_ne!(fine.fg, degraded.fg);
+        // Red anchors the lowest band — operator's "this is bad" signal.
+        assert_eq!(degraded.fg, Some(Color::Red));
     }
 }

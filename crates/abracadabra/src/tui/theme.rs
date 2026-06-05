@@ -70,10 +70,10 @@ pub fn accent_style() -> Style {
 /// performance — 80% is not enough to call healthy on a node that
 /// regularly sits in the 88-92% range):
 ///
-/// - `>= FAST_FIN_PERFECT_PCT` (98) → perfect (green BOLD)
-/// - `>= FAST_FIN_GOOD_PCT`    (95) → OK      (green)
-/// - `>= FAST_FIN_WARN_PCT`    (80) → fine    (yellow)
-/// - below                       → sucks   (red)
+/// - `>= FAST_FIN_PERFECT_PCT` (98) → perfect  (green BOLD)
+/// - `>= FAST_FIN_GOOD_PCT`    (95) → OK       (green)
+/// - `>= FAST_FIN_WARN_PCT`    (80) → fine     (yellow)
+/// - below                       → degraded (red)
 pub const FAST_FIN_PERFECT_PCT: f64 = 98.0;
 pub const FAST_FIN_GOOD_PCT: f64 = 95.0;
 pub const FAST_FIN_WARN_PCT: f64 = 80.0;
