@@ -64,11 +64,16 @@ fn render_left(
         Span::styled(" next  ", theme::label_style()),
     ];
     if current_kind == TabId::Live {
+        // `h` shows the glossary in the tx-pressure slot — without
+        // this hint, operators have no signal that the help toggle
+        // exists at all (LIVE-64).
         spans.extend([
             Span::styled("SPACE", theme::title_style()),
             Span::styled(" toggle follow  ", theme::label_style()),
             Span::styled("p", theme::title_style()),
             Span::styled(" pause  ", theme::label_style()),
+            Span::styled("h", theme::title_style()),
+            Span::styled(" help  ", theme::label_style()),
         ]);
     }
     // Scroll hints on tabs that carry a scrollable list.
@@ -114,4 +119,56 @@ fn render_left(
         Span::styled(" quit", theme::label_style()),
     ]);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn rendered_text(kind: TabId) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|f| render(kind, None, f, Rect::new(0, 0, 120, 1)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..120)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn live_tab_hint_strip_advertises_help_toggle() {
+        // LIVE-64: the `[h]` toggle is invisible without a hint on
+        // the status bar — operators had no signal the glossary
+        // existed at all. Pin the hint text so a future status-bar
+        // refactor cannot silently drop it.
+        let text = rendered_text(TabId::Live);
+        assert!(
+            text.contains("h help"),
+            "Live-tab status bar must advertise `h help`: {text:?}"
+        );
+        // Sibling Live-tab hints stay alongside.
+        assert!(
+            text.contains("SPACE toggle follow"),
+            "SPACE hint must remain: {text:?}"
+        );
+        assert!(
+            text.contains("p pause"),
+            "p pause hint must remain: {text:?}"
+        );
+    }
+
+    #[test]
+    fn non_live_tab_does_not_advertise_help_toggle() {
+        // The help glossary lives on the Live tab only; other tabs
+        // do not have an `[h]` binding. Avoid offering an action
+        // that does nothing on those tabs.
+        let text = rendered_text(TabId::Overview);
+        assert!(
+            !text.contains("h help"),
+            "non-Live tab must not show `h help` hint: {text:?}"
+        );
+    }
 }
