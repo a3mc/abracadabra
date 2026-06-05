@@ -33,11 +33,12 @@
 //!    outcome.
 //! 4. `CanonicalSkip` — skipped AND in `canonical_slots`.
 //! 5. `VoteSkip` — skipped, no canonical evidence.
-//! 6. `FastFinal` — canonical AND `fast_finalized == Some(true)`.
-//! 7. `SlowFinal` — canonical AND `fast_finalized == Some(false)`.
-//! 8. `Notarised` — canonical AND we observed VotingNotarize.
-//! 9. `CanonicalSilent` — canonical via walk-back, no direct event.
-//! 10. `Pending` — slot seen, no canonical evidence yet.
+//! 6. Canonical (`canonical_slots` contains slot), nested on
+//!    `fast_finalized`:
+//!    - `Some(true)` → `FastFinal`
+//!    - `Some(false)` → `SlowFinal`
+//!    - `None` → `Notarised` if `s.notarized`, else `CanonicalSilent`
+//! 7. `Pending` — slot seen, no canonical evidence yet.
 
 use ratatui::style::{Color, Modifier, Style};
 
