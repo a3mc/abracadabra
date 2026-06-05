@@ -61,12 +61,22 @@ pub fn accent_style() -> Style {
 // Centralised so every panel agrees on what counts as good/warn/bad.
 // Picked against protocol invariants rather than aesthetic guesses:
 
-/// Fast-finalize % of finalized slots. 80% is the `FinalizeFast` cert
-/// stake boundary: above it, fast-path finalization dominates. Below
-/// 60% the cluster is leaning on slow finalization for most slots,
-/// which is a load/reachability signal worth escalating to red.
-pub const FAST_FIN_GOOD_PCT: f64 = 80.0;
-pub const FAST_FIN_WARN_PCT: f64 = 60.0;
+/// Fast-finalize % of finalized slots. The denominator is
+/// `finalized_fast + finalized_slow` — skip slots are excluded from
+/// both numerator and denominator, so this ratio answers "of slots
+/// that finalized, what fraction took the fast path".
+///
+/// Bands (LIVE-62, calibrated against operator-observed cluster
+/// performance — 80% is not enough to call healthy on a node that
+/// regularly sits in the 88-92% range):
+///
+/// - `>= FAST_FIN_PERFECT_PCT` (98) → perfect (green BOLD)
+/// - `>= FAST_FIN_GOOD_PCT`    (95) → OK      (green)
+/// - `>= FAST_FIN_WARN_PCT`    (80) → fine    (yellow)
+/// - below                       → sucks   (red)
+pub const FAST_FIN_PERFECT_PCT: f64 = 98.0;
+pub const FAST_FIN_GOOD_PCT: f64 = 95.0;
+pub const FAST_FIN_WARN_PCT: f64 = 80.0;
 
 /// Any-path FIN % across all observed slots. ≥90% expected in a
 /// healthy cluster; <80% means a meaningful fraction of slots is

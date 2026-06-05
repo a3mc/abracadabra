@@ -137,6 +137,43 @@ fn fmt_bucket(secs: i64) -> String {
 // Each column rendered as its own `Paragraph` inside a `Layout`
 // horizontal split of the outer block's inner rect.
 
+/// Four-band verdict for `fast-finalize %` (LIVE-62). Returns
+/// `(style, mark, verdict_text)`. The math behind `fast_pct` is
+/// `finalized_fast / (finalized_fast + finalized_slow) × 100` —
+/// skip slots are excluded from both numerator and denominator
+/// (see `model::buckets::fast_finalize_pct`), so the ratio honestly
+/// describes "of finalized slots, what fraction took the fast path".
+///
+/// Bands calibrated against operator-observed cluster performance:
+///
+/// - `>= FAST_FIN_PERFECT_PCT (98)` → `perfect` green BOLD
+/// - `>= FAST_FIN_GOOD_PCT    (95)` → `OK`      green
+/// - `>= FAST_FIN_WARN_PCT    (80)` → `fine`    yellow
+/// - below                          → `sucks`   red
+fn fast_finalize_verdict(fast_pct: f64) -> (ratatui::style::Style, &'static str, &'static str) {
+    if fast_pct >= theme::FAST_FIN_PERFECT_PCT {
+        (
+            theme::good_style().add_modifier(ratatui::style::Modifier::BOLD),
+            "[✓]",
+            "perfect (>=98%)",
+        )
+    } else if fast_pct >= theme::FAST_FIN_GOOD_PCT {
+        (theme::good_style(), "[✓]", "OK (>=95%)")
+    } else if fast_pct >= theme::FAST_FIN_WARN_PCT {
+        (
+            theme::warn_style(),
+            "[✗]",
+            "fine (>=80%) — slow path active",
+        )
+    } else {
+        (
+            theme::bad_style(),
+            "[✗]",
+            "sucks (<80%) — slow path dominant",
+        )
+    }
+}
+
 fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     let ov = &state.overall;
     let total_final = ov.finalized_fast.saturating_add(ov.finalized_slow);
@@ -186,21 +223,7 @@ fn render_headline_health(state: &State, frame: &mut Frame<'_>, area: Rect) {
     };
     let has_standstill = !ov.standstill_ranges.is_empty();
 
-    let (fast_style, fast_mark, fast_verdict) = if fast_pct >= theme::FAST_FIN_GOOD_PCT {
-        (theme::good_style(), "[✓]", "healthy (>=80%)")
-    } else if fast_pct >= theme::FAST_FIN_WARN_PCT {
-        (
-            theme::warn_style(),
-            "[✗]",
-            "DEGRADED (60-80%) — slow path active",
-        )
-    } else {
-        (
-            theme::bad_style(),
-            "[✗]",
-            "CRITICAL (<60%) — slow path dominant",
-        )
-    };
+    let (fast_style, fast_mark, fast_verdict) = fast_finalize_verdict(fast_pct);
     let canon_skip_style = theme::band_lower_better(
         canon_skip_pct,
         theme::CANONICAL_SKIP_WARN_PCT,
@@ -737,5 +760,58 @@ fn pct_count(n: u64, total: u64) -> String {
     } else {
         let pct = n as f64 * 100.0 / total as f64;
         format!("{} ({pct:.1}%)", commas(n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Modifier;
+
+    #[test]
+    fn fast_finalize_verdict_pins_four_bands() {
+        // LIVE-62: pin each band's verdict text + colour. The
+        // operator's specific complaint was that 88-92% was
+        // showing as healthy green when it should be yellow "fine".
+        let (style_perfect, _, txt_perfect) = fast_finalize_verdict(99.0);
+        assert_eq!(txt_perfect, "perfect (>=98%)");
+        assert!(style_perfect.add_modifier.contains(Modifier::BOLD));
+
+        let (_, _, txt_ok) = fast_finalize_verdict(95.0);
+        assert_eq!(txt_ok, "OK (>=95%)");
+
+        // The exact value from the operator's screenshot.
+        let (_, _, txt_fine) = fast_finalize_verdict(92.35);
+        assert_eq!(txt_fine, "fine (>=80%) — slow path active");
+
+        let (_, _, txt_sucks) = fast_finalize_verdict(79.99);
+        assert_eq!(txt_sucks, "sucks (<80%) — slow path dominant");
+
+        // Boundary values.
+        let (_, _, txt_98) = fast_finalize_verdict(98.0);
+        assert_eq!(txt_98, "perfect (>=98%)");
+        let (_, _, txt_80) = fast_finalize_verdict(80.0);
+        assert_eq!(txt_80, "fine (>=80%) — slow path active");
+    }
+
+    #[test]
+    fn fast_finalize_verdict_colours_match_severity_ladder() {
+        // Green for perfect/OK, yellow for fine, red for sucks.
+        // Bold reserved for the top tier so the eye lands on
+        // "perfect" first when scanning the headline.
+        use ratatui::style::Color;
+        let (perfect, ..) = fast_finalize_verdict(99.0);
+        let (ok, ..) = fast_finalize_verdict(96.0);
+        let (fine, ..) = fast_finalize_verdict(85.0);
+        let (sucks, ..) = fast_finalize_verdict(50.0);
+        // Same green hue for perfect + OK; perfect is BOLD on top.
+        assert_eq!(perfect.fg, ok.fg);
+        assert!(perfect.add_modifier.contains(Modifier::BOLD));
+        assert!(!ok.add_modifier.contains(Modifier::BOLD));
+        // Distinct colours per band.
+        assert_ne!(ok.fg, fine.fg);
+        assert_ne!(fine.fg, sucks.fg);
+        // Red anchors "sucks" — operator's "this is bad" signal.
+        assert_eq!(sucks.fg, Some(Color::Red));
     }
 }
