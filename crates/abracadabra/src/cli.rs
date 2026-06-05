@@ -54,6 +54,18 @@ pub struct Cli {
     /// lies about their capabilities.
     #[arg(long, default_value_t = false)]
     pub no_truecolor: bool,
+
+    /// Force 24-bit RGB output, skipping the detection ladder.
+    ///
+    /// Use when the env-var ladder guessed wrong — e.g. running inside
+    /// `tmux` from a truecolor-capable outer terminal that does not
+    /// propagate `COLORTERM`, or any terminal whose advertisement is
+    /// conservative. Mutually exclusive with `--no-truecolor`; if both
+    /// are passed clap rejects the invocation. If neither is passed,
+    /// the detection ladder runs (with `NO_COLOR` honoured as the
+    /// no-color.org convention).
+    #[arg(long, default_value_t = false, conflicts_with = "no_truecolor")]
+    pub force_truecolor: bool,
 }
 
 /// Parse a duration string of the form `<NN>(s|m|h)` into seconds.

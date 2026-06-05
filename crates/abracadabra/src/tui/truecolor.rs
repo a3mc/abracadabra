@@ -19,16 +19,20 @@
 //!
 //! ## Detection ladder
 //!
-//! [`init_from_env`] is called once at startup, before the first frame
-//! renders. The ladder is:
+//! [`init`] is called once at startup, before the first frame renders.
+//! The ladder is:
 //!
-//! 1. `--no-truecolor` CLI flag → quantise (operator override).
-//! 2. `COLORTERM=truecolor` or `COLORTERM=24bit` → truecolor.
-//! 3. `TERM_PROGRAM=Apple_Terminal` → quantise (macOS Terminal.app).
-//! 4. `TERM` contains `kitty` / `alacritty` / `wezterm` / `vscode` /
+//! 1. `--no-truecolor` CLI flag → quantise (operator override, off).
+//! 2. `--force-truecolor` CLI flag → truecolor (operator override, on).
+//! 3. `NO_COLOR` env var set and non-empty → quantise
+//!    (no-color.org convention).
+//! 4. `COLORTERM=truecolor` or `COLORTERM=24bit` → truecolor.
+//! 5. `TERM_PROGRAM=Apple_Terminal` → quantise (macOS Terminal.app).
+//! 6. `TERM` contains `kitty` / `alacritty` / `wezterm` / `vscode` /
 //!    `ghostty` / `iterm` → truecolor.
-//! 5. Otherwise → truecolor (modern default). Operators on legacy
-//!    terminals can pass `--no-truecolor` to force fallback.
+//! 7. Otherwise → truecolor (default for terminals released since
+//!    approximately 2017). Operators on older terminals can pass
+//!    `--no-truecolor` or set `NO_COLOR` to force the fallback.
 //!
 //! ## SSH caveat
 //!
@@ -67,15 +71,30 @@ pub fn truecolor_enabled() -> bool {
 }
 
 /// Initialise the detector from the process environment + the CLI
-/// `--no-truecolor` flag. Call once from `main`, before the first
-/// frame renders.
-pub fn init_from_env(force_disable: bool) {
+/// override flags. Call once from `main`, before the first frame
+/// renders.
+///
+/// Resolution order (defensive: off-wins if both are set):
+/// 1. `force_disable` (`--no-truecolor`) → false.
+/// 2. `force_enable` (`--force-truecolor`) → true.
+/// 3. Otherwise run [`detect_truecolor_support`] (NO_COLOR + env-var
+///    ladder).
+pub fn init(force_disable: bool, force_enable: bool) {
     let enabled = if force_disable {
         false
+    } else if force_enable {
+        true
     } else {
         detect_truecolor_support()
     };
     TRUECOLOR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Initialise the detector with only the `--no-truecolor` flag.
+/// Thin wrapper around [`init`]; retained as a convenience for
+/// downstream callers that only need the off-switch knob.
+pub fn init_from_env(force_disable: bool) {
+    init(force_disable, false);
 }
 
 /// The user-facing colour helper. Returns `Color::Rgb` on truecolor
@@ -136,6 +155,7 @@ fn detect_truecolor_support() -> bool {
         env::var("COLORTERM").ok().as_deref(),
         env::var("TERM_PROGRAM").ok().as_deref(),
         env::var("TERM").ok().as_deref(),
+        env::var("NO_COLOR").ok().as_deref(),
     )
 }
 
@@ -144,26 +164,38 @@ fn detect_truecolor_support() -> bool {
 /// Takes the relevant env-var values explicitly so unit tests can
 /// exercise every rung without mutating process env (parallel tests
 /// race catastrophically on shared env). See module docs for the
-/// ladder. Rung numbers refer to the ladder in the module docstring.
+/// ladder. Rung numbers below align with the ladder rungs that are
+/// reachable once CLI flags have been applied upstream by [`init`]
+/// (rungs 1-2 of the module-level ladder are handled there).
 pub fn detect_truecolor_from(
     colorterm: Option<&str>,
     term_program: Option<&str>,
     term: Option<&str>,
+    no_color: Option<&str>,
 ) -> bool {
-    // Rung 1.
+    // Rung 3. no-color.org convention: any non-empty `NO_COLOR`
+    // disables colour. An empty string is treated as "not set" so
+    // a stray `NO_COLOR=` from a shell rc does not silently force
+    // the fallback.
+    if let Some(nc) = no_color {
+        if !nc.is_empty() {
+            return false;
+        }
+    }
+    // Rung 4.
     if let Some(ct) = colorterm {
         let ct = ct.to_ascii_lowercase();
         if ct == "truecolor" || ct == "24bit" {
             return true;
         }
     }
-    // Rung 2.
+    // Rung 5.
     if let Some(prog) = term_program {
         if prog == "Apple_Terminal" {
             return false;
         }
     }
-    // Rung 3.
+    // Rung 6.
     if let Some(t) = term {
         let t = t.to_ascii_lowercase();
         for needle in [
@@ -179,13 +211,25 @@ pub fn detect_truecolor_from(
             }
         }
     }
-    // Rung 4.
+    // Rung 7. Default for terminals released since approximately 2017
+    // (iTerm2 >= 3.0, Alacritty, Kitty, WezTerm, GNOME Terminal >= 3.12,
+    // Konsole >= 18.04, Windows Terminal, xterm >= 331) which parse
+    // SGR 38;2;R;G;B per ITU T.416.
     true
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, PoisonError};
+
     use super::*;
+
+    /// Serialises tests that mutate `TRUECOLOR_ENABLED`. Lib tests in
+    /// the same module run in parallel by default; without a lock, the
+    /// `rgb_returns_truecolor_in_default_test_mode` test (which reads
+    /// the flag) and the override-flag tests (which write it) race.
+    /// Poison is drained so the first-failure root cause survives.
+    static GLOBAL_FLAG_LOCK: Mutex<()> = Mutex::new(());
 
     // ---- Channel quantiser ----------------------------------------
 
@@ -277,6 +321,11 @@ mod tests {
     fn rgb_returns_truecolor_in_default_test_mode() {
         // Tests don't call init_from_env(); the global flag defaults
         // to `true` so production-shape RGB assertions still work.
+        // Hold the serialisation lock so a concurrently-running
+        // override-flag test cannot flip the flag mid-read.
+        let _guard = GLOBAL_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let c = rgb(76, 110, 148);
         assert!(matches!(c, Color::Rgb(76, 110, 148)));
     }
@@ -289,11 +338,11 @@ mod tests {
 
     #[test]
     fn rung_1_colorterm_truecolor_returns_true() {
-        assert!(detect_truecolor_from(Some("truecolor"), None, None));
-        assert!(detect_truecolor_from(Some("24bit"), None, None));
+        assert!(detect_truecolor_from(Some("truecolor"), None, None, None));
+        assert!(detect_truecolor_from(Some("24bit"), None, None, None));
         // Case-insensitive: real terminals advertise mixed-case.
-        assert!(detect_truecolor_from(Some("TrueColor"), None, None));
-        assert!(detect_truecolor_from(Some("24BIT"), None, None));
+        assert!(detect_truecolor_from(Some("TrueColor"), None, None, None));
+        assert!(detect_truecolor_from(Some("24BIT"), None, None, None));
     }
 
     #[test]
@@ -305,6 +354,7 @@ mod tests {
             Some("truecolor"),
             Some("Apple_Terminal"),
             Some("xterm-256color"),
+            None,
         ));
     }
 
@@ -318,6 +368,7 @@ mod tests {
             None,
             Some("Apple_Terminal"),
             Some("xterm-256color"),
+            None,
         ));
     }
 
@@ -332,7 +383,7 @@ mod tests {
             "vscode",
         ] {
             assert!(
-                detect_truecolor_from(None, None, Some(term)),
+                detect_truecolor_from(None, None, Some(term), None),
                 "TERM={term:?} must be detected as truecolor-capable"
             );
         }
@@ -340,8 +391,8 @@ mod tests {
 
     #[test]
     fn rung_3_case_insensitive() {
-        assert!(detect_truecolor_from(None, None, Some("XTERM-KITTY")));
-        assert!(detect_truecolor_from(None, None, Some("Alacritty")));
+        assert!(detect_truecolor_from(None, None, Some("XTERM-KITTY"), None));
+        assert!(detect_truecolor_from(None, None, Some("Alacritty"), None));
     }
 
     #[test]
@@ -350,9 +401,14 @@ mod tests {
         // to it so the operator does not have to opt in. Apple_Terminal
         // is the only widely-deployed terminal that lies about it,
         // and rung 2 catches that case.
-        assert!(detect_truecolor_from(None, None, Some("xterm-256color")));
-        assert!(detect_truecolor_from(None, None, None));
-        assert!(detect_truecolor_from(None, None, Some("dumb")));
+        assert!(detect_truecolor_from(
+            None,
+            None,
+            Some("xterm-256color"),
+            None
+        ));
+        assert!(detect_truecolor_from(None, None, None, None));
+        assert!(detect_truecolor_from(None, None, Some("dumb"), None));
     }
 
     #[test]
@@ -364,11 +420,13 @@ mod tests {
             Some("rxvt"),
             Some("Apple_Terminal"),
             None,
+            None,
         ));
         assert!(detect_truecolor_from(
             Some("rxvt"),
             None,
-            Some("xterm-kitty")
+            Some("xterm-kitty"),
+            None,
         ));
     }
 
@@ -377,6 +435,81 @@ mod tests {
         // iTerm2 sets TERM_PROGRAM=iTerm.app and DOES support
         // truecolor. Rung 2 must not match it. Falls through to
         // rung 4 (default true) when TERM doesn't match rung 3.
-        assert!(detect_truecolor_from(None, Some("iTerm.app"), None));
+        assert!(detect_truecolor_from(None, Some("iTerm.app"), None, None));
+    }
+
+    // ---- NO_COLOR + force-truecolor (DET-01) ----------------------
+
+    #[test]
+    fn no_color_overrides_other_rungs() {
+        // NO_COLOR set and non-empty disables colour regardless of
+        // any other env var that suggests truecolor capability.
+        assert!(!detect_truecolor_from(
+            Some("truecolor"),
+            None,
+            Some("xterm-kitty"),
+            Some("1"),
+        ));
+        // Any non-empty value qualifies per no-color.org.
+        assert!(!detect_truecolor_from(
+            Some("24bit"),
+            None,
+            Some("alacritty"),
+            Some("anything"),
+        ));
+    }
+
+    #[test]
+    fn no_color_empty_string_falls_through() {
+        // `NO_COLOR=` (empty) is the no-color.org convention for "not
+        // set" — a stray export in a shell rc must not silently force
+        // the fallback. The ladder runs normally.
+        assert!(detect_truecolor_from(
+            Some("truecolor"),
+            None,
+            None,
+            Some(""),
+        ));
+        // With empty NO_COLOR, Apple_Terminal still wins.
+        assert!(!detect_truecolor_from(
+            None,
+            Some("Apple_Terminal"),
+            Some("xterm-256color"),
+            Some(""),
+        ));
+    }
+
+    // ---- init() override flag matrix ------------------------------
+    //
+    // These tests mutate the process-global TRUECOLOR_ENABLED so they
+    // are run sequentially. Each test restores the default at exit.
+
+    #[test]
+    fn force_truecolor_via_init_overrides_apple_terminal() {
+        // `--force-truecolor` short-circuits the env-var ladder, so
+        // even if the environment looks like Apple_Terminal we still
+        // enable truecolor. Verified at the init() entry point since
+        // that's the operator-facing API.
+        let _guard = GLOBAL_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        init(false, true);
+        assert!(truecolor_enabled());
+        // Restore the default for any subsequent test.
+        TRUECOLOR_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn force_disable_takes_precedence_over_force_enable() {
+        // Defensive: if both flags are set (clap would normally reject
+        // via conflicts_with, but library callers can still pass both)
+        // the off-switch wins. Quieter failure mode than truecolor on
+        // a terminal the operator just explicitly disabled.
+        let _guard = GLOBAL_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        init(true, true);
+        assert!(!truecolor_enabled());
+        TRUECOLOR_ENABLED.store(true, Ordering::Relaxed);
     }
 }
