@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use time::OffsetDateTime;
 
+use crate::aggregator::MAX_LEADER_WINDOW_SPAN;
 use crate::parser::{Event, EventKind};
 
 use super::format::{percentiles_ms, stage_delta_us, TimingTable};
@@ -24,13 +25,6 @@ pub(super) const ROOT_TRAILING_SLOTS: u64 = 64;
 /// are treated as skip runs and excluded from cluster-cadence
 /// percentiles. Mirrors the same defence in [`crate::live::scenes::leader`].
 pub(super) const MAX_SLOT_GAP: u64 = 8;
-
-/// Maximum `end - start` we will accept on a `ProduceWindow` event
-/// before treating it as malformed (parser regression or upstream
-/// corruption). Solana leader windows are 4 slots; the leader pane
-/// uses the same upper bound — 8 slots is a generous ceiling that
-/// still catches anything outside Alpenglow's window range.
-const MAX_LEADER_WINDOW_SPAN: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub(super) struct SlotState {

@@ -418,6 +418,42 @@ mod tests {
     }
 
     #[test]
+    fn chain_pane_accepts_span_up_to_aggregator_max() {
+        // BUG-01 regression: the chain pane previously enforced its
+        // own `MAX_LEADER_WINDOW_SPAN = 8` while the aggregator and
+        // leader pane accepted spans up to 16. A valid `ProduceWindow`
+        // with `end - start == aggregator::MAX_LEADER_WINDOW_SPAN`
+        // must be admitted by the chain pane, not silently dropped.
+        use crate::aggregator::MAX_LEADER_WINDOW_SPAN;
+        let mut p = ChainPane::new();
+        let start = 100u64;
+        let end = start + MAX_LEADER_WINDOW_SPAN;
+        p.on_event(&mk(EventKind::ProduceWindow {
+            start,
+            end,
+            parent_slot: start.saturating_sub(1),
+            parent_hash: "x".into(),
+        }));
+        // Every slot in the window must have been upserted and
+        // flagged as our leader slot.
+        let expected_len = usize::try_from(end - start + 1).unwrap();
+        assert_eq!(
+            p.slots.len(),
+            expected_len,
+            "span = MAX_LEADER_WINDOW_SPAN must be admitted: got {} slots",
+            p.slots.len()
+        );
+        for slot in start..=end {
+            let s = p
+                .slots
+                .iter()
+                .find(|s| s.slot == slot)
+                .unwrap_or_else(|| panic!("slot {slot} missing from deque"));
+            assert!(s.we_are_leader, "slot {slot} not flagged ours");
+        }
+    }
+
+    #[test]
     fn skip_indeterminate_when_no_canonical_chain_yet() {
         let mut p = ChainPane::new();
         p.on_event(&mk(EventKind::VotingSkip { slot: 100 }));
