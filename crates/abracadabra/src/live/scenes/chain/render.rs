@@ -645,4 +645,67 @@ mod tests {
         let (ch, _) = wipe_cell('■', style, 0, 24, 0.8);
         assert_eq!(ch, ' ');
     }
+
+    #[test]
+    fn render_tx_stream_emits_slot_bar_count_per_row() {
+        // TEST-02: drive three BankFrozen events with distinct nonzero
+        // `signature_count` values, render the tx stream into a
+        // `TestBackend` buffer, walk the rows and assert each carries
+        // a slot-digit prefix, a bar glyph from `STREAM_BARS`, and the
+        // compact count text. Anchors row format against a regression
+        // that drops fields or reorders them.
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        let slots: [(u64, u64); 3] = [(535_914, 2_500), (535_921, 8_500), (535_928, 67_000)];
+        for (slot, sigs) in slots {
+            pane.on_event(&crate::parser::Event {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                kind: EventKind::BankFrozen {
+                    slot,
+                    hash: "h".into(),
+                    signature_count: sigs,
+                },
+            });
+        }
+        // Use a TestBackend wide enough for the stream's 14-cell
+        // budget plus a margin.
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 14, 3);
+        terminal.draw(|f| render_tx_stream(&pane, f, area)).unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+        // The stream walks the deque newest-first; row 0 = newest slot.
+        let expected_order: [(u64, u64, &str); 3] = [
+            (535_928, 67_000, "67k"),
+            (535_921, 8_500, "8k"),
+            (535_914, 2_500, "2k"),
+        ];
+        for (row_idx, (slot, _sigs, count_text)) in expected_order.iter().enumerate() {
+            let text = row_text(u16::try_from(row_idx).unwrap());
+            assert!(
+                text.contains(&slot.to_string()),
+                "row {row_idx} missing slot digits {slot}: {text:?}"
+            );
+            assert!(
+                text.contains(count_text),
+                "row {row_idx} missing compact count {count_text:?}: {text:?}"
+            );
+            // At least one of STREAM_BARS' filled glyphs must appear
+            // in the row.
+            assert!(
+                STREAM_BARS.iter().skip(1).any(|g| text.contains(*g)),
+                "row {row_idx} missing a bar glyph: {text:?}"
+            );
+        }
+    }
 }
