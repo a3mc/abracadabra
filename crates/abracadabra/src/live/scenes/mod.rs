@@ -370,4 +370,132 @@ mod tests {
         assert!(out.len() <= RECENT_CAPACITY);
         assert_eq!(cursor as usize, RECENT_CAPACITY + 50);
     }
+
+    // ---- TESTS-03: SceneEngine help-overlay public API -----------
+
+    #[test]
+    fn toggle_help_resets_scroll_asymmetrically_on_close() {
+        // Toggle open → scroll partway → toggle closed must reset
+        // scroll to 0 so the next open starts at the top. Toggle open
+        // (the symmetric direction) does NOT reset — the operator
+        // sometimes opens / dismisses / reopens to consult one
+        // section repeatedly, and forcing top each time would defeat
+        // the in-place re-open behaviour the spec doesn't require.
+        let mut e = SceneEngine::default_layout();
+        e.toggle_help();
+        assert!(e.help_visible());
+        e.scroll_help(20);
+        let after_scroll = e.help_scroll;
+        assert!(after_scroll > 0, "scroll should have advanced");
+        // Closing resets to 0.
+        e.toggle_help();
+        assert!(!e.help_visible());
+        assert_eq!(e.help_scroll, 0, "close must reset scroll to 0");
+        // Re-open: scroll stays at 0 (we just set it that way), and
+        // the next call to `scroll_help` advances from there.
+        e.toggle_help();
+        assert!(e.help_visible());
+        assert_eq!(e.help_scroll, 0, "re-open starts at top");
+    }
+
+    #[test]
+    fn scroll_help_is_no_op_when_help_hidden() {
+        // The scene engine's `step_scroll` already routes around
+        // `scroll_help` when help is hidden, but the helper itself
+        // must remain a no-op so a future re-route can't accidentally
+        // mutate `help_scroll` while the overlay is off-screen.
+        let mut e = SceneEngine::default_layout();
+        assert!(!e.help_visible());
+        assert_eq!(e.help_scroll, 0);
+        e.scroll_help(50);
+        assert_eq!(e.help_scroll, 0, "scroll_help must be a no-op when hidden");
+        e.scroll_help(i32::MAX);
+        assert_eq!(
+            e.help_scroll, 0,
+            "even saturating delta is a no-op when hidden"
+        );
+    }
+
+    #[test]
+    fn scroll_help_clamps_i32_extremes_without_panic() {
+        // The app-level `jump_top` / `jump_bottom` handlers pass
+        // `i32::MIN` / `i32::MAX` directly. The clamp must absorb
+        // these without panicking — the implementation lifts through
+        // `i64` for the add so the only failure mode is the final
+        // `usize::try_from`, which falls back to 0.
+        let mut e = SceneEngine::default_layout();
+        e.toggle_help();
+        assert!(e.help_visible());
+        // Bottom jump: clamps to `line_count() - 1`.
+        e.scroll_help(i32::MAX);
+        let max = e.help.line_count().saturating_sub(1);
+        assert_eq!(e.help_scroll, max);
+        // Top jump: clamps to 0.
+        e.scroll_help(i32::MIN);
+        assert_eq!(e.help_scroll, 0);
+    }
+
+    #[test]
+    fn render_swaps_tx_pressure_for_help_panel_when_help_visible() {
+        // Engine renders slot 4 (tx pressure) by default. When
+        // `help_visible` flips on, the same rect hosts the
+        // HelpPanel instead — no layout shift, just a content swap.
+        // Anchor: border title changes from ` tx pressure ` to
+        // ` help — press [h] to close `.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let mut e = SceneEngine::default_layout();
+        // Large enough for the canonical 6-slot composition: top row
+        // is `shred_ingress` (3 rows) + `slot_lifecycle` (3 rows),
+        // middle is `chain` / `leader` / `tx pressure` / `help`,
+        // bottom is decorations (3 rows).
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let area = Rect::new(0, 0, 160, 40);
+
+        terminal.draw(|f| e.render(f, area)).unwrap();
+        let frame_text: String = {
+            let buffer: &Buffer = terminal.backend().buffer();
+            (0..area.height)
+                .flat_map(|y| {
+                    (0..area.width)
+                        .map(move |x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                })
+                .collect()
+        };
+        assert!(
+            frame_text.contains("tx pressure"),
+            "default composition must render the tx-pressure pane",
+        );
+        assert!(
+            !frame_text.contains("press [h] to close"),
+            "help overlay must be hidden in the default composition",
+        );
+
+        // Now toggle help on and re-render the same area.
+        e.toggle_help();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| e.render(f, area)).unwrap();
+        let frame_text: String = {
+            let buffer: &Buffer = terminal.backend().buffer();
+            (0..area.height)
+                .flat_map(|y| {
+                    (0..area.width)
+                        .map(move |x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                })
+                .collect()
+        };
+        assert!(
+            frame_text.contains("press [h] to close"),
+            "help overlay must render its title when toggled on",
+        );
+        assert!(
+            !frame_text.contains("tx pressure"),
+            "tx-pressure pane must be replaced (no layout shift, same rect): \
+             frame_text head={:?}",
+            &frame_text[..200.min(frame_text.len())],
+        );
+    }
 }
