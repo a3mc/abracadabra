@@ -863,4 +863,117 @@ mod tests {
              {collected:?}"
         );
     }
+
+    #[test]
+    fn render_paints_border_title_slot_chip_cannon_and_non_blank_bucket() {
+        // TESTS-01: chain pane is the visual centrepiece; pin the
+        // load-bearing parts of `render` against a TestBackend so a
+        // regression that drops the title, the cannon glyph, the slot
+        // chip, or leaves the bucket blank is caught at build time.
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        // Drive a handful of canonical-fast slots so the bucket has
+        // cells to paint (filled glyphs land at the bottom rows).
+        for slot in 100u64..104 {
+            pane.on_event(&crate::parser::Event {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                kind: EventKind::Block {
+                    slot,
+                    hash: "h".into(),
+                    parent_slot: slot - 1,
+                    parent_hash: "p".into(),
+                },
+            });
+            pane.on_event(&crate::parser::Event {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                kind: EventKind::Finalized {
+                    slot,
+                    hash: "h".into(),
+                    fast: true,
+                },
+            });
+        }
+        // Drive a tick so the cannon advances pending particles into
+        // the bucket. Without this the bucket stays empty even when
+        // the slot deque has finalized entries.
+        let now = Instant::now() + std::time::Duration::from_secs(1);
+        pane.cannon.tick(now);
+
+        // Frame the pane in a 80×20 area: wide enough for the default
+        // 50-col bucket + 14-col tx stream + breathing room. Inner is
+        // 78×18 after the 1-row border deduction.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let area = Rect::new(0, 0, 80, 20);
+        terminal.draw(|f| super::render(&pane, f, area)).unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+
+        // Border title `chain` lives on row 0.
+        assert!(
+            row_text(0).contains("chain"),
+            "top border missing `chain` title: {:?}",
+            row_text(0)
+        );
+
+        // The cannon glyph ▼ must appear somewhere inside the inner
+        // area. Walk every cell looking for it.
+        let cannon_found = (1..(area.height - 1)).any(|y| row_text(y).contains(CANNON_GLYPH));
+        assert!(cannon_found, "cannon glyph ▼ missing from rendered frame");
+
+        // The slot chip carries the tip slot number; one of the
+        // top-area rows (between status chips and the cannon) must
+        // include `103` (last finalized).
+        let tip_found = (1..(area.height - 1)).any(|y| row_text(y).contains("103"));
+        assert!(tip_found, "slot chip missing tip slot 103");
+
+        // The bucket should have non-blank cells in its area. The
+        // bucket is bottom-aligned in viz, so look at the last few
+        // inner rows. At least one filled bucket glyph (■, ◐, ○, ★,
+        // ▴, ▾, ⊕) must appear.
+        let bucket_glyphs = ['■', '◐', '○', '★', '▴', '▾', '⊕'];
+        let bucket_has_content =
+            (1..(area.height - 1)).any(|y| row_text(y).chars().any(|c| bucket_glyphs.contains(&c)));
+        assert!(
+            bucket_has_content,
+            "bucket area has no filled glyphs after 4 canonical-fast \
+             slots were finalised and the cannon tick advanced",
+        );
+    }
+
+    #[test]
+    fn render_returns_early_without_panic_on_narrow_area() {
+        // TESTS-01: narrow-area guard. `render` early-returns when
+        // `inner.width < 24 || inner.height < 4`. Drive both branches
+        // and confirm no panic.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let pane = ChainPane::new();
+
+        // Narrow width: 10×20 area → inner width 8 < 24.
+        let mut terminal = Terminal::new(TestBackend::new(10, 20)).unwrap();
+        let narrow = Rect::new(0, 0, 10, 20);
+        terminal.draw(|f| super::render(&pane, f, narrow)).unwrap();
+
+        // Short height: 80×5 area → inner height 3 < 4.
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        let short = Rect::new(0, 0, 80, 5);
+        terminal.draw(|f| super::render(&pane, f, short)).unwrap();
+
+        // Zero-size: 0×0 area → block.inner returns zero-size inner,
+        // first early-return branch handles it.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let zero = Rect::new(0, 0, 0, 0);
+        terminal.draw(|f| super::render(&pane, f, zero)).unwrap();
+    }
 }
