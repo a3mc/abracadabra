@@ -22,13 +22,13 @@
 //! scales them at render time so the system is layout-agnostic —
 //! resizing the terminal does not break the trajectories.
 
+use std::time::Instant;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-
-use std::time::Instant;
 
 use crate::live::animation::spinner_frame;
 use crate::tui::theme;
@@ -212,7 +212,11 @@ fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     }
     render_particles(pane, frame, viz);
     let bucket_area = compute_bucket_area(viz);
-    render_bucket(pane, frame, bucket_area, Instant::now());
+    // BUG-03: read the simulation clock from the tick rather than
+    // wall-clock — the cannon's `last_tick` is what advanced particle
+    // positions and started/completed any wipe, so visual progress
+    // stays aligned with the simulation.
+    render_bucket(pane, frame, bucket_area, pane.cannon.last_tick());
     let stream_area = compute_tx_stream_area(viz, bucket_area);
     render_tx_stream(pane, frame, stream_area);
 }

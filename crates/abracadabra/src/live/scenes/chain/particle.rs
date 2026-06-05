@@ -272,6 +272,14 @@ impl CannonSystem {
         let total = WIPE_DURATION.as_secs_f32();
         Some((elapsed / total).clamp(0.0, 1.0))
     }
+
+    /// Most recent tick instant. Render paths read this to keep
+    /// visual time aligned with the simulation clock: the tick
+    /// already advanced particles and started/completed wipes, so
+    /// reading wall-clock in render would drift by up to one frame.
+    pub(super) const fn last_tick(&self) -> Instant {
+        self.last_tick
+    }
 }
 
 impl Default for CannonSystem {
