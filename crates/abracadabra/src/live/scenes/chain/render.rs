@@ -372,17 +372,16 @@ fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now
 /// - **count** — bold white compact integer (`67k`-style). Aligned
 ///   right inside whatever cells remain after slot + bar + spacing.
 ///
-/// **Zero-sig filter.** Empirically (24h capture against this
-/// validator's log) only ~9 % of bank-frozen slots carry a nonzero
-/// `signature_count` — the other 89 % are `signature_count: 0` and
-/// look identical to "no data yet" in a per-row stream. Surfacing
-/// them as `0` rows leaves the stream noisy with empty blocks and
-/// hides the operationally interesting (nonzero) blocks below them.
-/// The time-series tx-pressure card aggregates across 10-minute
-/// buckets so the few nonzero spikes dominate the rate; here, with
-/// row-per-slot granularity, the filter is the equivalent operator
-/// signal. Slot-numbers in the stream may therefore be sparse — that
-/// gap is the data, not a render bug.
+/// **Zero-sig filter.** In observed captures against this validator
+/// most bank-frozen slots carry `signature_count: 0`, with only a
+/// minority of slots carrying nonzero counts. Zero-sig rows look
+/// identical to "no data yet" in a per-row stream and would dominate
+/// the visible rows, hiding the operationally interesting nonzero
+/// blocks below them. The time-series tx-pressure card aggregates
+/// across 10-minute buckets so the few nonzero spikes dominate the
+/// rate; here, with row-per-slot granularity, the filter is the
+/// equivalent operator signal. Slot-numbers in the stream may
+/// therefore be sparse — that gap is the data, not a render bug.
 fn render_tx_stream(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
     if area.width < TX_STREAM_MIN_WIDTH || area.height == 0 {
         return;

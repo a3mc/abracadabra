@@ -43,7 +43,8 @@
 //!
 //! ```text
 //!  [✓] 1234567   45ms  12k   393ms 3k  16k    ← produced
-//!  [A] 1234568   PohRecorder(WindowMovedOn(…))  ← abandoned (verbatim reason)
+//!  [A] 1234568   —ms   —    —ms   —   —       ← abandoned (stats: no metric)
+//!      ⚠ skipped — PoH past slot 1234568      ← card footer, once per window
 //! ```
 //!
 //! Bank time per slot is read directly from the validator's
@@ -97,8 +98,8 @@ impl Pane for LeaderPane {
 #[cfg(test)]
 mod tests {
     use super::format::{
-        bank_ms, broadcast_ms, format_count_compact, slot_detail_compact, CARD_ROW_WIDTH,
-        COLUMN_HEADER, DETAIL_WIDTH,
+        bank_ms, broadcast_ms, format_count_compact, slot_detail_compact, summarize_abandon_reason,
+        CARD_ROW_WIDTH, COLUMN_HEADER, DETAIL_WIDTH,
     };
     use super::render::{
         card_alert_line, card_slot_line, slot_icon, MIN_ONE_CARD_WIDTH, MIN_TWO_CARD_WIDTH,
@@ -221,14 +222,15 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_slot_renders_a_icon_and_verbatim_reason_in_row_body() {
-        // DEAD-01 regression: `abandoned_reason` must be surfaced in
-        // the per-slot row. Pure-abandoned slot (no skip vote): icon
-        // is `[A]`, body is the verbatim reason text, NOT the
-        // `bank/sigs/bcast/sh/fin` placeholder columns.
-        // Short reason chosen so it fits inside `DETAIL_WIDTH` and the
-        // verbatim-substring assertion holds without colliding with
-        // the NIT-01 truncation path.
+    fn abandoned_slot_renders_a_icon_and_stats_columns_in_row_body() {
+        // Pure-abandoned slot (no skip vote): icon is `[A]` and the
+        // per-slot row still carries the `bank/sigs/bcast/sh/tx` data
+        // columns (rendered as `—` placeholders when no metric arrived).
+        // The verbatim abandon reason does NOT appear in the row body
+        // — it surfaces once at the card alert footer instead, so a
+        // 9-digit mainnet slot in the reason text cannot eat the stats
+        // columns and the four otherwise-identical rows do not repeat
+        // the same string four times.
         let mut p = LeaderPane::new();
         p.on_event(&mk(pw(100, 103)));
         p.on_event(&mk(EventKind::UnableToProduceWindow {
@@ -242,35 +244,28 @@ mod tests {
             text.contains("[A]"),
             "abandoned row missing [A] icon: {text:?}"
         );
+        // Stats columns must still render — `bank` and `bcast` both
+        // surface as `—ms` placeholders when no metric datapoint arrived.
         assert!(
-            text.contains("WindowMovedOn(103)"),
-            "abandoned row missing verbatim reason: {text:?}"
+            text.contains("—ms"),
+            "abandoned row dropped stats placeholder columns: {text:?}"
         );
-        // Placeholder columns must not appear — the reason replaces them.
         assert!(
-            !text.contains("—ms"),
-            "abandoned row leaked placeholder columns: {text:?}"
+            !text.contains("WindowMovedOn"),
+            "abandoned reason must not appear in row body (moved to footer): {text:?}"
         );
     }
 
     #[test]
-    fn skip_then_abandon_renders_cross_icon_with_verbatim_reason() {
-        // LBL-02 regression: skip-vote precedence wins for the icon
-        // ([✗]) but the abandon reason must still render in the row
-        // body. Both signals stay visible; neither suppresses the
-        // other. This is the empirically common case for windows
-        // where skip-fallback votes arrive before the
-        // `Unable to produce window` ERROR line.
+    fn skip_then_abandon_renders_cross_icon_with_stats_columns() {
+        // Skip-vote precedence wins for the icon ([✗]) and the row
+        // still renders the data columns. The verbatim abandon reason
+        // is surfaced once at the card alert footer, never per-row.
         let mut p = LeaderPane::new();
         p.on_event(&mk(pw(100, 103)));
-        // Skip votes arrive first on every slot.
         for slot in 100..=103 {
             p.on_event(&mk(EventKind::VotingSkipFallback { slot }));
         }
-        // Then the abandon ERROR fires for the whole window. Short
-        // reason chosen so it fits inside `DETAIL_WIDTH` and the
-        // verbatim-substring assertion holds without colliding with
-        // the NIT-01 truncation path.
         p.on_event(&mk(EventKind::UnableToProduceWindow {
             start: 100,
             end: 103,
@@ -279,8 +274,6 @@ mod tests {
         let s = &p.windows[0].slots[0];
         // Status remains Skipped (skip-vote precedence).
         assert!(matches!(s.status(), SlotOutcome::Skipped { .. }));
-        // But the rendered row carries BOTH the [✗] icon AND the
-        // verbatim reason text — the dual-channel design.
         let line = card_slot_line(s);
         let text = line_text(&line);
         assert!(
@@ -292,43 +285,119 @@ mod tests {
             "skip+abandon row must not use [A] icon: {text:?}"
         );
         assert!(
-            text.contains("WindowMovedOn(103)"),
-            "skip+abandon row missing verbatim reason: {text:?}"
+            text.contains("—ms"),
+            "skip+abandon row dropped stats placeholder columns: {text:?}"
+        );
+        assert!(
+            !text.contains("WindowMovedOn"),
+            "skip+abandon row must not embed the abandon reason: {text:?}"
         );
     }
 
     #[test]
-    fn abandoned_reason_truncates_at_detail_width_with_ellipsis() {
-        // NIT-01 regression: a 9-digit slot in the reason text
-        // (mainnet-scale) overflows `DETAIL_WIDTH = 32` by 3 cells and
-        // would spill past the card boundary in a two-card layout. The
-        // render path now truncates to `DETAIL_WIDTH - 1` and appends
-        // `…`.
+    fn summarize_abandon_reason_pattern_matches_observed_solana_variants() {
+        // The summarizer must round-trip every variant the operator's
+        // log empirically contains. Inputs below are real strings
+        // observed in log captures against this validator. Every
+        // abandon observed so far has been `WindowMovedOn(N)` with
+        // `N` equal to the window's last slot; the `MaxHeightReached`
+        // variant has not been observed but is kept because it is
+        // documented in Solana source and we want a sensible label
+        // if it ever fires; if Solana emits a new variant we fall
+        // through to verbatim rather than silently losing it.
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(WindowMovedOn(336507))"),
+            "PoH moved on"
+        );
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(WindowMovedOn(282583))"),
+            "PoH moved on"
+        );
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(MaxHeightReached)"),
+            "max height reached"
+        );
+        // Other PohRecorder variants — wrapper stripped, inner kept.
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(SomeNewVariant)"),
+            "SomeNewVariant"
+        );
+        // Anything outside the PohRecorder wrap is passed through so
+        // future non-PoH reason families are still legible.
+        assert_eq!(
+            summarize_abandon_reason("SomeFutureError"),
+            "SomeFutureError"
+        );
+    }
+
+    #[test]
+    fn poh_window_moved_on_summarises_to_short_phrase_in_footer() {
+        // Solana's `Unable to produce window` log emits the `Debug`
+        // form of a PohRecorder error. The footer translates the only
+        // variant observed in capture — `WindowMovedOn(N)` — to a
+        // short phrase. The slot `N` has always equalled the window's
+        // last slot in every abandon observed so far, so we do NOT
+        // echo it in the footer: the slot is already on screen in the
+        // last row's slot column. Solana's own log line reads
+        // "skipping window: <reason>"; we mirror that with "skipped"
+        // and never use the internal-only "abandoned" vocabulary.
         let mut p = LeaderPane::new();
         p.on_event(&mk(pw(300_123_456, 300_123_459)));
         p.on_event(&mk(EventKind::UnableToProduceWindow {
             start: 300_123_456,
             end: 300_123_459,
-            reason: "PohRecorder(WindowMovedOn(300123456))".into(),
+            reason: "PohRecorder(WindowMovedOn(300123459))".into(),
         }));
-        let line = card_slot_line(&p.windows[0].slots[0]);
-        let text = line_text(&line);
-        // The reason body span (everything after the icon + slot field)
-        // must fit DETAIL_WIDTH.
-        let reason_span = line
-            .spans
-            .last()
-            .expect("card_slot_line emits at least one span");
-        let reason_len = reason_span.content.chars().count();
+        let w = &p.windows[0];
+        let footer = card_alert_line(w).expect("footer must fire for an abandoned window");
+        let footer_text = line_text(&footer);
         assert!(
-            reason_len <= DETAIL_WIDTH,
-            "abandoned reason span {reason_len} chars exceeds DETAIL_WIDTH {DETAIL_WIDTH}: \
-             {text:?}",
+            footer_text.contains("skipped — PoH moved on"),
+            "footer should read 'skipped — PoH moved on' for WindowMovedOn: {footer_text:?}"
         );
-        // Truncated body ends with the ellipsis sentinel.
         assert!(
-            reason_span.content.ends_with('…'),
-            "truncated reason should end with ellipsis: {text:?}",
+            !footer_text.contains("PohRecorder"),
+            "footer must not leak raw error Debug output: {footer_text:?}"
+        );
+        assert!(
+            !footer_text.contains("300123459"),
+            "footer must not echo the redundant WindowMovedOn slot — \
+             the row already shows it: {footer_text:?}"
+        );
+        assert!(
+            !footer_text.contains("abandoned"),
+            "footer must use Solana 'skipped' vocabulary, not 'abandoned': {footer_text:?}"
+        );
+    }
+
+    #[test]
+    fn drops_counter_footer_uses_descriptive_label_not_bare_drops() {
+        // The `num_dropped_on_capacity` field, per the parser's own
+        // docstring, counts "txns the scheduler had to drop because
+        // its buffer was full". The footer label says exactly that —
+        // not the bare "drops" mnemonic the operator complained
+        // about, and not a vague "over capacity" that obscures which
+        // capacity. Observed values on this validator have stayed
+        // well under the `Nk` compaction threshold; this test uses a
+        // deliberately small value so the assertion shape matches
+        // everyday operation.
+        let mut p = LeaderPane::new();
+        p.on_event(&mk(pw(100, 103)));
+        p.on_event(&mk(EventKind::Metric(MetricEvent::BankingStageCounts {
+            slot: 100,
+            num_dropped_on_capacity: 187,
+            num_finished: 0,
+        })));
+        let footer = card_alert_line(&p.windows[0])
+            .expect("footer must fire on nonzero num_dropped_on_capacity");
+        let text = line_text(&footer);
+        assert!(
+            text.contains("187 tx dropped (scheduler full)"),
+            "drops segment should read '187 tx dropped (scheduler full)': {text:?}"
+        );
+        assert!(
+            !text.contains("drops "),
+            "footer must not use the bare 'drops' mnemonic: {text:?}"
         );
     }
 
@@ -623,7 +692,7 @@ mod tests {
     #[test]
     fn alert_footer_labels_bad_handover_not_sad() {
         // UX-05: the display label was `sad` (opaque Solana metric
-        // name) and is now `bad-handover`. Underlying field name
+        // name) and is now `bad handover`. Underlying field name
         // stays `leader_handover_sad` so grep parity holds.
         let mut p = LeaderPane::new();
         p.on_event(&mk(pw(100, 103)));
@@ -635,8 +704,8 @@ mod tests {
         let line = card_alert_line(&p.windows[0]).expect("alert footer should fire");
         let text = line_concat_text(&line);
         assert!(
-            text.contains("bad-handover 1"),
-            "footer missing `bad-handover`: {text:?}"
+            text.contains("1 bad handover"),
+            "footer missing `bad handover`: {text:?}"
         );
         assert!(
             !text.contains("sad "),

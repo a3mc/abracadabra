@@ -32,7 +32,9 @@ use super::state::OurSlot;
 /// - `[A]` Abandoned — `Unable to produce window` ERROR, no skip vote
 ///   on the slot. When a slot has both a skip vote AND `Unable to
 ///   produce window` covering it, the icon is `[✗]` (skip-vote
-///   precedence) but the row body shows the verbatim abandon reason.
+///   precedence). The verbatim abandon reason renders once in the
+///   card's alert footer (see `super::render::card_alert_line`), not
+///   in the per-slot row body.
 /// - `[ ]` Pending.
 ///
 /// Column `tx` is `banking_stage_scheduler_slot_counts.num_finished` —
@@ -167,6 +169,50 @@ fn write_compacted_count(out: &mut String, n: Option<u64>, width: usize) {
         }
     }
     let _ = write!(out, "{token:>width$}");
+}
+
+/// Translate the verbatim `Unable to produce window … skipping
+/// window: <reason>` trailer into a short operator-meaningful phrase.
+///
+/// The raw reason is Solana's `Debug` output of the underlying error
+/// (in practice always a `PohRecorder` variant). Printing it verbatim
+/// eats the half-card width (~44 cells) and tells the operator nothing
+/// they can act on. We pattern-match the variants Solana actually
+/// emits on this path and emit only what is not already on screen:
+///
+/// - `PohRecorder(WindowMovedOn(N))` — PoH was already past our
+///   leader window when `block_creation_loop` tried to insert. The
+///   `N` value has always equalled the window's last slot in every
+///   abandon observed so far — i.e. it duplicates the slot the
+///   operator can already read off the last row's slot column.
+///   Surfaced as just `PoH moved on`; if a future Solana version
+///   starts emitting an `N` that differs from the window's last
+///   slot, the formatter does not catch that — operators will still
+///   see [A] icons in the rows and the slot range in the title. The
+///   honest cost is compactness over an edge case nobody has
+///   observed.
+/// - `PohRecorder(MaxHeightReached)` — produced max possible blocks
+///   in the window. Surfaced as `max height reached`. Never observed
+///   in capture, kept for legibility if it ever fires.
+/// - Any other `PohRecorder(...)` variant — wrap stripped, inner text
+///   kept verbatim so an unrecognized PoH error is still legible.
+/// - Any other reason — passed through verbatim. Future Solana
+///   versions may introduce non-PoH reasons; the pass-through
+///   guarantees we don't silently lose them.
+pub(super) fn summarize_abandon_reason(reason: &str) -> String {
+    if reason.starts_with("PohRecorder(WindowMovedOn(") && reason.ends_with("))") {
+        return "PoH moved on".to_owned();
+    }
+    if reason == "PohRecorder(MaxHeightReached)" {
+        return "max height reached".to_owned();
+    }
+    if let Some(inner) = reason
+        .strip_prefix("PohRecorder(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        return inner.to_owned();
+    }
+    reason.to_owned()
 }
 
 /// Render a compact count for the headline (`sig max`, `sh max`).

@@ -15,8 +15,8 @@ use crate::live::animation::spinner_frame;
 use crate::tui::theme;
 
 use super::format::{
-    format_count_compact, slot_detail_compact, CARD_ROW_WIDTH, COLUMN_HEADER, DETAIL_WIDTH,
-    SLOT_FIELD_WIDTH,
+    format_count_compact, slot_detail_compact, summarize_abandon_reason, CARD_ROW_WIDTH,
+    COLUMN_HEADER, SLOT_FIELD_WIDTH,
 };
 use super::state::{LeaderPane, OurSlot, OurWindow, SlotOutcome};
 
@@ -217,81 +217,113 @@ fn render_card(frame: &mut Frame<'_>, area: Rect, w: &OurWindow) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Per-card footer that surfaces nonzero counts from three
-/// `solana_metrics::metrics` datapoint fields, summed across the
-/// window's slots. Returns `None` when every counter across every
-/// slot in the window is zero — silence is the correct default for
-/// a healthy window.
+/// Per-card footer summarising any operationally significant events
+/// across the window's slots. Returns `None` when nothing fired — a
+/// silent footer is the correct default for a healthy window.
 ///
-/// **Threshold = 1.** Any nonzero count surfaces the footer. The
-/// underlying fields are all operationally interesting at any nonzero
-/// value (a single dropped transaction or a single replay lag is a
-/// real signal on a leader slot), so the noise/signal trade favors
-/// surfacing low values. If empirical operation later shows this is
-/// too noisy, raise per-field thresholds rather than gating on the
-/// aggregate.
+/// All copy uses Solana's own vocabulary so an operator who knows the
+/// validator logs reads the footer the same way they read the source.
+/// The verbatim raw values from `solana_metrics::metrics` datapoints
+/// are translated into short, in-width phrases; nothing is the raw
+/// `Debug` output of a Solana error type.
 ///
-/// Mnemonics map to verbatim datapoint field names:
+/// Segments emitted in priority order, joined by ` · `:
 ///
-/// - `drops` — `banking_stage_scheduler_slot_counts.num_dropped_on_capacity`.
-///   Banking-stage scheduler dropped transactions because the per-slot
-///   capacity was exhausted. Summed across the window's slots.
-/// - `bad-handover` — `slot-metrics.leader_handover_sad`. Validator's
-///   own 1/0 flag on a bad handover from the prior leader. Counted as
-///   `1` per slot it fired (so the value is "slots in this window
-///   with a bad handover"). Display label is descriptive; the source
-///   field name stays `leader_handover_sad` for grep parity.
-/// - `behind` — `slot-metrics.replay_is_behind_count`. Number of
-///   times replay lagged during the slot. Summed across the window's
-///   slots.
+/// - **`skipped — <reason>`** — first non-empty `abandoned_reason`
+///   across the window's slots, translated by
+///   [`summarize_abandon_reason`]. Solana's log line for this event
+///   reads "skipping window: <reason>"; we match that phrasing. The
+///   four slots of one abandon ERROR share the reason, so taking the
+///   first is both correct and dedupes the otherwise-identical text.
+///   Every abandon observed against this validator so far has been
+///   `PohRecorder(WindowMovedOn(N))`, surfaced here as
+///   `PoH moved on`. Other variants are documented at the summarizer.
+/// - **`<n> tx dropped (scheduler full)`** — sum of
+///   `banking_stage_scheduler_slot_counts.num_dropped_on_capacity`
+///   across the window. The verbatim parser comment on that field
+///   reads "txns the scheduler had to drop because its buffer was
+///   full". `n` formatted via [`format_count_compact`] (`Nk` past
+///   1 000); observed values on this validator have stayed under the
+///   compaction threshold so the typical render is one or two
+///   digits.
+/// - **`<n> bad handover`** — count of slots in this window whose
+///   `slot-metrics.leader_handover_sad` field was set (1/0 per slot,
+///   set→1). Not yet observed against this validator; kept so a
+///   real event in the future does not pass silently.
+/// - **`<n> replay lag`** — sum of `slot-metrics.replay_is_behind_count`
+///   across the window — the number of times replay reported it was
+///   behind during the leader slot. Not yet observed against this
+///   validator.
+///
+/// **Threshold = 1.** Any nonzero count fires its segment. The
+/// underlying datapoints are operationally interesting at any nonzero
+/// value on a leader slot. If empirical operation shows specific
+/// fields are too noisy, raise per-field thresholds rather than
+/// aggregating.
 pub(super) fn card_alert_line(w: &OurWindow) -> Option<Line<'static>> {
     let mut drops = 0u64;
     let mut bad_handover = 0u64;
     let mut behind = 0u64;
+    let mut abandoned_reason: Option<&str> = None;
     for s in &w.slots {
         drops = drops.saturating_add(s.num_dropped_on_capacity.unwrap_or(0));
         if s.leader_handover_sad == Some(true) {
             bad_handover = bad_handover.saturating_add(1);
         }
         behind = behind.saturating_add(s.replay_is_behind_count.unwrap_or(0));
+        if abandoned_reason.is_none() {
+            abandoned_reason = s.abandoned_reason.as_deref();
+        }
     }
-    if drops == 0 && bad_handover == 0 && behind == 0 {
+    if drops == 0 && bad_handover == 0 && behind == 0 && abandoned_reason.is_none() {
         return None;
     }
     let warn = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let label = Style::default().fg(Color::Red);
+    let sep = Style::default().fg(Color::Red);
     let mut spans = vec![Span::styled("    ⚠ ", warn)];
     let mut first = true;
-    for (n, name) in [
-        (drops, "drops"),
-        (bad_handover, "bad-handover"),
-        (behind, "behind"),
+    let mut push_segment = |spans: &mut Vec<Span<'static>>, body: String| {
+        if !first {
+            spans.push(Span::styled("  ·  ", sep));
+        }
+        spans.push(Span::styled(body, warn));
+        first = false;
+    };
+    if let Some(reason) = abandoned_reason {
+        push_segment(
+            &mut spans,
+            format!("skipped — {}", summarize_abandon_reason(reason)),
+        );
+    }
+    for (n, label_text) in [
+        (drops, "tx dropped (scheduler full)"),
+        (bad_handover, "bad handover"),
+        (behind, "replay lag"),
     ] {
         if n == 0 {
             continue;
         }
-        if !first {
-            spans.push(Span::styled("  ·  ", label));
-        }
-        spans.push(Span::styled(format!("{name} {n}"), warn));
-        first = false;
+        push_segment(
+            &mut spans,
+            format!("{} {label_text}", format_count_compact(n)),
+        );
     }
     Some(Line::from(spans))
 }
 
-/// Per-slot row. Dual-channel design:
+/// Per-slot row. The data columns (`bank · sigs · bcast · sh · tx`)
+/// render unconditionally — the operator needs them on every row,
+/// including abandoned slots where partial production work may have
+/// landed (e.g. banked locally before PoH moved on).
 ///
-/// - The **icon** comes from [`OurSlot::status`] — skip-vote
-///   precedence wins over abandoned (a locally banked fork is still
-///   protocol-skipped, and the network-side skip vote is the right
-///   single-glyph signal). So a slot with both a `Voting skip` AND
-///   an `Unable to produce window` covering it renders `[✗]`.
-/// - The **detail body** independently checks `abandoned_at` — if
-///   set and a verbatim `abandoned_reason` is recorded, it replaces
-///   the `bank/sigs/bcast/sh/fin` column row with that reason text.
-///   This way both pieces of evidence stay visible: the protocol
-///   category from the icon, and the validator's own stated reason
-///   from the row body. Neither suppresses the other.
+/// The verbatim `abandoned_reason` is surfaced once at the card
+/// footer rather than per-row, both to free the column space for
+/// stats and to dedupe the reason text across the 4 affected slots.
+/// See [`card_alert_line`] for the footer integration.
+///
+/// The status icon still carries the protocol category: `[A]` for
+/// pure abandoned (no skip vote cast), `[✗]` for slots where we
+/// voted skip (with or without the window also being abandoned).
 pub(super) fn card_slot_line(s: &OurSlot) -> Line<'static> {
     let (icon, icon_style) = slot_icon(s.status());
     let slot_field = format!("{:>w$}", s.slot, w = SLOT_FIELD_WIDTH);
@@ -305,28 +337,7 @@ pub(super) fn card_slot_line(s: &OurSlot) -> Line<'static> {
         Span::raw(" "),
         Span::styled(slot_field, theme::value_style()),
     ];
-    if let (Some(_), Some(reason)) = (s.abandoned_at, s.abandoned_reason.as_deref()) {
-        // Two-space gap mirrors the leading padding of `slot_detail_compact`
-        // (a 5-col `BANK_MS_FIELD_WIDTH` field holding a 3-digit value
-        // starts with two spaces). Keeps the column-header / icon /
-        // slot-field prefix alignment stable across both row variants.
-        // NIT-01: cap the reason body to `DETAIL_WIDTH` so mainnet-scale
-        // slot numbers in the reason text (e.g.
-        // `PohRecorder(WindowMovedOn(300123456))` at 33 chars + 2-space
-        // prefix) cannot spill past the card column into the right
-        // card. Truncated reasons end with `…`; the slot column already
-        // shows the slot number directly.
-        let body = format!("  {reason}");
-        let body = if body.chars().count() > DETAIL_WIDTH {
-            let truncated: String = body.chars().take(DETAIL_WIDTH.saturating_sub(1)).collect();
-            format!("{truncated}…")
-        } else {
-            body
-        };
-        spans.push(Span::styled(body, theme::bad_style()));
-    } else {
-        spans.push(Span::styled(slot_detail_compact(s), theme::label_style()));
-    }
+    spans.push(Span::styled(slot_detail_compact(s), theme::label_style()));
     Line::from(spans)
 }
 
@@ -341,9 +352,9 @@ pub(super) fn card_slot_line(s: &OurSlot) -> Line<'static> {
 ///
 /// Both use `theme::bad_style()` (red, BOLD); the glyph carries the
 /// semantic difference. A slot with both signals shows `[✗]` (the
-/// skip-vote precedence in [`OurSlot::status`]) but the row body
-/// still surfaces the verbatim `abandoned_reason` — see
-/// [`card_slot_line`] for that dual-channel render.
+/// skip-vote precedence in [`OurSlot::status`]); the verbatim
+/// `abandoned_reason` is surfaced once at the card footer rather
+/// than per-row — see [`card_alert_line`].
 pub(super) fn slot_icon(status: SlotOutcome) -> (&'static str, Style) {
     let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     match status {
