@@ -1,6 +1,6 @@
 //! Per-slot classifier — turns a `SlotState` (plus the pane's
 //! canonical-slot projection) into a glyph + colour pair used by
-//! both the matrix renderer (for landed cells) and the particle
+//! both the bucket renderer (for landed cells) and the particle
 //! renderer (for in-flight slots).
 //!
 //! Vocabulary mirrors the event log of the pre-LIVE-39 chain pane so

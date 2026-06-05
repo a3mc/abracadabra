@@ -267,7 +267,7 @@ impl CannonSystem {
     }
 
     /// Wipe progress in `[0.0, 1.0]` when active. `None` when no
-    /// wipe is in progress. Used by the matrix renderer to drive the
+    /// wipe is in progress. Used by the bucket renderer to drive the
     /// left-to-right sweep flash.
     pub(super) fn wipe_progress(&self, now: Instant) -> Option<f32> {
         let start = self.wipe_started_at?;

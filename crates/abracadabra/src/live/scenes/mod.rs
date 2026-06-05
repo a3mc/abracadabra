@@ -54,8 +54,10 @@ pub struct SceneEngine {
     /// Help-panel overlay. When `help_visible` is true, the render
     /// path swaps `tx pressure` (slot 4) for the [`help::HelpPanel`]
     /// instead. `help_scroll` is the index of the top visible glossary
-    /// line; clamped against `help.max_scroll(area_height)` on every
-    /// scroll. Toggled by the `[h]` key handler in `tui::app`.
+    /// line; engine-side it is clamped against `line_count() - 1` and
+    /// render-side it is clamped against `lines.len() - inner.height`
+    /// (the engine cannot see the render area). Toggled by the `[h]`
+    /// key handler in `tui::app`.
     help_visible: bool,
     help_scroll: usize,
     help: help::HelpPanel,
@@ -119,10 +121,11 @@ impl SceneEngine {
 
     /// Scroll the help glossary by `delta` lines (positive = down,
     /// negative = up). Clamped to the panel's line count so the
-    /// last line cannot scroll above the top edge. The exact
-    /// "viewport bottom" clamp depends on render-time area height
-    /// — we don't track that here; the render path naturally hides
-    /// over-scrolled lines. No-op when help is hidden.
+    /// last line cannot scroll above the top edge. The render-time
+    /// "viewport bottom" clamp is applied by `HelpPanel::render`
+    /// itself (the engine cannot see the render area), so the last
+    /// page of the glossary stays visible when this value is at
+    /// `line_count() - 1`. No-op when help is hidden.
     pub fn scroll_help(&mut self, delta: i32) {
         if !self.help_visible {
             return;
