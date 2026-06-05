@@ -80,12 +80,15 @@ struct Sample {
 ///   (defensive; the same `latest_event_ts` should always carry the
 ///   same signature payload but be explicit);
 /// - `y_max_bucket` — the curve's vertical scale moved;
+/// - `now_ts_bucket` — the event-time anchor advanced (see field
+///   docstring; bucketed to whole seconds);
 /// - `area` — terminal resized or layout shifted.
 ///
-/// Wall-clock alone does not invalidate the cache: the X-axis is
-/// anchored to `latest_event_ts`, not to `Instant::now()`, so the
-/// rendered curve is byte-identical across frames inside a single
-/// event-quiescent window.
+/// **Render wall-clock does not invalidate the cache; event-time
+/// does.** The X-axis is anchored to `latest_event_ts`, not to
+/// `Instant::now()`, so multiple render frames within the same
+/// event-second reuse the cached coords. Each event-second advance
+/// forces a recompute via `now_ts_bucket`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CoordKey {
     sample_count: usize,
