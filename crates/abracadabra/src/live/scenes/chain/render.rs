@@ -466,13 +466,16 @@ fn render_tx_stream(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
         if remaining == 0 {
             continue;
         }
-        let count_chars: Vec<char> = count_text.chars().collect();
-        let pad = remaining.saturating_sub(count_chars.len());
+        // PERF-03: `compact_count` only emits ASCII (digits + 'k'),
+        // so `len()` equals the char count and we can iterate
+        // `chars()` directly without materialising a `Vec<char>`.
+        let count_len = count_text.len();
+        let pad = remaining.saturating_sub(count_len);
         for _ in 0..pad {
             buf[(x, y)].set_char(' ');
             x = x.saturating_add(1);
         }
-        for ch in count_chars.into_iter().take(remaining) {
+        for ch in count_text.chars().take(remaining) {
             buf[(x, y)].set_char(ch).set_style(count_style);
             x = x.saturating_add(1);
         }
