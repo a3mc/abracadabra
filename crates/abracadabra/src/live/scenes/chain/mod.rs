@@ -1019,6 +1019,72 @@ mod tests {
     }
 
     #[test]
+    fn refresh_bucket_glyphs_keeps_cache_through_natural_prune() {
+        // TEST-04: drive enough events to exceed HISTORY_CAPACITY so
+        // the natural prune path (inside `observe_event`) evicts the
+        // anchor slot. The bucket cell's cached glyph must persist
+        // through the production-path eviction, not just the
+        // hand-mutated `p.slots.remove(...)` case the sibling test
+        // covers.
+        use super::particle::BucketCell;
+        use super::state::HISTORY_CAPACITY;
+        let mut p = ChainPane::new();
+        // Bring slot 100 in and finalise canonically. We will rely on
+        // the natural prune path to evict it once HISTORY_CAPACITY
+        // tip-extension slots arrive.
+        p.on_event(&block_ev(100, "a", 99, "root"));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "a".into(),
+            fast: true,
+        }));
+        // Manually seed the bucket cell + refresh so the glyph is
+        // cached before any prune fires.
+        p.cannon.bucket.push_back(BucketCell {
+            slot: 100,
+            glyph: None,
+        });
+        super::refresh_bucket_glyphs(&mut p);
+        let cached_before = p.cannon.bucket.back().unwrap().glyph;
+        assert!(cached_before.is_some(), "first refresh must populate");
+
+        // Drive HISTORY_CAPACITY + 100 fresh slots so the prune loop
+        // evicts slot 100 from the retained deque. Use FirstShred
+        // events for cheap tip-extension upserts.
+        let total = u64::try_from(HISTORY_CAPACITY + 100).unwrap();
+        for i in 0..total {
+            let slot = 1_000_000 + i;
+            p.on_event(&mk(EventKind::FirstShred { slot }));
+        }
+        // Confirm the natural prune path removed slot 100.
+        assert!(
+            p.slots.iter().all(|s| s.slot != 100),
+            "natural prune must evict slot 100 from the deque"
+        );
+
+        // Refresh again — the cache must persist through the
+        // production prune path.
+        super::refresh_bucket_glyphs(&mut p);
+        let cached_after = p.cannon.bucket.front().unwrap().glyph;
+        // Find the bucket cell for slot 100 — its index depends on
+        // whether the loop above pushed any extra cells via fired
+        // slots; the bucket only holds 100 at index 0.
+        let cell_for_100 = p
+            .cannon
+            .bucket
+            .iter()
+            .find(|c| c.slot == 100)
+            .unwrap_or_else(|| panic!("bucket lost slot 100 entirely"))
+            .glyph;
+        assert_eq!(
+            cell_for_100, cached_before,
+            "pruned-slot cache must persist; got {cached_before:?} -> {cell_for_100:?}",
+        );
+        // Sanity: at least one cell was preserved.
+        assert!(cached_after.is_some() || cell_for_100.is_some());
+    }
+
+    #[test]
     fn refresh_bucket_glyphs_keeps_cache_when_slot_is_pruned() {
         // The regression behind LIVE-55: bucket cells should NOT
         // degrade to the "unknown" dim grey dot when their slot is
