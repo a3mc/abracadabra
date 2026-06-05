@@ -47,12 +47,21 @@ Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/re
 
 ![alerts](assets/alerts_tab.png)
 
+### Live
+
+![live](assets/live_tab.png)
+
+Real-time animation surface that follows an actively-written log. Hidden when the log is static (rotated / stale / no size growth). Press `SPACE` to start tailing, `p` to pause the animation, `h` to toggle an in-app glossary explaining every widget label and glyph. The chain pane and tx-pressure chart are animation-heavy — a stable network link gives the smoothest experience over SSH.
+
 ## Keys
 
 | | |
 |---|---|
-| `1`–`6` / `Tab` / `Shift+Tab` | Switch tabs (forward / back) |
+| `1`–`7` / `Tab` / `Shift+Tab` | Switch tabs (forward / back) |
 | `j` / `k` · `↓` / `↑` · `PgDn` / `PgUp` · `g` / `G` · `Home` / `End` | Scroll |
+| `SPACE` | Live — start / stop tailing |
+| `p` | Live — pause / resume animation |
+| `h` | Live — toggle in-app glossary |
 | `t` `n` `p` | Slots filter — TCL / S2N / S2S |
 | `l` `f` `s` | Slots filter — leader / fast-finalize / slow-finalize |
 | `v` `c` | Slots filter — VSKIP (we voted skip) / CSKIP (canonical skip). Both on = union. |
@@ -63,10 +72,19 @@ Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/re
 ## Flags
 
 ```
---bucket <DUR>   Time-series bucket size  (default 10m, range 1m..=24h)
---text           Non-interactive summary instead of the TUI
---version        Print version
---help           Print full help
+--bucket <DUR>      Time-series bucket size  (default 10m, range 1m..=24h)
+--text              Non-interactive summary instead of the TUI
+--no-truecolor      Force the 256-colour ANSI fallback. Use on terminals
+                    that report 256-colour support but do not implement
+                    the SGR 38;2;R;G;B sequence (notably macOS Terminal.app).
+                    Auto-detected via COLORTERM / TERM_PROGRAM / TERM at
+                    startup, so this flag is only needed when the
+                    environment lies about the terminal's capabilities.
+--force-truecolor   Skip the env-var detection ladder and force 24-bit RGB.
+                    Mutually exclusive with --no-truecolor. Use on capable
+                    terminals whose COLORTERM was stripped by SSH.
+--version           Print version
+--help              Print full help
 ```
 
 ## License
