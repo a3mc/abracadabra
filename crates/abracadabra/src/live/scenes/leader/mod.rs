@@ -331,6 +331,32 @@ mod tests {
     }
 
     #[test]
+    fn summarize_abandon_reason_rejects_non_digit_inner_payload() {
+        // TEST-03 regression: the `WindowMovedOn(N)` collapse only
+        // applies when `N` is the empirically-observed digits-only
+        // slot number. A future Solana variant emitting a nested
+        // structure (e.g. `WindowMovedOn(Nested(123))`) must NOT
+        // resolve to "PoH moved on" — that would be a lie. Fall
+        // through to the wrapper-stripped path instead so the
+        // operator sees the genuine inner debug text.
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(WindowMovedOn(Nested(123)))"),
+            "WindowMovedOn(Nested(123))",
+            "nested payload must not match the digits-only collapse"
+        );
+        // Empty inner payload also rejected — N is mandatory.
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(WindowMovedOn())"),
+            "WindowMovedOn()"
+        );
+        // Mixed alphanumeric inner — rejected.
+        assert_eq!(
+            summarize_abandon_reason("PohRecorder(WindowMovedOn(12a3))"),
+            "WindowMovedOn(12a3)"
+        );
+    }
+
+    #[test]
     fn poh_window_moved_on_summarises_to_short_phrase_in_footer() {
         // Solana's `Unable to produce window` log emits the `Debug`
         // form of a PohRecorder error. The footer translates the only

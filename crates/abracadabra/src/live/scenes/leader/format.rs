@@ -208,8 +208,18 @@ fn write_compacted_count(out: &mut String, n: Option<u64>, width: usize) {
 ///   versions may introduce non-PoH reasons; the pass-through
 ///   guarantees we don't silently lose them.
 pub(super) fn summarize_abandon_reason(reason: &str) -> String {
-    if reason.starts_with("PohRecorder(WindowMovedOn(") && reason.ends_with("))") {
-        return "PoH moved on".to_owned();
+    // TEST-03: only the digits-only payload form `WindowMovedOn(N)`
+    // collapses to the short phrase. A nested variant such as
+    // `WindowMovedOn(Nested(123))` is NOT the observed slot-number
+    // form, so fall through to the wrapper-stripped path so the
+    // operator sees the genuine inner debug text rather than a lie.
+    if let Some(inner) = reason
+        .strip_prefix("PohRecorder(WindowMovedOn(")
+        .and_then(|s| s.strip_suffix("))"))
+    {
+        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+            return "PoH moved on".to_owned();
+        }
     }
     if reason == "PohRecorder(MaxHeightReached)" {
         return "max height reached".to_owned();
