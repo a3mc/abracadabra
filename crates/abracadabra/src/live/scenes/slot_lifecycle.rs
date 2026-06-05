@@ -34,9 +34,19 @@ const CELLS_PER_CARD: u16 = 20;
 const CARD_DIVIDER: &str = "┊";
 
 const BLOCK_BARS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-/// Dot-size glyphs for discrete event lanes (slow, skip). Three
-/// visible levels read as event marks rather than gradient bars.
+/// Dot-size glyphs for the slow lane. Three visible levels read as
+/// event marks rather than gradient bars. Pre-LIVE-63 the skip lane
+/// also used these dots — same shape as slow made the two lanes
+/// visually indistinguishable.
 const MARK_BARS: [&str; 9] = [" ", "·", "·", "•", "•", "•", "●", "●", "●"];
+/// Left-pointing triangles for the skip lane (LIVE-63). Shape is
+/// deliberately different from the slow lane's dots so the operator
+/// can tell at a glance which lane fired. Two-level intensity:
+/// outline `◁` for normal magnitude, filled `◀` for high — same
+/// "more = more visible" intuition as `MARK_BARS`, just a different
+/// shape family. Left-pointing because the chart scrolls leftward
+/// as time advances; the apex points in the direction of motion.
+const SKIP_BARS: [&str; 9] = [" ", "◁", "◁", "◁", "◁", "◁", "◀", "◀", "◀"];
 
 const COL_GOOD: Color = Color::Green;
 const COL_WARN: Color = Color::Yellow;
@@ -502,7 +512,8 @@ fn glyph_for_level(level: usize, bars: &[&'static str; 9]) -> &'static str {
 const fn bars_for(lane: Lane) -> &'static [&'static str; 9] {
     match lane {
         Lane::Fast | Lane::Fec => &BLOCK_BARS,
-        Lane::Slow | Lane::Skip => &MARK_BARS,
+        Lane::Slow => &MARK_BARS,
+        Lane::Skip => &SKIP_BARS,
     }
 }
 
@@ -813,6 +824,35 @@ mod tests {
             Lane::Slow.colour(),
             Color::Yellow,
             "slow stays yellow (warn — 2-round path)"
+        );
+    }
+
+    #[test]
+    fn lane_glyphs_distinguish_slow_dots_from_skip_triangles() {
+        // LIVE-63 regression: before this change `slow` and `skip`
+        // shared MARK_BARS so the two lanes painted the same
+        // ·/•/● glyphs and could only be told apart by colour.
+        // Skip lane now uses SKIP_BARS (left-pointing triangles).
+        let slow = bars_for(Lane::Slow);
+        let skip = bars_for(Lane::Skip);
+        // Distinct arrays — not the same backing memory.
+        assert!(
+            !std::ptr::eq(slow, skip),
+            "slow and skip must use distinct bar arrays"
+        );
+        // Slow keeps its dot vocabulary.
+        assert!(
+            slow.iter().any(|g| *g == "·" || *g == "•" || *g == "●"),
+            "slow lane must keep its dot glyphs: {slow:?}"
+        );
+        // Skip carries the triangle vocabulary AND no dot glyphs.
+        assert!(
+            skip.iter().any(|g| *g == "◁" || *g == "◀"),
+            "skip lane must use triangle glyphs: {skip:?}"
+        );
+        assert!(
+            !skip.iter().any(|g| *g == "·" || *g == "•" || *g == "●"),
+            "skip lane must not leak any dot glyphs: {skip:?}"
         );
     }
 }
