@@ -15,6 +15,7 @@
 
 pub mod chain;
 pub mod decorations;
+pub mod help;
 pub mod leader;
 pub mod shred_ingress;
 pub mod slot_lifecycle;
@@ -50,6 +51,14 @@ pub struct SceneEngine {
     /// see them under sustained burst load — counters in `LiveBuffer`
     /// still reflect the honest totals).
     cursor: u64,
+    /// Help-panel overlay. When `help_visible` is true, the render
+    /// path swaps `tx pressure` (slot 4) for the [`help::HelpPanel`]
+    /// instead. `help_scroll` is the index of the top visible glossary
+    /// line; clamped against `help.max_scroll(area_height)` on every
+    /// scroll. Toggled by the `[h]` key handler in `tui::app`.
+    help_visible: bool,
+    help_scroll: usize,
+    help: help::HelpPanel,
 }
 
 impl SceneEngine {
@@ -85,7 +94,43 @@ impl SceneEngine {
                 },
             ],
             cursor: 0,
+            help_visible: false,
+            help_scroll: 0,
+            help: help::HelpPanel::new(),
         }
+    }
+
+    /// Toggle the help-panel overlay on / off. Off resets the scroll
+    /// offset so re-opening always starts from the top.
+    pub const fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
+        if !self.help_visible {
+            self.help_scroll = 0;
+        }
+    }
+
+    /// Is the help overlay currently displayed? Used by the key
+    /// handler to route scroll keys (`j` / `k` / PgDn / PgUp) to
+    /// `scroll_help` instead of the app-level scroll.
+    #[must_use]
+    pub const fn help_visible(&self) -> bool {
+        self.help_visible
+    }
+
+    /// Scroll the help glossary by `delta` lines (positive = down,
+    /// negative = up). Clamped to the panel's line count so the
+    /// last line cannot scroll above the top edge. The exact
+    /// "viewport bottom" clamp depends on render-time area height
+    /// — we don't track that here; the render path naturally hides
+    /// over-scrolled lines. No-op when help is hidden.
+    pub fn scroll_help(&mut self, delta: i32) {
+        if !self.help_visible {
+            return;
+        }
+        let max = self.help.line_count().saturating_sub(1);
+        let new_scroll = i64::try_from(self.help_scroll).unwrap_or(i64::MAX) + i64::from(delta);
+        let clamped = new_scroll.clamp(0, i64::try_from(max).unwrap_or(i64::MAX));
+        self.help_scroll = usize::try_from(clamped).unwrap_or(0);
     }
 
     /// Advance the cursor to the tail buffer's current `total_events`
@@ -179,7 +224,13 @@ impl SceneEngine {
             .split(mid_h[0]);
         self.slots[2].pane.render(frame, mid_left_v[0]);
         self.slots[3].pane.render(frame, mid_left_v[1]);
-        self.slots[4].pane.render(frame, mid_h[1]);
+        // Tx pressure slot swaps to the help glossary when `[h]` is
+        // active. Same Rect either way; no layout shift.
+        if self.help_visible {
+            self.help.render(frame, mid_h[1], self.help_scroll);
+        } else {
+            self.slots[4].pane.render(frame, mid_h[1]);
+        }
 
         self.slots[5].pane.render(frame, v_chunks[2]);
     }

@@ -596,6 +596,17 @@ impl<'s> App<'s> {
     }
 
     fn step_scroll(&mut self, delta: isize) {
+        // When the Live-tab help overlay is open, scroll keys drive
+        // the help glossary instead of the tab's content scroll.
+        if self.current_kind() == TabId::Live {
+            if let Some(engine) = self.engine.as_mut() {
+                if engine.help_visible() {
+                    let d = i32::try_from(delta).unwrap_or(0);
+                    engine.scroll_help(d);
+                    return;
+                }
+            }
+        }
         let max = self.scroll_max();
         let Some(target) = self.scroll_target() else {
             return;
@@ -609,12 +620,28 @@ impl<'s> App<'s> {
     }
 
     fn jump_top(&mut self) {
+        if self.current_kind() == TabId::Live {
+            if let Some(engine) = self.engine.as_mut() {
+                if engine.help_visible() {
+                    engine.scroll_help(i32::MIN);
+                    return;
+                }
+            }
+        }
         if let Some(target) = self.scroll_target() {
             *target = 0;
         }
     }
 
     fn jump_bottom(&mut self) {
+        if self.current_kind() == TabId::Live {
+            if let Some(engine) = self.engine.as_mut() {
+                if engine.help_visible() {
+                    engine.scroll_help(i32::MAX);
+                    return;
+                }
+            }
+        }
         let max = self.scroll_max();
         if let Some(target) = self.scroll_target() {
             *target = max;
@@ -783,6 +810,15 @@ fn event_loop(
                             {
                                 engine.skip_to_present(tail);
                             }
+                        }
+                    }
+                    // Live-tab-only: `h` toggles the help glossary in
+                    // the tx-pressure slot. The engine ignores the
+                    // toggle when no engine exists (tail not started)
+                    // because there is nothing to overlay.
+                    KeyCode::Char('h') if app.current_kind() == TabId::Live => {
+                        if let Some(engine) = app.engine.as_mut() {
+                            engine.toggle_help();
                         }
                     }
                     KeyCode::Char('j') | KeyCode::Down => app.step_scroll(1),
