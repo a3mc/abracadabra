@@ -94,6 +94,14 @@ pub(super) const CARD_ROW_WIDTH: usize = ROW_PREFIX_WIDTH + DETAIL_WIDTH;
 /// buffer via [`std::fmt::Write`]. The previous form built five
 /// throwaway `String`s per call; on a busy 2-card layout that was
 /// ~10 short allocations per card render per frame.
+///
+/// **PERF-01 deferred.** A per-frame scratch buffer threaded through
+/// the render path would drop the remaining ~240 allocations/sec
+/// (two cards × four slots × 30 fps), but [`super::render::render`]
+/// takes `&self` so the scratch needs interior mutability and a
+/// per-pane reset. The current cost is bounded and observed steady
+/// at well under the SSH-friendly budget; preserving the simple
+/// signature is worth the small alloc.
 pub(super) fn slot_detail_compact(s: &OurSlot) -> String {
     let mut out = String::with_capacity(DETAIL_WIDTH);
     write_bank_field(&mut out, bank_ms(s));
