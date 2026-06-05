@@ -153,6 +153,90 @@ pub fn render(
             chunks[4],
         );
     }
+
+    // Show the "before you start" tips block only in the active-but-
+    // not-following state — once the operator hits SPACE the scene
+    // engine takes over the whole area (return path above) so the
+    // tips never compete with live rendering. Static-log states get
+    // nothing here either; the supporting line already names the
+    // reason the log is unavailable.
+    if matches!(activity, Activity::Active) && !following {
+        frame.render_widget(
+            Paragraph::new(before_you_start_tips()).alignment(Alignment::Center),
+            chunks[5],
+        );
+    }
+}
+
+/// Three short tips shown on the idle Live-tab landing so operators
+/// know what to expect before they hit SPACE.
+///
+/// Topics, in order:
+/// 1. **SSH bandwidth.** The Live tab is animation-heavy (cannon
+///    particles, gradient charts, scrolling tx stream). On a laggy
+///    SSH link the animation stutters and the operator may think
+///    something is broken when it is just terminal-side jitter.
+/// 2. **Truecolor.** Some terminals (notably macOS Terminal.app) do
+///    not implement 24-bit RGB; our LIVE-67 detection falls back to
+///    the 256-colour cube automatically, but the operator can force
+///    the fallback with `--no-truecolor` or switch to a capable
+///    terminal for sharper colour.
+/// 3. **Help glossary.** The `[h]` hotkey toggles the in-app
+///    glossary so the operator knows where to look when a label or
+///    glyph is unclear.
+fn before_you_start_tips() -> Vec<Line<'static>> {
+    let label = theme::label_style();
+    let value = theme::value_style();
+    let bold_accent = theme::accent_style().add_modifier(Modifier::BOLD);
+
+    vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "before you start",
+            theme::accent_style().add_modifier(Modifier::DIM),
+        )),
+        Line::from(""),
+        // Tip 1 — SSH bandwidth.
+        Line::from(vec![
+            Span::styled(
+                "· The Live tab is animation-heavy — a laggy SSH link to the ",
+                label,
+            ),
+            Span::styled("server", value),
+            Span::styled(" will stutter.", label),
+        ]),
+        Line::from(Span::styled(
+            "  A stable connection gives the smoothest experience.",
+            label,
+        )),
+        Line::from(""),
+        // Tip 2 — Truecolor capability.
+        Line::from(vec![
+            Span::styled("· Some terminals (notably macOS ", label),
+            Span::styled("Terminal.app", value),
+            Span::styled(") do not support 24-bit RGB.", label),
+        ]),
+        Line::from(vec![
+            Span::styled("  Run with ", label),
+            Span::styled("--no-truecolor", bold_accent),
+            Span::styled(" for the 256-colour fallback, or upgrade to", label),
+        ]),
+        Line::from(Span::styled(
+            "  iTerm2 / Alacritty / Kitty / WezTerm for full RGB.",
+            label,
+        )),
+        Line::from(""),
+        // Tip 3 — Help glossary.
+        Line::from(vec![
+            Span::styled("· Press ", label),
+            Span::styled("h", bold_accent),
+            Span::styled(
+                " while following for the in-app glossary explaining every",
+                label,
+            ),
+        ]),
+        Line::from(Span::styled("  widget label and glyph.", label)),
+    ]
 }
 
 /// Snapshot the live buffer into an owned `TailFrame`. Lock is held
@@ -345,6 +429,48 @@ mod tests {
         let (primary, _, extra) = lines_for_state(&Activity::Active, "/tmp/x.log", false, &snap());
         assert!(extra.is_none());
         assert!(join_line(&primary).contains("SPACEBAR"));
+    }
+
+    #[test]
+    fn before_you_start_tips_cover_ssh_truecolor_and_help_hotkey() {
+        // LIVE-69 regression: the idle landing must surface the three
+        // operator-facing tips so the first impression of the Live
+        // tab is informed (smooth animation on stable link, colour
+        // fallback for legacy terminals, glossary hotkey). If any
+        // of these strings stops appearing, a future operator opens
+        // the tab and forms the wrong mental model.
+        let lines = before_you_start_tips();
+        let text: String = lines.iter().map(join_line).collect::<Vec<_>>().join("\n");
+
+        // Tip 1 — SSH stability / animation cost.
+        assert!(
+            text.contains("animation-heavy") && text.contains("SSH"),
+            "tip 1 (SSH stability) missing or reworded: {text:?}"
+        );
+
+        // Tip 2 — Truecolor fallback path and the CLI flag operators
+        // need if they cannot upgrade their terminal.
+        assert!(
+            text.contains("Terminal.app"),
+            "tip 2 must name the headline non-truecolor terminal: {text:?}"
+        );
+        assert!(
+            text.contains("--no-truecolor"),
+            "tip 2 must point at the CLI fallback flag: {text:?}"
+        );
+        assert!(
+            text.contains("iTerm2")
+                && text.contains("Alacritty")
+                && text.contains("Kitty")
+                && text.contains("WezTerm"),
+            "tip 2 must list the four capable terminals: {text:?}"
+        );
+
+        // Tip 3 — [h] hotkey for the in-app glossary.
+        assert!(
+            text.contains("glossary"),
+            "tip 3 must mention the glossary the [h] hotkey opens: {text:?}"
+        );
     }
 
     #[test]
