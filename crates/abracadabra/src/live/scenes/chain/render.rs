@@ -376,28 +376,48 @@ fn render_bucket(pane: &ChainPane, frame: &mut Frame<'_>, bucket_area: Rect, now
 /// - **count** — bold white compact integer (`67k`-style). Aligned
 ///   right inside whatever cells remain after slot + bar + spacing.
 ///
-/// **Zero-sig filter.** In observed captures against this validator
-/// most bank-frozen slots carry `signature_count: 0`, with only a
-/// minority of slots carrying nonzero counts. Zero-sig rows look
-/// identical to "no data yet" in a per-row stream and would dominate
-/// the visible rows, hiding the operationally interesting nonzero
-/// blocks below them. The time-series tx-pressure card aggregates
-/// across 10-minute buckets so the few nonzero spikes dominate the
-/// rate; here, with row-per-slot granularity, the filter is the
-/// equivalent operator signal. Slot-numbers in the stream may
-/// therefore be sparse — that gap is the data, not a render bug.
+/// **Two filters.**
+///
+/// 1. *Zero-sig filter.* In observed captures against this validator
+///    most bank-frozen slots carry `signature_count: 0`, with only a
+///    minority of slots carrying nonzero counts. Zero-sig rows look
+///    identical to "no data yet" in a per-row stream and would
+///    dominate the visible rows, hiding the operationally interesting
+///    nonzero blocks below them. The cannon already shoots one
+///    particle per new slot regardless, so per-slot motion is
+///    surfaced via the bucket — the tx stream is dedicated to
+///    non-trivial weight rows.
+///
+/// 2. *Skip filter.* Slots we voted skip on are excluded even when
+///    they have a nonzero local `signature_count`. The empirical
+///    case: an own leader window where PoH moves on before we
+///    finish — we banked the blocks locally (so `signature_count` is
+///    populated) but the network does NOT keep those blocks (we self-
+///    voted skip + `UnableToProduceWindow` fires). Including them in
+///    the stream would read as "recent canonical block weight" when
+///    they were orphaned local-bank events. The skip signal stays
+///    visible elsewhere — the bucket paints ▴/▾/★-red — so dropping
+///    them from the stream loses no information the operator needs
+///    here. The simpler `!s.skipped` rule also covers the (rare)
+///    LSKIP case where we voted skip but the network kept the slot;
+///    that signal is already loud in the bucket (▴ red BOLD), so
+///    surfacing the weight in the stream would just duplicate.
+///
+/// Slot-numbers in the stream may therefore be sparse — that gap is
+/// the data, not a render bug.
 fn render_tx_stream(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
     if area.width < TX_STREAM_MIN_WIDTH || area.height == 0 {
         return;
     }
     let rows = usize::from(area.height);
     // Walk the deque newest-first, collecting (slot, sigs) for the
-    // first `rows` slots with a nonzero captured count — see the
-    // zero-sig filter note in the doc-comment above.
+    // first `rows` non-skipped slots with a nonzero captured count.
+    // See the two-filter rationale in the doc-comment above.
     let recent: Vec<(u64, u64)> = pane
         .slots
         .iter()
         .rev()
+        .filter(|s| !s.skipped)
         .filter_map(|s| s.signature_count.filter(|c| *c > 0).map(|c| (s.slot, c)))
         .take(rows)
         .collect();
@@ -717,5 +737,130 @@ mod tests {
                 "row {row_idx} missing a bar glyph: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_tx_stream_omits_skipped_slots_even_when_signatures_present() {
+        // LIVE-59 regression: an own leader window where PoH moves
+        // on writes a real `signature_count` from the local bank,
+        // then the slot also collects a `VotingSkip` (we self-voted
+        // skip) — the block is NOT kept by consensus, so it must NOT
+        // appear in the tx stream. The bucket separately surfaces the
+        // skip via the ▾/▴/red-★ glyph; the stream stays clean of
+        // orphaned local-bank weight.
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        // Slot 100: banks with 50k sigs AND we vote skip. Expected: hidden.
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::BankFrozen {
+                slot: 100,
+                hash: "h".into(),
+                signature_count: 50_000,
+            },
+        });
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::VotingSkip { slot: 100 },
+        });
+        // Slot 101: banks with 30k sigs, NO skip vote. Expected: visible.
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::BankFrozen {
+                slot: 101,
+                hash: "h".into(),
+                signature_count: 30_000,
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 14, 3);
+        terminal.draw(|f| render_tx_stream(&pane, f, area)).unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let collected: String = (0..area.height)
+            .flat_map(|y| {
+                (0..area.width).map(move |x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            })
+            .collect();
+        assert!(
+            collected.contains("101"),
+            "non-skipped slot 101 must appear in stream: {collected:?}"
+        );
+        assert!(
+            !collected.contains("100"),
+            "skipped slot 100 (orphaned local bank) must NOT appear in stream: \
+             {collected:?}"
+        );
+    }
+
+    #[test]
+    fn render_tx_stream_omits_skipped_slot_even_when_canonical_lskip() {
+        // LIVE-59: the LSKIP case (we voted skip but the network
+        // kept the slot — `Finalized` walked back marking it
+        // canonical). The bucket paints ▴ red BOLD; the operator
+        // already sees the bad signal there. Surfacing the weight
+        // in the stream would duplicate the signal AND read as
+        // "recent block weight from our perspective" when we self-
+        // voted skip. Simpler rule: just `!s.skipped`.
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        // Slot 200: full LSKIP chain — Block emitted, we voted skip,
+        // BankFrozen recorded sigs, network finalized anyway.
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::Block {
+                slot: 200,
+                hash: "a".into(),
+                parent_slot: 199,
+                parent_hash: "root".into(),
+            },
+        });
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::BankFrozen {
+                slot: 200,
+                hash: "a".into(),
+                signature_count: 67_000,
+            },
+        });
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::VotingSkip { slot: 200 },
+        });
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::Finalized {
+                slot: 200,
+                hash: "a".into(),
+                fast: true,
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 14, 3);
+        terminal.draw(|f| render_tx_stream(&pane, f, area)).unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let collected: String = (0..area.height)
+            .flat_map(|y| {
+                (0..area.width).map(move |x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            })
+            .collect();
+        assert!(
+            !collected.contains("200"),
+            "LSKIP slot must NOT appear in stream (bucket already paints ▴): \
+             {collected:?}"
+        );
     }
 }
