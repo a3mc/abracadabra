@@ -83,6 +83,12 @@ pub(super) struct OurSlot {
     /// (no skip vote) or `[✗]` (skip vote also cast on the slot).
     pub(super) abandoned_at: Option<OffsetDateTime>,
     pub(super) abandoned_reason: Option<Arc<str>>,
+    /// Pre-summarised form of `abandoned_reason`, produced at write
+    /// time so the render path does not re-run
+    /// `summarize_abandon_reason` for every frame the footer shows.
+    /// Shared across the slots of one window via [`Arc::clone`] (same
+    /// pattern as `abandoned_reason`).
+    pub(super) abandoned_reason_summary: Option<Arc<str>>,
 }
 
 /// One of our `ProduceWindow` ranges. Slots are inclusive `start..=end`.
@@ -382,6 +388,12 @@ impl LeaderPane {
                 // event so the (up to `MAX_LEADER_WINDOW_SPAN+1`) per-
                 // slot stores below reuse the same allocation.
                 let shared_reason: Arc<str> = Arc::from(reason.as_str());
+                // PERF-02: summarise once per event, share the
+                // summary Arc across all slots in the window so the
+                // render path's `card_alert_line` does not re-run
+                // `summarize_abandon_reason` per frame.
+                let shared_summary: Arc<str> =
+                    Arc::from(super::format::summarize_abandon_reason(reason).as_str());
                 // The error may cover a window we never saw a ProduceWindow
                 // for (log replay started mid-stream). In that case we have
                 // no slots to mark — silently no-op.
@@ -390,6 +402,8 @@ impl LeaderPane {
                         s.abandoned_at.get_or_insert(ts);
                         s.abandoned_reason
                             .get_or_insert_with(|| Arc::clone(&shared_reason));
+                        s.abandoned_reason_summary
+                            .get_or_insert_with(|| Arc::clone(&shared_summary));
                     }
                 }
             }

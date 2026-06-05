@@ -15,8 +15,7 @@ use crate::live::animation::spinner_frame;
 use crate::tui::theme;
 
 use super::format::{
-    format_count_compact, slot_detail_compact, summarize_abandon_reason, CARD_ROW_WIDTH,
-    COLUMN_HEADER, SLOT_FIELD_WIDTH,
+    format_count_compact, slot_detail_compact, CARD_ROW_WIDTH, COLUMN_HEADER, SLOT_FIELD_WIDTH,
 };
 use super::state::{LeaderPane, OurSlot, OurWindow, SlotOutcome};
 
@@ -264,18 +263,23 @@ pub(super) fn card_alert_line(w: &OurWindow) -> Option<Line<'static>> {
     let mut drops = 0u64;
     let mut bad_handover = 0u64;
     let mut behind = 0u64;
-    let mut abandoned_reason: Option<&str> = None;
+    let mut abandoned_summary: Option<&str> = None;
     for s in &w.slots {
         drops = drops.saturating_add(s.num_dropped_on_capacity.unwrap_or(0));
         if s.leader_handover_sad == Some(true) {
             bad_handover = bad_handover.saturating_add(1);
         }
         behind = behind.saturating_add(s.replay_is_behind_count.unwrap_or(0));
-        if abandoned_reason.is_none() {
-            abandoned_reason = s.abandoned_reason.as_deref();
+        // PERF-02: consume the pre-summarised reason cached at write
+        // time rather than re-running `summarize_abandon_reason` per
+        // render. `abandoned_reason_summary` is populated alongside
+        // `abandoned_reason` on the same `UnableToProduceWindow`
+        // observe path.
+        if abandoned_summary.is_none() {
+            abandoned_summary = s.abandoned_reason_summary.as_deref();
         }
     }
-    if drops == 0 && bad_handover == 0 && behind == 0 && abandoned_reason.is_none() {
+    if drops == 0 && bad_handover == 0 && behind == 0 && abandoned_summary.is_none() {
         return None;
     }
     let warn = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
@@ -289,11 +293,8 @@ pub(super) fn card_alert_line(w: &OurWindow) -> Option<Line<'static>> {
         spans.push(Span::styled(body, warn));
         first = false;
     };
-    if let Some(reason) = abandoned_reason {
-        push_segment(
-            &mut spans,
-            format!("skipped — {}", summarize_abandon_reason(reason)),
-        );
+    if let Some(summary) = abandoned_summary {
+        push_segment(&mut spans, format!("skipped — {summary}"));
     }
     for (n, label_text) in [
         (drops, "tx dropped (scheduler full)"),
