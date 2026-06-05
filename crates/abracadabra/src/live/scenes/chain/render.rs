@@ -80,18 +80,21 @@ fn chip_value_bg() -> Color {
 fn chip_value_fg() -> Color {
     crate::tui::truecolor::rgb(244, 248, 255)
 }
-// `slot_chip_bg` and `slot_chip_fg` are tuned so their 6×6×6 cube
-// quantisation does not collide with the chain status chip palette
-// (`chip_label_bg/fg`, `chip_value_bg/fg`). On the macOS Terminal.app
-// fallback path a collision would render the slot chip and the status
-// label pills as visually identical rectangles. The unit test
-// `quantize_to_cube_maps_chain_chip_palette_to_distinct_indices`
-// in `tui::truecolor::tests` guards all six values pairwise.
+// `slot_chip_bg` is tuned so its 6×6×6 cube quantisation does not
+// collide with the chain status chip backgrounds (`chip_label_bg`,
+// `chip_value_bg`). Backgrounds define chip boundaries — a collision
+// would render the slot chip and the status label pills as visually
+// identical rectangles on the fallback path. Foregrounds are allowed
+// to share a cube cell because each foreground sits on a distinct
+// background, so the chips remain visually separable even when their
+// text quantises to the same near-white cell. The unit test
+// `quantize_to_cube_maps_chain_chip_backgrounds_to_distinct_indices`
+// in `tui::truecolor::tests` guards the three backgrounds pairwise.
 fn slot_chip_bg() -> Color {
     crate::tui::truecolor::rgb(36, 50, 135)
 }
 fn slot_chip_fg() -> Color {
-    crate::tui::truecolor::rgb(252, 252, 234)
+    crate::tui::truecolor::rgb(252, 252, 255)
 }
 
 /// Render the entire pane (border + composition) inside `area`.

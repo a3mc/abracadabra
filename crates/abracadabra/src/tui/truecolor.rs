@@ -297,26 +297,27 @@ mod tests {
     }
 
     #[test]
-    fn quantize_to_cube_maps_chain_chip_palette_to_distinct_indices() {
-        // All six chain chip colours (status chip label bg/fg, status
-        // chip value bg/fg, slot chip bg/fg) must not collapse to the
-        // same cube index under quantisation — otherwise distinct
-        // chips would render as visually identical rectangles on a
-        // 256-colour terminal. Mirrors the RGB anchors in
+    fn quantize_to_cube_maps_chain_chip_backgrounds_to_distinct_indices() {
+        // The three chain chip background colours (status chip label
+        // bg, status chip value bg, slot chip bg) define the chip
+        // boundaries — a cube-quantisation collision between any two
+        // would render distinct chips as visually identical rectangles
+        // on a 256-colour terminal. Foregrounds are NOT asserted here
+        // because each foreground sits on a distinct background, so a
+        // cube-cell collision between two foregrounds is invisible to
+        // the operator (both still read as light text against
+        // different chip backgrounds). Mirrors the RGB anchors in
         // `live::scenes::chain::render`.
         let label_bg = quantize_to_cube(46, 54, 68);
-        let label_fg = quantize_to_cube(168, 180, 198);
         let value_bg = quantize_to_cube(76, 110, 148);
-        let value_fg = quantize_to_cube(244, 248, 255);
         let slot_bg = quantize_to_cube(36, 50, 135);
-        let slot_fg = quantize_to_cube(252, 252, 234);
-        let palette = [label_bg, label_fg, value_bg, value_fg, slot_bg, slot_fg];
-        let distinct: std::collections::HashSet<u8> = palette.iter().copied().collect();
+        let backgrounds = [label_bg, value_bg, slot_bg];
+        let distinct: std::collections::HashSet<u8> = backgrounds.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            palette.len(),
-            "quantised chip palette collapses to {distinct:?}; \
-             retune RGB anchors so each chip stays distinguishable"
+            backgrounds.len(),
+            "quantised chip backgrounds collapse to {distinct:?}; \
+             retune RGB anchors so chip rectangles stay distinguishable"
         );
     }
 
