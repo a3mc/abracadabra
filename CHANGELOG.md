@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-05
+
+Tracks alpenglow `ag-v0.4.0`. Major release adds the Live tab — a
+real-time animation surface that tails an actively-written validator
+log and presents chain progression, leader-window outcomes, shred
+ingress, transaction pressure, and slot lifecycle as continuously
+updating visualisations. Plus a runtime truecolor detector + 6×6×6
+cube fallback for terminals that misparse 24-bit RGB, and a four-band
+fast-finalize verdict ladder calibrated against operator-observed
+cluster performance.
+
+### Added
+
+- Live tab — real-time tail of an actively-written log. Hidden when
+  the log is static (rotated / stale / no size growth observed).
+  Press `SPACE` to start tailing, `p` to pause the animation,
+  `h` to toggle an in-app glossary that explains every widget
+  label and glyph. Composite scene engine with six panes:
+    - **Shred streams** — turbine particle stream + repair/drop/err
+      sparklines from `ShredFetch` / `ShredFetchRepair` /
+      `ShredSigverify` / `RecvWindowInsert` metric datapoints.
+    - **Slot outcomes** — fast/slow/skip/FEC lane bars per
+      time-slice over a rolling 64-slot window. Skip lane uses
+      left-pointing triangle glyphs to read distinctly from the
+      slow lane's dots.
+    - **Chain** — cannon-particle visualisation: tip-slot chip and
+      cannon at the top, particles fall into a paged 25×5 bucket
+      with magic-wipe transition between pages. Left-side tx
+      stream surfaces recent `BankFrozen.signature_count` per
+      slot (filters skipped slots and zero-sig blocks). Four
+      status chips show `cadence` / `assembly` / `consensus` /
+      `lifecycle` p50/p95 in ms.
+    - **Block production** — recent leader windows as cards with
+      per-slot bank time, signatures, broadcast time, shreds, tx
+      counts, and outcome icons (`[✓]` / `[~]` / `[…]` / `[✗]` /
+      `[A]`). Headline summarises `bank avg` / `sig max` /
+      `sh max` / `since last block`. Right-aligned timer column
+      lands cleanly in the right card slot.
+    - **Tx pressure** — `BankFrozen.signature_count` thermal area
+      chart with cold→hot gradient + dimmed area fill. Header
+      surfaces `now / avg / peak` over the visible window.
+    - **Decorations** — status strip with tail health, recent
+      event summary, pause indicator.
+- Truecolor detection + 6×6×6 cube fallback (`tui::truecolor`).
+  Routes every `Color::Rgb` callsite through a runtime helper
+  that detects terminal capability at startup. Detection ladder:
+  CLI flag → `NO_COLOR` → `COLORTERM=truecolor/24bit` →
+  `TERM_PROGRAM=Apple_Terminal` → `TERM` substring match
+  (kitty / alacritty / wezterm / ghostty / iterm / vscode) →
+  default true. On the fallback path quantises to the nearest
+  of the 216 colours in the ANSI cube so chip backgrounds and
+  gradients render correctly on terminals that misparse 24-bit
+  SGR sequences (notably macOS Terminal.app).
+- `--no-truecolor` CLI flag to force the 256-colour fallback.
+- `--force-truecolor` CLI flag to skip the detection ladder
+  (escape hatch for SSH sessions where COLORTERM was stripped).
+  Mutually exclusive with `--no-truecolor` per clap.
+- `NO_COLOR` env var honoured per the no-color.org convention.
+- Replay xtask (`cargo xtask replay-log`) for offline Live-tab
+  development against a captured log.
+- Parser support for `ProduceWindow`, `Unable to produce window`,
+  `Triggering parent ready`, `ParentReady`, and the
+  shred-pipeline metric datapoints (`ShredFetch`,
+  `ShredFetchRepair`, `ShredSigverify`, `RecvWindowInsert`,
+  `ShredInsertIsFull`, `BankingStageCounts`).
+
+### Changed
+
+- Overview tab `fast-finalize` headline rebanded to four
+  verdicts: `perfect (>=98%)` (green BOLD), `OK (95-98%)`
+  (green), `fine (80-95%)` (yellow), `degraded (<80%)` (red).
+  Verdict text shows each band's actual range rather than a
+  single lower threshold so the operator reads "I'm in the
+  80-95% band" rather than the misleading "above 80%". Text-
+  mode runner cutoff aligned with the new `FAST_FIN_GOOD_PCT`
+  (95) to keep CLI and TUI consistent.
+- Slots tab gains the `LSKIP` filter (we voted skip on a slot
+  the network ultimately kept canonical — local-skip on a
+  canonical slot). Distinct from `CSKIP` (canonical-skip across
+  the cluster).
+- Status bar advertises `[h] help` on the Live tab so the
+  glossary toggle is discoverable.
+
+### Notes
+
+- Tab key bindings: `1`–`7` now span all tabs (Live = tab 7,
+  hidden in static-log mode).
+- Test count: 461 (was 222 at 0.3.3 release). Includes 4 new
+  integration tests in `crates/abracadabra/tests/truecolor_render.rs`
+  that prove every `Color::Rgb` callsite routes through the
+  truecolor detector by walking the rendered ratatui buffer
+  and asserting zero RGB cells when the fallback is active.
+
 ## [0.3.3] — 2026-05-29
 
 Tracks alpenglow `ag-v0.3.2`. Post-release polish on standstill
