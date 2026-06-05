@@ -33,7 +33,7 @@
 //! - **truecolor ON**: the same render produces ≥1 `Color::Rgb`
 //!   cell — anchors the capable-terminal path against regression.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use abracadabra::live::animation::Pane;
 use abracadabra::live::scenes::chain::ChainPane;
@@ -49,7 +49,10 @@ use time::OffsetDateTime;
 
 /// Serialises tests that mutate the process-global truecolor flag.
 /// Both ON-path and OFF-path tests acquire this before flipping
-/// `TRUECOLOR_ENABLED`, so they never interleave.
+/// `TRUECOLOR_ENABLED`, so they never interleave. Poison is drained
+/// via `PoisonError::into_inner` so a panic inside one critical
+/// section does not mask the next test's real failure with a
+/// generic "test mutex" panic.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Seed a chain pane with enough event volume that the chip line and
@@ -147,7 +150,7 @@ fn render_tx_pressure_pane(pane: &TxPressurePane) -> Buffer {
 
 #[test]
 fn truecolor_off_chain_pane_emits_zero_rgb_cells() {
-    let _guard = TEST_LOCK.lock().expect("test mutex");
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     truecolor::init_from_env(true);
 
     let pane = seeded_chain_pane();
@@ -172,7 +175,7 @@ fn truecolor_off_chain_pane_emits_zero_rgb_cells() {
 
 #[test]
 fn truecolor_off_chain_pane_produces_indexed_cube_colours() {
-    let _guard = TEST_LOCK.lock().expect("test mutex");
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     truecolor::init_from_env(true);
 
     let pane = seeded_chain_pane();
@@ -199,7 +202,7 @@ fn truecolor_off_chain_pane_produces_indexed_cube_colours() {
 
 #[test]
 fn truecolor_off_tx_pressure_emits_zero_rgb_cells() {
-    let _guard = TEST_LOCK.lock().expect("test mutex");
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     truecolor::init_from_env(true);
 
     let pane = seeded_tx_pressure_pane();
@@ -227,7 +230,7 @@ fn truecolor_off_tx_pressure_emits_zero_rgb_cells() {
 
 #[test]
 fn truecolor_on_chain_pane_renders_rgb_cells() {
-    let _guard = TEST_LOCK.lock().expect("test mutex");
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     truecolor::init_from_env(false);
 
     let pane = seeded_chain_pane();
