@@ -57,6 +57,16 @@ pub(super) struct SlotState {
     /// fires for the slot. Drives the left-side tx stream rendered
     /// alongside the bucket — gives the operator a rolling view of
     /// per-block "weight" without leaving the chain pane.
+    ///
+    /// **BUG-04 note.** `Some(0)` is the typical post-BankFrozen
+    /// state on this validator — most slots empirically carry
+    /// `signature_count: 0`. The render path's `get_or_insert(*sig)`
+    /// guard means the first `BankFrozen` for a slot wins (fork-safe
+    /// for the rare multi-hash case), but `Some(0)` is NOT a "no
+    /// data" sentinel — it is the genuine observation that the slot
+    /// banked with no signatures. The tx-stream renderer filters
+    /// these out separately for visual signal (see the zero-sig
+    /// filter note on `super::render::render_tx_stream`).
     pub(super) signature_count: Option<u64>,
 }
 
