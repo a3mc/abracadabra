@@ -249,15 +249,19 @@ mod tests {
 
     #[test]
     fn quantize_to_cube_maps_chain_chip_palette_to_distinct_indices() {
-        // The four chain chip colours (label bg, label fg, value bg,
-        // value fg) must not collapse to the same cube index under
-        // quantisation — otherwise the chips would render as a flat
-        // single-colour rectangle on a 256-colour terminal.
+        // All six chain chip colours (status chip label bg/fg, status
+        // chip value bg/fg, slot chip bg/fg) must not collapse to the
+        // same cube index under quantisation — otherwise distinct
+        // chips would render as visually identical rectangles on a
+        // 256-colour terminal. Mirrors the RGB anchors in
+        // `live::scenes::chain::render`.
         let label_bg = quantize_to_cube(46, 54, 68);
         let label_fg = quantize_to_cube(168, 180, 198);
         let value_bg = quantize_to_cube(76, 110, 148);
         let value_fg = quantize_to_cube(244, 248, 255);
-        let palette = [label_bg, label_fg, value_bg, value_fg];
+        let slot_bg = quantize_to_cube(36, 50, 135);
+        let slot_fg = quantize_to_cube(252, 252, 234);
+        let palette = [label_bg, label_fg, value_bg, value_fg, slot_bg, slot_fg];
         let distinct: std::collections::HashSet<u8> = palette.iter().copied().collect();
         assert_eq!(
             distinct.len(),
