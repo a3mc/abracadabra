@@ -47,10 +47,13 @@ pub(super) const CANNON_X: f32 = 0.50;
 pub(super) const CANNON_Y: f32 = 0.0;
 
 /// World-space landing-cluster centre. Bucket is bottom-aligned in
-/// viz, so the cluster centre sits near the top of the bucket area
-/// (~75% down the viz rect for the default 25×8 bucket inside a
-/// ~10-row viz). Per-particle horizontal jitter spreads trajectories
-/// so a burst doesn't collapse into one column.
+/// viz (default 25×5 = 125-cell page; see [`PAGE_CAPACITY`]). The
+/// cluster centre at `y = 0.70` sits at the top of the bucket area
+/// for a 10-row viz (rows 7-9 are the bottom three bucket rows),
+/// giving the eye 30% of the viz as the arena where the falling
+/// trail is visible before each particle settles into its cell.
+/// Per-particle horizontal jitter spreads trajectories so a burst
+/// doesn't collapse into one column.
 const LANDING_X: f32 = 0.50;
 const LANDING_Y: f32 = 0.70;
 

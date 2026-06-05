@@ -2,20 +2,24 @@
 //!
 //! Layout (top → bottom inside the border):
 //!
-//! 1. **Header line 1** — `<spinner> <tip> tip ▶` (plus `⚠ N anom`
-//!    when parser anomalies have fired). The `▶` cannon glyph anchors
-//!    the operator's eye to the particle origin; counters previously
-//!    on this line (`CSKIP`, `indet`, `forks`) were dropped because
-//!    the matrix itself surfaces those classes visually.
-//! 2. **Header line 2** — timing strip `cadence p50/p95ms · …`.
-//! 3. **Arena** — empty area above the bucket where in-flight
+//! 1. **Status chips** — `cadence · assembly · consensus · lifecycle`
+//!    `p50/p95` ms over the retained slot history.
+//! 2. **Slot chip** — spinner + tip slot number on a dark slate
+//!    background, plus an optional `⚠ N anom` segment when parser
+//!    walk-back anomalies have fired.
+//! 3. **Cannon `▼`** — a single centred glyph one row below the slot
+//!    chip; particles fall vertically into the bucket.
+//! 4. **Arena** — empty area above the bucket where in-flight
 //!    cannon particles travel.
-//! 4. **Bucket** — fixed 100-cell grid laid out in a centred 25×4
+//! 5. **Bucket** — fixed 125-cell page laid out in a centred 25×5
 //!    block (or the largest grid that fits when the area is
 //!    narrower). Cells are placed at **static positions** and never
-//!    move until the page wipes; when the 100th slot lands, a left-
+//!    move until the page wipes; when the 125th slot lands, a left-
 //!    to-right **magic-wipe** sweep clears the bucket over ~500 ms
 //!    and the next page begins from cell 0.
+//! 6. **Left-side tx stream** — strip between the pane's left edge
+//!    and the bucket: per-row slot digits + bar glyph + compact
+//!    `BankFrozen.signature_count`, newest at top.
 //!
 //! **World-space → screen-space.** Particles carry normalised
 //! `(x, y) ∈ [0, 1]²` coordinates. The visualisation area's `Rect`
@@ -234,7 +238,7 @@ const TX_STREAM_MIN_WIDTH: u16 = 10;
 const STREAM_BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Position a bucket sub-rect inside `viz`. Aims for the default
-/// 25×8 grid; falls back to whatever fits when the viz width is
+/// 25×5 grid; falls back to whatever fits when the viz width is
 /// narrower. Centred horizontally, **bottom-aligned vertically** —
 /// the bucket sits flush at the bottom of `viz` so the rows above
 /// become the arena where particles fall. Matches the operator's
