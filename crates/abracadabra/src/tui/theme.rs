@@ -68,12 +68,15 @@ pub fn accent_style() -> Style {
 ///
 /// Bands (LIVE-62, calibrated against operator-observed cluster
 /// performance — 80% is not enough to call healthy on a node that
-/// regularly sits in the 88-92% range):
+/// regularly sits in the 88-92% range). Right-open intervals — verdict
+/// text shows each band's actual range so the operator reads "this
+/// validator is IN the 80-95% band" rather than the misleading
+/// "above 80%":
 ///
-/// - `>= FAST_FIN_PERFECT_PCT` (98) → perfect  (green BOLD)
-/// - `>= FAST_FIN_GOOD_PCT`    (95) → OK       (green)
-/// - `>= FAST_FIN_WARN_PCT`    (80) → fine     (yellow)
-/// - below                       → degraded (red)
+/// - `[98, ∞)`  → perfect  (green BOLD)
+/// - `[95, 98)` → OK       (green)
+/// - `[80, 95)` → fine     (yellow)
+/// - `[0,  80)` → degraded (red)
 pub const FAST_FIN_PERFECT_PCT: f64 = 98.0;
 pub const FAST_FIN_GOOD_PCT: f64 = 95.0;
 pub const FAST_FIN_WARN_PCT: f64 = 80.0;

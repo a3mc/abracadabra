@@ -159,12 +159,17 @@ pub fn print_summary(state: &State, stats: &RunStats) {
     println!("\n-- Health --");
     let total_final = ov.finalized_fast.saturating_add(ov.finalized_slow);
     let fast_pct = pct(ov.finalized_fast, total_final);
+    // Text-mode is binary (ok / not-ok); the TUI Overview has the full
+    // four-band ladder. Cutoff aligned with the TUI's `FAST_FIN_GOOD_PCT`
+    // (95%) so the two surfaces don't disagree on what counts as OK.
+    // Anything 80-95% reads as `slow path active` here even though the
+    // TUI would call it `fine` — text-mode collapses the middle bands.
     health_line(
         "fast-finalize",
         &format!("{fast_pct:>5.2}%"),
-        fast_pct >= 80.0,
-        "healthy (>=80%)",
-        "DEGRADED — cluster fragmented",
+        fast_pct >= 95.0,
+        "OK (>=95%)",
+        "slow path active (<95%)",
     );
     let total_slots = state.slots.len() as u64;
     // Canonical-skip percentage is the operator-facing failure

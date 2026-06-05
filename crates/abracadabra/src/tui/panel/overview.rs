@@ -144,12 +144,16 @@ fn fmt_bucket(secs: i64) -> String {
 /// (see `model::buckets::fast_finalize_pct`), so the ratio honestly
 /// describes "of finalized slots, what fraction took the fast path".
 ///
-/// Bands calibrated against operator-observed cluster performance:
+/// Bands calibrated against operator-observed cluster performance.
+/// Verdict text shows the band's actual RANGE (not just its lower
+/// threshold) so the operator reads "this validator is in the
+/// 80-95% band" rather than the misleading "above 80%". Single-
+/// threshold phrasing implied the top of the scale was still open:
 ///
-/// - `>= FAST_FIN_PERFECT_PCT (98)` → `perfect`  green BOLD
-/// - `>= FAST_FIN_GOOD_PCT    (95)` → `OK`       green
-/// - `>= FAST_FIN_WARN_PCT    (80)` → `fine`     yellow
-/// - below                          → `degraded` red
+/// - `[98, ∞)`  → `perfect (>=98%)`              green BOLD
+/// - `[95, 98)` → `OK (95-98%)`                   green
+/// - `[80, 95)` → `fine (80-95%)`                 yellow
+/// - `[0,  80)` → `degraded (<80%)`               red
 fn fast_finalize_verdict(fast_pct: f64) -> (ratatui::style::Style, &'static str, &'static str) {
     if fast_pct >= theme::FAST_FIN_PERFECT_PCT {
         (
@@ -158,12 +162,12 @@ fn fast_finalize_verdict(fast_pct: f64) -> (ratatui::style::Style, &'static str,
             "perfect (>=98%)",
         )
     } else if fast_pct >= theme::FAST_FIN_GOOD_PCT {
-        (theme::good_style(), "[✓]", "OK (>=95%)")
+        (theme::good_style(), "[✓]", "OK (95-98%)")
     } else if fast_pct >= theme::FAST_FIN_WARN_PCT {
         (
             theme::warn_style(),
             "[✗]",
-            "fine (>=80%) — slow path active",
+            "fine (80-95%) — slow path active",
         )
     } else {
         (
@@ -778,11 +782,11 @@ mod tests {
         assert!(style_perfect.add_modifier.contains(Modifier::BOLD));
 
         let (_, _, txt_ok) = fast_finalize_verdict(95.0);
-        assert_eq!(txt_ok, "OK (>=95%)");
+        assert_eq!(txt_ok, "OK (95-98%)");
 
         // The exact value from the operator's screenshot.
         let (_, _, txt_fine) = fast_finalize_verdict(92.35);
-        assert_eq!(txt_fine, "fine (>=80%) — slow path active");
+        assert_eq!(txt_fine, "fine (80-95%) — slow path active");
 
         let (_, _, txt_degraded) = fast_finalize_verdict(79.99);
         assert_eq!(txt_degraded, "degraded (<80%) — slow path dominant");
@@ -791,7 +795,15 @@ mod tests {
         let (_, _, txt_98) = fast_finalize_verdict(98.0);
         assert_eq!(txt_98, "perfect (>=98%)");
         let (_, _, txt_80) = fast_finalize_verdict(80.0);
-        assert_eq!(txt_80, "fine (>=80%) — slow path active");
+        assert_eq!(txt_80, "fine (80-95%) — slow path active");
+        // Upper boundary of the OK band: 97.99 stays OK; 98.0 promotes
+        // to perfect. Anchors the closed-open semantics of the bands.
+        let (_, _, txt_97) = fast_finalize_verdict(97.99);
+        assert_eq!(txt_97, "OK (95-98%)");
+        // Upper boundary of the fine band: 94.99 stays fine; 95.0 promotes
+        // to OK.
+        let (_, _, txt_94) = fast_finalize_verdict(94.99);
+        assert_eq!(txt_94, "fine (80-95%) — slow path active");
     }
 
     #[test]
