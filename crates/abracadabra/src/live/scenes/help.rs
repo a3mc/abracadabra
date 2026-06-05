@@ -70,6 +70,12 @@ impl HelpPanel {
     /// `scroll`. Lines below the visible window are hidden; lines
     /// above are skipped. The top row carries a hint line so the
     /// operator never has to wonder how to dismiss the panel.
+    ///
+    /// `scroll` is clamped against the inner viewport here so an
+    /// over-scrolled offset (e.g. `[G]` / `End` arriving from the
+    /// scene engine which doesn't know the render-time area height)
+    /// pins the last full page rather than skipping past every
+    /// line and leaving the viewport blank.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, scroll: usize) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -82,8 +88,20 @@ impl HelpPanel {
             return;
         }
         let take = usize::from(inner.height);
-        let visible: Vec<Line<'static>> =
-            self.lines.iter().skip(scroll).take(take).cloned().collect();
+        // Render-side clamp: the scene engine clamps `help_scroll`
+        // against `line_count() - 1` because it doesn't track the
+        // render area, so a `[G]` press can leave `scroll` past the
+        // last full page. Pin it here to `lines.len() - take` so the
+        // bottom row of the glossary stays visible.
+        let max_scroll = self.lines.len().saturating_sub(take);
+        let effective = scroll.min(max_scroll);
+        let visible: Vec<Line<'static>> = self
+            .lines
+            .iter()
+            .skip(effective)
+            .take(take)
+            .cloned()
+            .collect();
         frame.render_widget(Paragraph::new(visible), inner);
     }
 }
@@ -420,6 +438,46 @@ mod tests {
         let panel = HelpPanel::new();
         // Way more rows than content — should clamp to 0.
         assert_eq!(panel.max_scroll(u16::MAX), 0);
+    }
+
+    #[test]
+    fn render_clamps_over_scroll_so_last_page_stays_visible() {
+        // MODULES-01 regression: the SceneEngine's `scroll_help`
+        // clamps against `line_count() - 1` because it doesn't see
+        // the render area. A `[G]` / `End` press therefore arrives
+        // here with `scroll` past `lines.len() - inner.height`. The
+        // render path must clamp the value so the bottom page of
+        // the glossary stays visible, not collapse to a blank
+        // viewport.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+
+        let panel = HelpPanel::new();
+        let n = panel.line_count();
+        // Frame area large enough for a border + 10-row inner.
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let area = Rect::new(0, 0, 60, 12);
+        // Deliberately over-scroll past every line — the scene engine
+        // can legitimately send this on `[G]`.
+        let over_scroll = n + 50;
+        terminal
+            .draw(|f| panel.render(f, area, over_scroll))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        // Concatenate the inner rows (skipping the 1-row top/bottom
+        // border). At least one inner row must carry visible text —
+        // the bug was that every row was blank.
+        let inner_text: String = (1..11)
+            .flat_map(|y: u16| {
+                (1..59u16).map(move |x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            })
+            .collect();
+        assert!(
+            inner_text.trim().chars().any(|c| !c.is_whitespace()),
+            "over-scrolled render must clamp and show the last page, \
+             not leave the viewport blank: inner_text={inner_text:?}",
+        );
     }
 
     #[test]
