@@ -191,6 +191,9 @@ pub fn detect_truecolor_from(
     }
     // Rung 5.
     if let Some(prog) = term_program {
+        // Apple_Terminal exported by Terminal.app on macOS 10.7-14
+        // (verified at LIVE-67). Update this matcher if Apple ships
+        // a new TERM_PROGRAM value.
         if prog == "Apple_Terminal" {
             return false;
         }
