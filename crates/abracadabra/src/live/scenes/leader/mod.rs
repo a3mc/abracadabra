@@ -858,4 +858,114 @@ mod tests {
         // panic if a negative ever slips through.
         assert_eq!(format_since(-1), "-1s");
     }
+
+    // ---- LIVE-65 headline right-alignment split --------------------
+
+    /// Drive a pane to a state where `summary()` carries `has_windows`
+    /// AND `last_produced_at = Some(...)`. Required for the
+    /// `since last block` segment to appear in `render_headline`.
+    fn pane_with_one_produced_slot() -> LeaderPane {
+        let mut p = LeaderPane::new();
+        p.on_event(&mk(pw(100, 103)));
+        p.on_event(&mk(EventKind::Metric(MetricEvent::LeaderSlotElapsed {
+            slot: 100,
+            elapsed_ms: 400,
+        })));
+        p.on_event(&mk(EventKind::BankFrozen {
+            slot: 100,
+            hash: "h".into(),
+            signature_count: 12_000,
+        }));
+        p.on_event(&mk(EventKind::Finalized {
+            slot: 100,
+            hash: "h".into(),
+            fast: true,
+        }));
+        p
+    }
+
+    #[test]
+    fn render_headline_right_aligns_since_segment_in_right_card_column_when_wide() {
+        // LIVE-65: when the area is at least MIN_TWO_CARD_WIDTH the
+        // headline splits 50/1/Min(0) and the "since last block"
+        // segment renders right-aligned in the right card column.
+        // Anchor: the `since last block` text must appear AFTER the
+        // first card-column boundary, never straddling the vertical
+        // separator slot.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let pane = pane_with_one_produced_slot();
+        let width: u16 = MIN_TWO_CARD_WIDTH + 20; // generous wide area
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        let area = Rect::new(0, 0, width, 1);
+        terminal
+            .draw(|f| super::render::render_headline(&pane, f, area))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row: String = (0..width)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // The "since last block" label must appear in the row at all.
+        let since_pos = row.find("since last block").unwrap_or_else(|| {
+            panic!("`since last block` segment missing in wide headline: {row:?}")
+        });
+        // Wide layout pins it to the right card cell (`Min(0)`
+        // starting after `Percentage(50) + 1`). The label's start
+        // index must lie strictly past the half-width boundary.
+        let half = usize::from(width / 2);
+        assert!(
+            since_pos > half,
+            "since-segment must land in right card column, not straddle separator: \
+             since_pos={since_pos}, half={half}, row={row:?}",
+        );
+    }
+
+    #[test]
+    fn render_headline_narrow_fallback_uses_single_line_with_three_space_separator() {
+        // Below MIN_TWO_CARD_WIDTH the headline falls back to a single
+        // line: left spans + "   " separator + right spans. Both
+        // segments must appear so the "since last block" data is not
+        // silently dropped on narrow widths.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let pane = pane_with_one_produced_slot();
+        let width: u16 = MIN_TWO_CARD_WIDTH - 5; // strictly narrower
+        assert!(width >= MIN_ONE_CARD_WIDTH, "test setup: still wide enough");
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        let area = Rect::new(0, 0, width, 1);
+        terminal
+            .draw(|f| super::render::render_headline(&pane, f, area))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row: String = (0..width)
+            .map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // Both the left-side `bank avg` segment and the right-side
+        // `since last block` must coexist on the single line.
+        assert!(
+            row.contains("bank avg"),
+            "narrow fallback dropped left segment: {row:?}"
+        );
+        assert!(
+            row.contains("since last block"),
+            "narrow fallback dropped right segment (LIVE-65 single-line path): {row:?}"
+        );
+        // The single-line path inserts a 3-space separator between the
+        // two segment groups; verify there is at least one `   ` run
+        // somewhere between them.
+        let bank_idx = row.find("bank avg").unwrap();
+        let since_idx = row.find("since last block").unwrap();
+        let between = &row[bank_idx..since_idx];
+        assert!(
+            between.contains("   "),
+            "narrow fallback missing the 3-space separator between segments: \
+             between={between:?}, row={row:?}",
+        );
+    }
 }

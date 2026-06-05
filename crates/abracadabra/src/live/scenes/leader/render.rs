@@ -59,7 +59,7 @@ pub(super) fn render(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
     render_windows(pane, frame, chunks[2]);
 }
 
-fn render_headline(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
+pub(super) fn render_headline(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
     let spinner = spinner_frame(pane.event_count, pane.last_event_at);
 
     let s = pane.summary();
