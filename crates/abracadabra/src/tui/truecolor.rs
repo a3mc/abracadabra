@@ -128,29 +128,44 @@ pub const fn quantize_to_cube(r: u8, g: u8, b: u8) -> u8 {
 }
 
 /// Inspect the process environment and decide whether the terminal
-/// supports 24-bit RGB. See module docs for the ladder.
+/// supports 24-bit RGB. Thin wrapper around the pure
+/// [`detect_truecolor_from`] for testability — reads env once and
+/// hands the values to the pure decision function.
 fn detect_truecolor_support() -> bool {
-    // Rung 1: explicit COLORTERM advertisement — most reliable signal
-    // when set, because terminals that advertise truecolor universally
-    // mean it.
-    if let Ok(ct) = env::var("COLORTERM") {
+    detect_truecolor_from(
+        env::var("COLORTERM").ok().as_deref(),
+        env::var("TERM_PROGRAM").ok().as_deref(),
+        env::var("TERM").ok().as_deref(),
+    )
+}
+
+/// Pure decision function for the detection ladder.
+///
+/// Takes the relevant env-var values explicitly so unit tests can
+/// exercise every rung without mutating process env (parallel tests
+/// race catastrophically on shared env). See module docs for the
+/// ladder. Rung numbers refer to the ladder in the module docstring.
+pub fn detect_truecolor_from(
+    colorterm: Option<&str>,
+    term_program: Option<&str>,
+    term: Option<&str>,
+) -> bool {
+    // Rung 1.
+    if let Some(ct) = colorterm {
         let ct = ct.to_ascii_lowercase();
         if ct == "truecolor" || ct == "24bit" {
             return true;
         }
     }
-    // Rung 2: macOS Terminal.app self-identifies via TERM_PROGRAM. It
-    // does NOT support truecolor on any version released to date.
-    if let Ok(prog) = env::var("TERM_PROGRAM") {
+    // Rung 2.
+    if let Some(prog) = term_program {
         if prog == "Apple_Terminal" {
             return false;
         }
     }
-    // Rung 3: TERM contains a known truecolor-capable terminal name.
-    // SSH usually forwards TERM, so this still catches modern remote
-    // terminals whose COLORTERM was stripped.
-    if let Ok(term) = env::var("TERM") {
-        let term = term.to_ascii_lowercase();
+    // Rung 3.
+    if let Some(t) = term {
+        let t = t.to_ascii_lowercase();
         for needle in [
             "kitty",
             "alacritty",
@@ -159,13 +174,12 @@ fn detect_truecolor_support() -> bool {
             "ghostty",
             "iterm",
         ] {
-            if term.contains(needle) {
+            if t.contains(needle) {
                 return true;
             }
         }
     }
-    // Rung 4: default to truecolor — most modern terminals support
-    // it, and operators on legacy terminals can pass --no-truecolor.
+    // Rung 4.
     true
 }
 
@@ -265,13 +279,100 @@ mod tests {
 
     // ---- detection ladder -----------------------------------------
     //
-    // detect_truecolor_support() reads process env, which is shared
-    // across parallel tests. Manipulating env in a unit test would
-    // race against any other test that also reads it, so the ladder
-    // is exercised only via explicit fixed-env probes in a single
-    // serial test. Production behaviour is covered by manual QA on
-    // macOS Terminal.app + iTerm2 + Alacritty.
-    //
-    // The function logic is small enough that line-by-line review
-    // covers the cases the env-mutation tests would have.
+    // The pure-function variant `detect_truecolor_from` takes all
+    // three env values explicitly so the ladder is testable without
+    // mutating shared process env. Every rung gets a direct test.
+
+    #[test]
+    fn rung_1_colorterm_truecolor_returns_true() {
+        assert!(detect_truecolor_from(Some("truecolor"), None, None));
+        assert!(detect_truecolor_from(Some("24bit"), None, None));
+        // Case-insensitive: real terminals advertise mixed-case.
+        assert!(detect_truecolor_from(Some("TrueColor"), None, None));
+        assert!(detect_truecolor_from(Some("24BIT"), None, None));
+    }
+
+    #[test]
+    fn rung_1_takes_precedence_over_apple_terminal() {
+        // If someone wrapped Terminal.app in a shim that DOES set
+        // COLORTERM, trust the advertisement — there's no good
+        // reason to refuse working colour for an opt-in operator.
+        assert!(detect_truecolor_from(
+            Some("truecolor"),
+            Some("Apple_Terminal"),
+            Some("xterm-256color"),
+        ));
+    }
+
+    #[test]
+    fn rung_2_apple_terminal_without_colorterm_returns_false() {
+        // The headline scenario: stock macOS Terminal.app. No
+        // COLORTERM advertisement, TERM_PROGRAM identifies the
+        // terminal, TERM is the misleading `xterm-256color`. The
+        // detector must return false so the 6×6×6 cube takes over.
+        assert!(!detect_truecolor_from(
+            None,
+            Some("Apple_Terminal"),
+            Some("xterm-256color"),
+        ));
+    }
+
+    #[test]
+    fn rung_3_known_truecolor_terminals_match() {
+        for term in [
+            "xterm-kitty",
+            "alacritty",
+            "wezterm",
+            "xterm-ghostty",
+            "iterm.app",
+            "vscode",
+        ] {
+            assert!(
+                detect_truecolor_from(None, None, Some(term)),
+                "TERM={term:?} must be detected as truecolor-capable"
+            );
+        }
+    }
+
+    #[test]
+    fn rung_3_case_insensitive() {
+        assert!(detect_truecolor_from(None, None, Some("XTERM-KITTY")));
+        assert!(detect_truecolor_from(None, None, Some("Alacritty")));
+    }
+
+    #[test]
+    fn rung_4_default_is_truecolor_when_nothing_matches() {
+        // Modern terminals overwhelmingly support truecolor; default
+        // to it so the operator does not have to opt in. Apple_Terminal
+        // is the only widely-deployed terminal that lies about it,
+        // and rung 2 catches that case.
+        assert!(detect_truecolor_from(None, None, Some("xterm-256color")));
+        assert!(detect_truecolor_from(None, None, None));
+        assert!(detect_truecolor_from(None, None, Some("dumb")));
+    }
+
+    #[test]
+    fn rung_1_ignores_unrelated_colorterm_values() {
+        // Some legacy terminals set COLORTERM to their own name as a
+        // breadcrumb; we should not interpret that as a 24-bit
+        // capability claim. Fall through to subsequent rungs.
+        assert!(!detect_truecolor_from(
+            Some("rxvt"),
+            Some("Apple_Terminal"),
+            None,
+        ));
+        assert!(detect_truecolor_from(
+            Some("rxvt"),
+            None,
+            Some("xterm-kitty")
+        ));
+    }
+
+    #[test]
+    fn rung_2_other_term_programs_do_not_force_false() {
+        // iTerm2 sets TERM_PROGRAM=iTerm.app and DOES support
+        // truecolor. Rung 2 must not match it. Falls through to
+        // rung 4 (default true) when TERM doesn't match rung 3.
+        assert!(detect_truecolor_from(None, Some("iTerm.app"), None));
+    }
 }
