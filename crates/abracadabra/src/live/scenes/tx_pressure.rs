@@ -21,6 +21,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -106,11 +107,31 @@ struct CoordKey {
     area_h: u16,
 }
 
+/// One Canvas coordinate triple: `(x, y, t)`.
+///
+/// - `x` — seconds since `latest_event_ts - VISIBLE_WINDOW`.
+/// - `y` — `signature_count` for the sample.
+/// - `t` — normalised pressure for the thermal gradient.
+type CoordTriple = (f64, f64, f64);
+
+/// Shared, immutable Canvas coord buffer. `Arc<[_]>` so the render
+/// path can hand the closure an owned `'static` value via a cheap
+/// `Arc::clone` rather than a `Vec` deep copy.
+type CoordBuf = Arc<[CoordTriple]>;
+
 /// Pre-computed coords plus the key they were computed from. Lives
 /// behind a [`RefCell`] because [`Pane::render`] takes `&self`.
+///
+/// `coords` is stored as [`CoordBuf`] so the Canvas paint closure
+/// (which needs an owned `'static`-bound value) can `Arc::clone`
+/// rather than allocating a fresh `Vec` per frame. The PERF-04 path
+/// previously did `cache.coords.clone()` which allocated a fresh
+/// `Vec<(f64, f64, f64)>` every render — roughly 200 samples × 24
+/// bytes per frame = ~5 KB / render. `Arc::clone` drops it to a
+/// single 16-byte pointer + atomic refcount bump.
 #[derive(Debug, Default)]
 struct ChartCache {
-    coords: Vec<(f64, f64, f64)>,
+    coords: CoordBuf,
     key: Option<CoordKey>,
     /// Cached `y_max` matching `coords`. Re-emitted to the Canvas
     /// widget so the paint closure does not recompute the peak.
@@ -274,8 +295,11 @@ impl TxPressurePane {
 
         let mut cache = self.cache.borrow_mut();
         if cache.key != Some(key) {
-            cache.coords.clear();
-            cache.coords.reserve(self.samples.len());
+            // Build a fresh `Vec` then convert to `Arc<[_]>` for the
+            // cache slot. The `Vec → Arc<[_]>` conversion is a single
+            // allocation; subsequent frames reuse the Arc via cheap
+            // refcount bumps.
+            let mut next: Vec<CoordTriple> = Vec::with_capacity(self.samples.len());
             for s in &self.samples {
                 // (now_ts - s.ts) is a `time::Duration` (signed). Clamp
                 // age into [0, window_secs] so a freak out-of-order
@@ -285,8 +309,9 @@ impl TxPressurePane {
                 let x = (window_secs - age).max(0.0);
                 let y = s.signatures as f64;
                 let t = (y / y_max).clamp(0.0, 1.0);
-                cache.coords.push((x, y, t));
+                next.push((x, y, t));
             }
+            cache.coords = Arc::from(next);
             cache.key = Some(key);
             cache.y_max = y_max;
             #[cfg(test)]
@@ -294,11 +319,10 @@ impl TxPressurePane {
         }
 
         // Hand the cached coords to the Canvas paint closure as a
-        // borrow-free owned copy. The clone is cheap (one `Vec` of
-        // `(f64, f64, f64)`) and sidesteps lifetime issues with the
-        // `'static`-bound closure ratatui's Canvas takes. The closure
-        // body itself avoids any per-frame allocation.
-        let coords_snapshot: Vec<(f64, f64, f64)> = cache.coords.clone();
+        // borrow-free owned `Arc`. The clone is one atomic refcount
+        // bump rather than the prior per-frame `Vec` realloc; the
+        // closure body itself avoids any per-frame allocation.
+        let coords_snapshot: CoordBuf = Arc::clone(&cache.coords);
         let cached_y_max = cache.y_max;
         drop(cache);
 
@@ -307,9 +331,10 @@ impl TxPressurePane {
             .x_bounds([0.0, window_secs])
             .y_bounds([0.0, cached_y_max])
             .paint(move |ctx| {
+                let coords: &[CoordTriple] = &coords_snapshot;
                 // 1. Area fill: vertical strips at each sample,
                 // dimmed thermal color.
-                for &(x, y, t) in &coords_snapshot {
+                for &(x, y, t) in coords {
                     ctx.draw(&CanvasLine {
                         x1: x,
                         y1: 0.0,
@@ -322,7 +347,7 @@ impl TxPressurePane {
                 // 2. Smooth curve: segments between consecutive
                 // samples, full-intensity thermal color (averaged
                 // across the segment for smoothness).
-                for w in coords_snapshot.windows(2) {
+                for w in coords.windows(2) {
                     let (x1, y1, t1) = w[0];
                     let (x2, y2, t2) = w[1];
                     ctx.draw(&CanvasLine {
@@ -335,7 +360,7 @@ impl TxPressurePane {
                 }
 
                 // 3. "Now" glow: a small cross at the latest sample.
-                if let Some(&(x, y, t)) = coords_snapshot.last() {
+                if let Some(&(x, y, t)) = coords.last() {
                     let glow = thermal_color(t.max(0.6));
                     let dx = window_secs * 0.005;
                     let dy = cached_y_max * 0.025;
