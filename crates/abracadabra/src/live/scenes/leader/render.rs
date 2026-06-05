@@ -102,7 +102,36 @@ fn render_headline(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
             theme::value_style().add_modifier(Modifier::BOLD),
         ));
     }
+    if let Some(at) = s.last_produced_at {
+        // Now-vs-event delta — wall-clock honest in live tail.
+        // Replay mode shows the gap between log timestamps and the
+        // operator's machine clock; that is the right thing because
+        // the replay is "now" from the operator's seat.
+        let now = time::OffsetDateTime::now_utc();
+        let elapsed_secs = (now - at).whole_seconds().max(0);
+        spans.push(Span::styled("   since last block ", theme::label_style()));
+        spans.push(Span::styled(
+            format_since(elapsed_secs),
+            theme::value_style().add_modifier(Modifier::BOLD),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Single-unit duration formatter for the "since last block" label.
+/// Keeps the headline tight: `Ns` under a minute, `Nm` under an
+/// hour, `Nh` under a day, `Nd` beyond that. No multi-unit
+/// composition — operator just needs the order of magnitude.
+pub(super) fn format_since(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
 /// Render the recent leader-window cards.

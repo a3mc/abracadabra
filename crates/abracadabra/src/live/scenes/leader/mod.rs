@@ -794,4 +794,68 @@ mod tests {
         assert_eq!(banked_style.fg, Some(Color::Green));
         assert_eq!(banking_style.fg, Some(Color::Yellow));
     }
+
+    // ---- since-last-block headline timer ---------------------------
+
+    #[test]
+    fn summary_last_produced_at_is_none_when_no_slot_produced() {
+        // LIVE-60: empty pane and pane with windows-only-but-not-yet-
+        // produced both leave `last_produced_at` as `None`. The
+        // render path keys off this to omit the segment, sidestepping
+        // duplication with the "waiting for first leader window"
+        // line that already covers the empty case.
+        let empty = LeaderPane::new();
+        assert!(empty.summary().last_produced_at.is_none());
+
+        let mut pending = LeaderPane::new();
+        pending.on_event(&mk(pw(100, 103)));
+        // ProduceWindow alone — no BankFrozen yet — leaves slots in
+        // Pending state, so `last_produced_at` stays None.
+        assert!(pending.summary().last_produced_at.is_none());
+    }
+
+    #[test]
+    fn summary_last_produced_at_tracks_latest_bank_frozen_across_slots() {
+        // LIVE-60: pick the MAX bank_frozen_at across produced/banked
+        // slots so the headline reflects the most-recent block, not
+        // an arbitrary one.
+        use time::Duration as TimeDuration;
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        let t_later = t0 + TimeDuration::seconds(30);
+
+        let mut p = LeaderPane::new();
+        p.on_event(&mk(pw(100, 103)));
+        p.on_event(&Event {
+            ts: t0,
+            kind: EventKind::BankFrozen {
+                slot: 100,
+                hash: "a".into(),
+                signature_count: 100,
+            },
+        });
+        p.on_event(&Event {
+            ts: t_later,
+            kind: EventKind::BankFrozen {
+                slot: 101,
+                hash: "b".into(),
+                signature_count: 200,
+            },
+        });
+        assert_eq!(p.summary().last_produced_at, Some(t_later));
+    }
+
+    #[test]
+    fn format_since_uses_single_unit_per_magnitude() {
+        use super::render::format_since;
+        assert_eq!(format_since(0), "0s");
+        assert_eq!(format_since(59), "59s");
+        assert_eq!(format_since(60), "1m");
+        assert_eq!(format_since(3_599), "59m");
+        assert_eq!(format_since(3_600), "1h");
+        assert_eq!(format_since(86_399), "23h");
+        assert_eq!(format_since(86_400), "1d");
+        // Negative is clamped at the call site; helper should not
+        // panic if a negative ever slips through.
+        assert_eq!(format_since(-1), "-1s");
+    }
 }

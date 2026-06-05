@@ -210,6 +210,13 @@ pub(super) struct WindowSummary {
     pub(super) sig_max: Option<u64>,
     /// Max `num_data_shreds` across retained produced slots.
     pub(super) sh_max: Option<u64>,
+    /// Latest `bank_frozen_at` across produced/banked slots. Drives
+    /// the "since last block" timer in the headline. `None` when no
+    /// slot has been banked yet — the headline omits the segment
+    /// rather than printing a meaningless zero. The empty-pane case
+    /// is already covered by the `waiting for first leader window`
+    /// line so there is no duplication risk between them.
+    pub(super) last_produced_at: Option<OffsetDateTime>,
 }
 
 impl LeaderPane {
@@ -249,6 +256,10 @@ impl LeaderPane {
                     }
                     if let Some(sh) = s.num_data_shreds {
                         out.sh_max = Some(out.sh_max.map_or(sh, |m| m.max(sh)));
+                    }
+                    if let Some(at) = s.bank_frozen_at {
+                        out.last_produced_at =
+                            Some(out.last_produced_at.map_or(at, |prev| prev.max(at)));
                     }
                 }
             }
