@@ -1,25 +1,35 @@
-//! Chain pane — calm spinner + live timing table.
+//! Chain pane — cannon-particle visualisation of recent slot outcomes.
 //!
-//! Most slots on a healthy validator are fast-finalised canonical
-//! slots — there is no useful per-slot visual to draw for them.
-//! Instead the pane shows:
+//! Layout (top → bottom inside the border):
 //!
-//! - A spinner and the **tip slot number** at the top, proving the
-//!   stream is live and giving the operator a slot counter.
-//! - A four-row **live timing table** (p50 / p95 in ms) for the four
-//!   stage-delta families the Windows tab also reports — local slot
-//!   cadence (bank-frozen inter-arrival at this node, used as a
-//!   proxy for cluster cadence), assembly, consensus, lifecycle.
-//!   Definitions match [`crate::model::analysis::LatencyStages`]
-//!   exactly so the live numbers are directly comparable to the
-//!   Windows-tab snapshot.
+//! 1. **Status chips** — `cadence · assembly · consensus · lifecycle`
+//!    `p50/p95` ms over the retained slot history. Definitions match
+//!    [`crate::model::analysis::LatencyStages`] exactly so the values
+//!    are directly comparable to the Windows-tab snapshot.
+//! 2. **Slot chip** — spinner + tip slot number on a dark slate
+//!    background, plus an optional `⚠ N anom` segment when parser
+//!    walk-back anomalies have fired.
+//! 3. **Cannon `▼`** — a single centred glyph one row below the slot
+//!    chip; particles spawn flush beneath it and fall vertically.
+//! 4. **Arena** — empty area above the bucket where in-flight
+//!    cannon particles travel from cannon down to landing.
+//! 5. **Bucket** — fixed 25×5 = 125-cell page at the bottom of the
+//!    pane. Cells are placed at **static positions** and never move
+//!    until the page wipes; when the 125th slot lands a left-to-right
+//!    **magic wipe** (~500 ms) clears the bucket and the next page
+//!    begins from cell 0.
+//! 6. **Left-side tx stream** — strip between the pane's left edge
+//!    and the bucket. Each row shows one recent slot with a nonzero
+//!    `BankFrozen.signature_count`: slot digits, a bar glyph, and
+//!    the compact count. Newest at top.
 //!
 //! The underlying graph model tracks every `Block` / `Finalized` /
-//! `VotingSkip` / `VotingNotarize` / `SettingRoot` event:
+//! `VotingSkip` / `VotingNotarize` / `SettingRoot` / `BankFrozen` /
+//! `FirstShred` / `ProduceWindow` event:
 //!
 //! - [`EventKind::Block { slot, hash, parent_slot, parent_hash, .. }`]
 //!   stores the parent edge `(slot, hash) → (parent_slot, parent_hash)`.
-//!   Two distinct hashes for the same slot ⇒ fork.
+//!   Two distinct hashes for the same slot ⇒ fork (⊕ glyph).
 //! - [`EventKind::Finalized { slot, hash, .. }`] anchors
 //!   `(slot, hash)` as canonical, then walks back through parent
 //!   edges marking every ancestor canonical too. If the `Finalized`
@@ -27,19 +37,14 @@
 //!   `Block` event (so we had no parent edge to walk), the next
 //!   `Block` event retroactively replays the walk-back from the
 //!   parent.
-//! - [`EventKind::VotingSkip { slot }`] records the skip. At render
-//!   time the skip is classified (see below).
-//!
-//! Snapshot row tallies canonical-skip / indeterminate counts.
-//!
-//! Label vocabulary matches the Slots tab: `CSKIP` is the canonical-skip
-//! term across the whole TUI. The Live-tab chain pane uses the same
-//! token; see `tui/panel/slots.rs` for the legend that defines it.
-//!
-//! Note: `ParentReady` and `SettingRoot` events are intentionally not
-//! surfaced in this pane — operator deemed them low-signal noise.
-//! Earlier iterations carried a scrolling event log; that pane was
-//! removed and the timing table + snapshot row replaced it.
+//! - [`EventKind::ProduceWindow`] marks each slot in the window as
+//!   ours; the bucket classifier paints those with a `★` glyph so
+//!   own leader slots stand out (LIVE-56).
+//! - [`EventKind::BankFrozen`] captures `signature_count` per slot
+//!   to drive the left-side tx stream (LIVE-58).
+//! - [`EventKind::VotingSkip`] / [`EventKind::VotingSkipFallback`]
+//!   record the skip; the classifier resolves `▴` (canonical-skip)
+//!   or `▾` (indeterminate) on render.
 //!
 //! Classification (mirrors the aggregator):
 //!
@@ -62,14 +67,23 @@
 //! the others are fork siblings. We rely solely on `Finalized`
 //! anchors walking backwards through observed parent edges.
 //!
+//! Note: `ParentReady` and `SettingRoot` events are not directly
+//! surfaced — `SettingRoot` advances the prune cutoff via
+//! `last_root` and `ParentReady` is ignored entirely (low-signal).
+//!
 //! ## Module layout
 //!
 //! - [`state`] — [`ChainPane`], `SlotState`, `SkipClass`, walk-back,
 //!   skip classification, event observation, derived queries.
-//! - [`render`] — ratatui rendering (border, spinner, timing table,
-//!   snapshot row).
+//! - [`render`] — ratatui rendering (border, status chips, slot
+//!   chip, cannon, arena, bucket, tx stream).
 //! - [`format`] — `TimingTable` + stage-percentile helpers shared
 //!   between state and render.
+//! - [`glyph`] — `CellGlyph` classifier turning a `SlotState` plus
+//!   canonical-membership flag into a `(char, Style)` pair. Shared
+//!   between in-flight particles and the bucket cache.
+//! - [`particle`] — `CannonSystem` (in-flight particles, paged
+//!   bucket, magic-wipe lifecycle, glyph cache).
 
 mod format;
 mod glyph;
