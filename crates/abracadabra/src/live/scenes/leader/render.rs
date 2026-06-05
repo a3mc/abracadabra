@@ -5,7 +5,7 @@
 //! [`super::state::OurSlot`]) and a [`Frame`] sink. The split keeps
 //! all `ratatui::*` use out of the state module.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -83,39 +83,76 @@ fn render_headline(pane: &LeaderPane, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
-    let mut spans = vec![spinner_span];
+    let mut left_spans = vec![spinner_span];
     if let Some(ms) = s.bank_ms_avg {
-        spans.push(Span::styled("bank avg ", theme::label_style()));
-        spans.push(Span::styled(format!("{ms}ms"), theme::value_style()));
+        left_spans.push(Span::styled("bank avg ", theme::label_style()));
+        left_spans.push(Span::styled(format!("{ms}ms"), theme::value_style()));
     }
     if let Some(max) = s.sig_max {
-        spans.push(Span::styled("   sig max ", theme::label_style()));
-        spans.push(Span::styled(
+        left_spans.push(Span::styled("   sig max ", theme::label_style()));
+        left_spans.push(Span::styled(
             format_count_compact(max),
             theme::value_style().add_modifier(Modifier::BOLD),
         ));
     }
     if let Some(max) = s.sh_max {
-        spans.push(Span::styled("   sh max ", theme::label_style()));
-        spans.push(Span::styled(
+        left_spans.push(Span::styled("   sh max ", theme::label_style()));
+        left_spans.push(Span::styled(
             format_count_compact(max),
             theme::value_style().add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(at) = s.last_produced_at {
-        // Now-vs-event delta — wall-clock honest in live tail.
-        // Replay mode shows the gap between log timestamps and the
-        // operator's machine clock; that is the right thing because
-        // the replay is "now" from the operator's seat.
-        let now = time::OffsetDateTime::now_utc();
-        let elapsed_secs = (now - at).whole_seconds().max(0);
-        spans.push(Span::styled("   since last block ", theme::label_style()));
-        spans.push(Span::styled(
-            format_since(elapsed_secs),
-            theme::value_style().add_modifier(Modifier::BOLD),
-        ));
+
+    // Build the right-side "since last block" span set independently.
+    // Now-vs-event delta — wall-clock honest in live tail. Replay
+    // mode shows the gap between log timestamps and the operator's
+    // machine clock; that is the right thing because the replay is
+    // "now" from the operator's seat.
+    let right_spans: Vec<Span<'static>> = s
+        .last_produced_at
+        .map(|at| {
+            let now = time::OffsetDateTime::now_utc();
+            let elapsed_secs = (now - at).whole_seconds().max(0);
+            vec![
+                Span::styled("since last block ", theme::label_style()),
+                Span::styled(
+                    format_since(elapsed_secs),
+                    theme::value_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]
+        })
+        .unwrap_or_default();
+
+    // Wide layout: split the headline along the same 50/1/Min(0)
+    // axis the two-card row uses so `since last block` lands in the
+    // right card column instead of straddling the vertical
+    // separator (LIVE-65). Narrow fallback: render both span sets
+    // on one line so the segment is not lost.
+    if area.width >= MIN_TWO_CARD_WIDTH {
+        let cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        frame.render_widget(Paragraph::new(Line::from(left_spans)), cells[0]);
+        if !right_spans.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
+                cells[2],
+            );
+        }
+    } else {
+        let mut combined = left_spans;
+        if !right_spans.is_empty() {
+            combined.push(Span::styled("   ", theme::label_style()));
+            combined.extend(right_spans);
+        }
+        frame.render_widget(Paragraph::new(Line::from(combined)), area);
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Single-unit duration formatter for the "since last block" label.
