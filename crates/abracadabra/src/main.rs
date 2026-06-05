@@ -13,12 +13,13 @@ fn main() -> ExitCode {
     let want_tui = !args.text && std::io::stdout().is_terminal();
 
     // Detect terminal truecolor capability once, before any frame
-    // renders. Terminals that misparse 24-bit SGR sequences (notably
-    // macOS Terminal.app) trigger the 6×6×6 cube fallback so chip
-    // backgrounds and tx-pressure gradients render correctly.
-    // `--no-truecolor` forces the fallback; `--force-truecolor` skips
-    // the env-var ladder when the operator knows their terminal is
-    // capable. clap rejects passing both at once.
+    // renders. Terminals that do not implement the SGR 38;2;R;G;B /
+    // 48;2;R;G;B sequences (notably macOS Terminal.app) trigger the
+    // 6×6×6 cube fallback so chip backgrounds and tx-pressure
+    // gradients render correctly. `--no-truecolor` forces the
+    // fallback; `--force-truecolor` skips the env-var ladder when the
+    // operator knows their terminal is capable. clap rejects passing
+    // both at once.
     abracadabra::tui::truecolor::init(args.no_truecolor, args.force_truecolor);
 
     // Verify file accessibility once, up front, before either

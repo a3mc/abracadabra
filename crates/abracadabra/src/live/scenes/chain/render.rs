@@ -64,10 +64,10 @@ const BUCKET_STRIDE: u16 = 2;
 const WIPE_FLASH_WINDOW: f32 = 0.12;
 
 /// Chip colours. Routed through [`crate::tui::truecolor::rgb`] so
-/// terminals that misparse 24-bit SGR sequences (notably macOS
-/// Terminal.app) receive the nearest 6×6×6 cube approximation instead
-/// of the broken truecolor escape. `Color` is `Copy`; the dispatch is
-/// a single atomic load.
+/// terminals that do not implement the SGR 38;2;R;G;B / 48;2;R;G;B
+/// sequences (notably macOS Terminal.app) receive the nearest 6×6×6
+/// cube approximation instead of the fragmented truecolor output.
+/// `Color` is `Copy`; the dispatch is a single atomic load.
 fn chip_label_bg() -> Color {
     crate::tui::truecolor::rgb(46, 54, 68)
 }

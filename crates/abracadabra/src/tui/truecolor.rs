@@ -1,12 +1,13 @@
 //! Terminal truecolor capability detection + 6×6×6 cube fallback.
 //!
-//! macOS Terminal.app reports `TERM=xterm-256color` but does NOT parse
-//! the SGR 38;2;R;G;B / 48;2;R;G;B sequences for 24-bit RGB — it
-//! misparses each `;<digit>` group as an additional palette index, so a
-//! `Color::Rgb` style renders as fragmented multi-color text. Modern
-//! terminals (iTerm2, Alacritty, Kitty, WezTerm, GNOME Terminal,
-//! Konsole, Windows Terminal, recent xterm) parse the sequence
-//! correctly.
+//! macOS Terminal.app reports `TERM=xterm-256color` but does not
+//! implement the SGR 38;2;R;G;B / 48;2;R;G;B sequences for 24-bit RGB.
+//! When the unrecognised parameters are encountered, the visible
+//! result is fragmented multi-colour output — operator-confirmed via
+//! screenshot on macOS 14. Terminals released since approximately
+//! 2017 (iTerm2 ≥3.0, Alacritty, Kitty, WezTerm, GNOME Terminal
+//! ≥3.12, Konsole ≥18.04, Windows Terminal, xterm ≥331) parse the
+//! SGR 38;2;R;G;B sequence per ITU T.416.
 //!
 //! We solve this by routing every truecolor callsite through [`rgb`]:
 //! when truecolor is detected, the helper returns `Color::Rgb` as
@@ -39,20 +40,21 @@
 //! SSH strips `COLORTERM` by default, so the env-var ladder is
 //! conservative under SSH — `Apple_Terminal` detection still works
 //! (the local terminal sets `TERM_PROGRAM` and SSH does forward `TERM`
-//! variants on most setups), but a friend SSHing from a modern
-//! terminal whose `COLORTERM` is stripped will still get truecolor by
-//! default unless they explicitly set `--no-truecolor`. Reasonable
-//! trade-off: most modern terminals handle truecolor, Terminal.app is
-//! the specific outlier.
+//! variants on most setups), but a friend SSHing from a
+//! truecolor-capable terminal whose `COLORTERM` is stripped will still
+//! get truecolor by default unless they explicitly set
+//! `--no-truecolor` or set `NO_COLOR`. Reasonable trade-off:
+//! Terminal.app is the specific outlier the ladder defends against.
 //!
 //! ## Test discipline
 //!
 //! Tests use [`Color::Rgb`] inline in assertions to pin gradient
 //! interpolation behaviour. The global flag defaults to `true` so
-//! every test sees the same colour shape as production on a modern
-//! terminal. Tests that need to exercise the quantiser call
-//! [`quantize_to_cube`] directly rather than flipping the global flag,
-//! so they remain order-independent under parallel execution.
+//! every test sees the same colour shape as production on a
+//! truecolor-capable terminal. Tests that need to exercise the
+//! quantiser call [`quantize_to_cube`] directly rather than flipping
+//! the global flag, so they remain order-independent under parallel
+//! execution.
 
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +63,7 @@ use ratatui::style::Color;
 
 /// Global truecolor flag. Defaults to `true` so tests, which do not
 /// call [`init_from_env`], see the same colour shape as production on
-/// a modern terminal.
+/// a truecolor-capable terminal.
 static TRUECOLOR_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Read the detected mode. Cheap (lock-free atomic load).
@@ -400,10 +402,10 @@ mod tests {
 
     #[test]
     fn rung_4_default_is_truecolor_when_nothing_matches() {
-        // Modern terminals overwhelmingly support truecolor; default
-        // to it so the operator does not have to opt in. Apple_Terminal
-        // is the only widely-deployed terminal that lies about it,
-        // and rung 2 catches that case.
+        // Terminals released since approximately 2017 overwhelmingly
+        // support truecolor; default to it so the operator does not
+        // have to opt in. Apple_Terminal is the only widely-deployed
+        // terminal that lies about it, and rung 5 catches that case.
         assert!(detect_truecolor_from(
             None,
             None,

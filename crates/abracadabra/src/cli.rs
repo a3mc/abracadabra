@@ -46,12 +46,13 @@ pub struct Cli {
     /// Force the 256-colour ANSI fallback instead of 24-bit RGB.
     ///
     /// Use this on terminals that report `TERM=xterm-256color` but do
-    /// not parse 24-bit SGR sequences (most notably the macOS built-in
-    /// Terminal.app, which misparses `\e[38;2;R;G;B m` and renders
-    /// chip backgrounds as fragmented multi-colour text). Auto-detected
-    /// via `COLORTERM` / `TERM_PROGRAM` / `TERM` at startup, so this
-    /// flag is only needed for terminals whose env-var advertisement
-    /// lies about their capabilities.
+    /// not implement the SGR 38;2;R;G;B / 48;2;R;G;B sequences (most
+    /// notably the macOS built-in Terminal.app, which renders chip
+    /// backgrounds as fragmented multi-colour text on encountering
+    /// the unrecognised parameters). Auto-detected via `COLORTERM` /
+    /// `TERM_PROGRAM` / `TERM` at startup, so this flag is only needed
+    /// for terminals whose env-var advertisement lies about their
+    /// capabilities.
     #[arg(long, default_value_t = false)]
     pub no_truecolor: bool,
 
