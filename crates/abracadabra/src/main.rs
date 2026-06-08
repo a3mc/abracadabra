@@ -17,7 +17,7 @@ fn main() -> ExitCode {
     // clap's ArgGroup already guarantees exactly one is set.
     let source = match (args.path, args.unit) {
         (Some(p), None) => LogSource::File(p),
-        (None, Some(u)) => LogSource::Journal { unit: u },
+        (None, Some(u)) => LogSource::Journal { unit: u, since: args.since },
         _ => unreachable!("clap ArgGroup enforces exactly one of path/unit"),
     };
 

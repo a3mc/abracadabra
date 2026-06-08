@@ -60,7 +60,7 @@ pub struct RunStats {
 pub fn run(source: LogSource) -> Result<(State, RunStats), RunError> {
     match source {
         LogSource::File(path) => run_file(path),
-        LogSource::Journal { unit } => run_journal(unit),
+        LogSource::Journal { unit, since } => run_journal(unit, since),
     }
 }
 
@@ -88,9 +88,9 @@ fn run_file(path: PathBuf) -> Result<(State, RunStats), RunError> {
     Ok((state, stats))
 }
 
-fn run_journal(unit: String) -> Result<(State, RunStats), RunError> {
+fn run_journal(unit: String, since: String) -> Result<(State, RunStats), RunError> {
     let mut child = Command::new("journalctl")
-        .args(["-u", &unit, "--no-pager", "-o", "cat"])
+        .args(["-u", &unit, "--no-pager", "-o", "cat", "--since", &since])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -106,7 +106,7 @@ fn run_journal(unit: String) -> Result<(State, RunStats), RunError> {
     });
     let reader = BufReader::with_capacity(64 * 1024, stdout);
 
-    let mut state = State::with_source(LogSource::Journal { unit }, 0);
+    let mut state = State::with_source(LogSource::Journal { unit, since }, 0);
     let mut stats = RunStats::default();
     let started = Instant::now();
 

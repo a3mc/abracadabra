@@ -8,7 +8,7 @@ pub enum LogSource {
     /// A plain file (or symlink to one).
     File(PathBuf),
     /// A systemd unit streamed via `journalctl`.
-    Journal { unit: String },
+    Journal { unit: String, since: String },
 }
 
 impl LogSource {
@@ -16,7 +16,7 @@ impl LogSource {
     pub fn as_display_path(&self) -> PathBuf {
         match self {
             Self::File(p) => p.clone(),
-            Self::Journal { unit } => PathBuf::from(format!("journal:{unit}")),
+            Self::Journal { unit, .. } => PathBuf::from(format!("journal:{unit}")),
         }
     }
 }

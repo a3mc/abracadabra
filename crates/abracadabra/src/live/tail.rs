@@ -149,7 +149,7 @@ pub fn spawn(source: LogSource) -> TailHandle {
                 child: None,
             }
         }
-        LogSource::Journal { unit } => {
+        LogSource::Journal { unit, .. } => {
             let child_proc = Command::new("journalctl")
                 .args(["-u", &unit, "-f", "-o", "cat", "-n", "0"])
                 .stdout(Stdio::piped())

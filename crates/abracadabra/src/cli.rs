@@ -37,6 +37,19 @@ pub struct Cli {
     #[arg(long, value_name = "UNIT", group = "input")]
     pub unit: Option<String>,
 
+    /// How far back to read from the journal (journal mode only).
+    ///
+    /// Passed verbatim to `journalctl --since`. Examples:
+    ///   today            — since midnight today (default)
+    ///   yesterday        — since midnight yesterday
+    ///   "1 hour ago"     — last 60 minutes
+    ///   "2 hours ago"    — last 2 hours
+    ///   "30 min ago"     — last 30 minutes
+    ///   "2026-06-08"     — since a specific date
+    ///   "2026-06-08 10:00:00"  — since a specific date and time
+    #[arg(long, default_value = "today", value_name = "SINCE")]
+    pub since: String,
+
     /// Print a text summary instead of opening the interactive TUI.
     /// (Also auto-enabled when stdout is not a terminal — e.g. piped.)
     #[arg(long, default_value_t = false)]
