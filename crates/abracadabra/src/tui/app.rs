@@ -788,7 +788,7 @@ fn event_loop(
                             app.engine = None;
                         } else {
                             app.tail =
-                                Some(crate::live::tail::spawn(app.state.file_meta.path.clone()));
+                                Some(crate::live::tail::spawn(app.state.file_meta.source.clone()));
                             app.engine = Some(crate::live::scenes::SceneEngine::default_layout());
                         }
                         // Either start or stop unpauses — neither

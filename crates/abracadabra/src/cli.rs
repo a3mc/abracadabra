@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap::ArgGroup;
 
 /// Bucket-size floor: smaller than this and per-bucket aggregates become
 /// statistically noisy on a 21h log, and bucket counts climb into the
@@ -18,13 +19,23 @@ pub const MAX_BUCKET_SECS: i64 = 24 * 3600;
     name = "abracadabra",
     version,
     about = "Solana Alpenglow validator log analyzer",
-    long_about = "Streams a saved validator log, parses Alpenglow consensus events, \
-                  and presents a per-slot lifecycle view in a terminal UI."
+    long_about = "Streams a validator log file or systemd journal unit, parses Alpenglow \
+                  consensus events, and presents a per-slot lifecycle view in a terminal UI."
 )]
+#[command(group(
+    ArgGroup::new("input")
+        .required(true)
+        .args(["path", "unit"]),
+))]
 pub struct Cli {
     /// Path to the validator log file.
-    #[arg(value_name = "LOG")]
-    pub path: PathBuf,
+    #[arg(value_name = "LOG", group = "input")]
+    pub path: Option<PathBuf>,
+
+    /// Systemd unit name to stream from the journal instead of a file.
+    /// journalctl must be available on PATH.
+    #[arg(long, value_name = "UNIT", group = "input")]
+    pub unit: Option<String>,
 
     /// Print a text summary instead of opening the interactive TUI.
     /// (Also auto-enabled when stdout is not a terminal — e.g. piped.)

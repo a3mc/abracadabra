@@ -23,12 +23,14 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::parser::{self, Event, Parsed};
+use crate::source::LogSource;
 
 /// Maximum events kept in [`LiveBuffer::recent`]. Older events drop
 /// off the front as new ones arrive, so memory is bounded regardless
@@ -84,6 +86,8 @@ pub struct TailHandle {
     pub buffer: Arc<Mutex<LiveBuffer>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Held only for the journal variant so we can kill it on drop.
+    child: Option<Arc<Mutex<Child>>>,
 }
 
 impl TailHandle {
@@ -91,11 +95,20 @@ impl TailHandle {
     /// repeatedly is safe (subsequent calls are a no-op).
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        // Kill the journalctl subprocess so the tail thread unblocks
+        // from its blocking read and exits promptly.
+        if let Some(child) = &self.child {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.kill();
+            }
+        }
         if let Some(t) = self.thread.take() {
-            // Join error here means the tail thread panicked. We
-            // already toggled shutdown; nothing actionable from the
-            // caller's side. Discard.
             let _ = t.join();
+        }
+        if let Some(child) = self.child.take() {
+            if let Ok(mut c) = child.lock() {
+                let _ = c.wait();
+            }
         }
     }
 }
@@ -106,32 +119,78 @@ impl Drop for TailHandle {
     }
 }
 
-/// Spawn the tail thread on `path`.
+/// Spawn the tail thread for `source`.
 ///
-/// The thread opens the file, seeks to end (so we follow appends,
-/// not history), and reads new bytes as they arrive. Parsed events
-/// are pushed into the returned buffer; raw read errors land on
+/// For a file source: opens the file, seeks to end (so we follow
+/// appends, not history), and reads new bytes as they arrive.
+/// For a journal source: spawns `journalctl -u <unit> -f -o cat -n 0`
+/// and streams its stdout. `-n 0` means start from now — history was
+/// already processed by the initial `runner::run` pass.
+/// Parsed events are pushed into the returned buffer; errors land on
 /// `LiveBuffer.last_error` without panicking.
-pub fn spawn(path: PathBuf) -> TailHandle {
+pub fn spawn(source: LogSource) -> TailHandle {
     let buffer = Arc::new(Mutex::new(LiveBuffer::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let thread = {
-        let buffer = Arc::clone(&buffer);
-        let shutdown = Arc::clone(&shutdown);
-        thread::Builder::new()
-            .name("abracadabra-tail".to_owned())
-            .spawn(move || tail_loop(path, buffer, shutdown))
-            .ok()
-    };
-    TailHandle {
-        buffer,
-        shutdown,
-        thread,
+
+    match source {
+        LogSource::File(path) => {
+            let thread = {
+                let buffer = Arc::clone(&buffer);
+                let shutdown = Arc::clone(&shutdown);
+                thread::Builder::new()
+                    .name("abracadabra-tail".to_owned())
+                    .spawn(move || file_tail_loop(path, buffer, shutdown))
+                    .ok()
+            };
+            TailHandle {
+                buffer,
+                shutdown,
+                thread,
+                child: None,
+            }
+        }
+        LogSource::Journal { unit } => {
+            let child_proc = Command::new("journalctl")
+                .args(["-u", &unit, "-f", "-o", "cat", "-n", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+
+            match child_proc {
+                Err(e) => {
+                    publish_error(&buffer, format!("spawn journalctl: {e}"));
+                    TailHandle {
+                        buffer,
+                        shutdown,
+                        thread: None,
+                        child: None,
+                    }
+                }
+                Ok(mut child) => {
+                    let stdout = child.stdout.take();
+                    let child = Arc::new(Mutex::new(child));
+                    let thread = stdout.and_then(|out| {
+                        let buffer = Arc::clone(&buffer);
+                        let shutdown = Arc::clone(&shutdown);
+                        thread::Builder::new()
+                            .name("abracadabra-tail".to_owned())
+                            .spawn(move || journal_tail_loop(out, buffer, shutdown))
+                            .ok()
+                    });
+                    TailHandle {
+                        buffer,
+                        shutdown,
+                        thread,
+                        child: Some(child),
+                    }
+                }
+            }
+        }
     }
 }
 
-/// Inner tail loop. Owns the file handle and the partial-line carry.
-fn tail_loop(path: PathBuf, buffer: Arc<Mutex<LiveBuffer>>, shutdown: Arc<AtomicBool>) {
+/// Inner tail loop for a plain file.
+fn file_tail_loop(path: PathBuf, buffer: Arc<Mutex<LiveBuffer>>, shutdown: Arc<AtomicBool>) {
     let mut file = match open_at_end(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -159,6 +218,35 @@ fn tail_loop(path: PathBuf, buffer: Arc<Mutex<LiveBuffer>>, shutdown: Arc<Atomic
             }
             Err(e) => {
                 publish_error(&buffer, format!("read {}: {e}", path.display()));
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+/// Inner tail loop for a journalctl stdout stream.
+fn journal_tail_loop<R: Read>(
+    mut reader: R,
+    buffer: Arc<Mutex<LiveBuffer>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut carry = Vec::<u8>::new();
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES];
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                // journalctl -f should not hit EOF; if it does (process
+                // killed externally), bail out.
+                break;
+            }
+            Ok(n) => {
+                carry.extend_from_slice(&chunk[..n]);
+                drain_complete_lines(&mut carry, &buffer);
+                clear_error(&buffer);
+            }
+            Err(e) => {
+                publish_error(&buffer, format!("read journalctl: {e}"));
                 thread::sleep(POLL_INTERVAL);
             }
         }
@@ -260,7 +348,7 @@ mod tests {
         let path = unique_tmp("observe");
         std::fs::write(&path, b"seed\n").unwrap();
 
-        let handle = spawn(path.clone());
+        let handle = spawn(LogSource::File(path.clone()));
 
         // Brief settle so the tail seeks to end before the writer races.
         thread::sleep(Duration::from_millis(50));
@@ -302,7 +390,7 @@ mod tests {
         let path = unique_tmp("missing-do-not-create");
         std::fs::remove_file(&path).ok();
 
-        let handle = spawn(path);
+        let handle = spawn(LogSource::File(path));
         thread::sleep(Duration::from_millis(100));
         let err = handle.buffer.lock().ok().and_then(|b| b.last_error.clone());
         drop(handle);
@@ -314,7 +402,7 @@ mod tests {
     fn drop_stops_thread_within_a_few_polls() {
         let path = unique_tmp("idle-drop");
         std::fs::write(&path, b"seed\n").unwrap();
-        let handle = spawn(path.clone());
+        let handle = spawn(LogSource::File(path.clone()));
         let start = Instant::now();
         drop(handle);
         let elapsed = start.elapsed();
