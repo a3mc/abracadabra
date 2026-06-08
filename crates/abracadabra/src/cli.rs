@@ -47,7 +47,7 @@ pub struct Cli {
     ///   "30 min ago"     — last 30 minutes
     ///   "2026-06-08"     — since a specific date
     ///   "2026-06-08 10:00:00"  — since a specific date and time
-    #[arg(long, default_value = "today", value_name = "SINCE")]
+    #[arg(long, default_value = "10 minutes ago", value_name = "SINCE")]
     pub since: String,
 
     /// Print a text summary instead of opening the interactive TUI.
