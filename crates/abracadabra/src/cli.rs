@@ -33,32 +33,47 @@ pub struct Cli {
     pub path: Option<PathBuf>,
 
     /// Systemd unit name to stream from the journal instead of a file.
-    /// journalctl must be available on PATH.
+    ///
+    /// Linux-only. Requires `journalctl` on PATH.
     #[arg(long, value_name = "UNIT", group = "input")]
     pub unit: Option<String>,
 
     /// How far back to read from the journal (journal mode only).
     ///
     /// Passed verbatim to `journalctl --since`. Examples:
-    ///   today            — since midnight today (default)
-    ///   yesterday        — since midnight yesterday
-    ///   "1 hour ago"     — last 60 minutes
-    ///   "2 hours ago"    — last 2 hours
-    ///   "30 min ago"     — last 30 minutes
-    ///   "2026-06-08"     — since a specific date
+    ///
+    ///   today                  — since midnight today
+    ///   yesterday              — since midnight yesterday
+    ///   "1 hour ago"           — last 60 minutes
+    ///   "2 hours ago"          — last 2 hours
+    ///   "30 min ago"           — last 30 minutes
+    ///   "2026-06-08"           — since a specific date
     ///   "2026-06-08 10:00:00"  — since a specific date and time
-    #[arg(long, default_value = "10 minutes ago", value_name = "SINCE")]
+    ///
+    /// Bounds the historical scan only; once the Live tab starts
+    /// tailing it follows from "now" regardless of this window.
+    #[arg(
+        long,
+        default_value = "10 minutes ago",
+        value_name = "SINCE",
+        verbatim_doc_comment
+    )]
     pub since: String,
 
     /// Print a text summary instead of opening the interactive TUI.
-    /// (Also auto-enabled when stdout is not a terminal — e.g. piped.)
+    ///
+    /// Also auto-enabled when stdout is not a terminal (e.g. piped to
+    /// a file or another command).
     #[arg(long, default_value_t = false)]
     pub text: bool,
 
-    /// Bucket size for time-series aggregation. Accepts `30s`, `5m`, `1h`,
-    /// etc. Bounds: 1m..=24h. Smaller → finer trend resolution but noisier
-    /// per-bucket aggregates and more bars to render. Larger → smoother
-    /// trend but loses sub-bucket detail.
+    /// Bucket size for time-series aggregation.
+    ///
+    /// Accepts `30s`, `5m`, `1h`, etc. Bounds: 1m..=24h.
+    ///
+    /// Smaller → finer trend resolution but noisier per-bucket
+    /// aggregates and more bars to render. Larger → smoother trend
+    /// but loses sub-bucket detail.
     #[arg(
         long,
         default_value = "10m",
