@@ -59,6 +59,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Opt into Node 24 for JavaScript actions ahead of GitHub's
+  # 2026-06-16 default switch — silences the Node 20 deprecation
+  # warning that currently fires on every workflow run. Can be
+  # removed after Node 24 becomes the runner default.
+  # https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
