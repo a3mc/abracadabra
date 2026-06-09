@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-09
+
+Minor release. Adds an alternative input source — operators can now
+stream directly from a systemd journal unit instead of pointing at a
+log file. Useful on setups where log files are not exposed or where
+rotation makes the right path hard to pin down. Also includes a
+follow-up to the LIVE-70 work that lets the shred-streams snapshot
+surface a `(peak N)` annotation when the chart shows recent err
+activity that the last batch sample alone would hide.
+
+### Added
+
+- `--unit <SERVICE>` — stream the log from a systemd journal unit
+  instead of a file. Mutually exclusive with the positional log
+  path via clap `ArgGroup` (exactly one must be passed). Spawns
+  `journalctl` via argv-safe `Command::args([...])` — no shell
+  involved, so operator-supplied unit names cannot inject. The
+  child is held in `Arc<Mutex<Child>>` on `TailHandle`; `Drop`
+  signals shutdown, kills the child, and waits.
+- `--since <SPEC>` — historical scan window for journal mode.
+  Default `10 minutes ago`. Accepts anything `journalctl --since`
+  understands (`today`, `yesterday`, `"1 hour ago"`, ISO dates).
+  Bounds the historical bulk read only; the Live tab tail starts
+  following from "now" via `journalctl -n 0 -f` regardless of the
+  `--since` window.
+- `LogSource` enum (`File(PathBuf)` / `Journal { unit, since }`)
+  in a new `crate::source` module. `runner` and `live::tail` both
+  match on it; `main` builds it from the parsed CLI args.
+
+  Contributed by @schmiatz in #1. Thank you!
+
+### Changed
+
+- Shred-streams snapshot in the Live tab appends `(peak N)` after
+  the `err` field when the visible chart window has seen a batch
+  with more errors than the most recent sample (LIVE-70). The
+  annotation is suppressed in the steady state, so the line stays
+  compact when there is nothing extra to surface. Matches the
+  chart's visible-window scale 1:1 via `LaneSpark::peak_recent`.
+
+### Documentation
+
+- README now demonstrates the journal-mode invocation pattern and
+  notes that `--since` controls the historical scan only — the
+  Live tab always follows from "now" once tailing starts. Journal
+  mode is documented as Linux-only (requires `journalctl` on
+  PATH).
+
 ## [0.4.0] — 2026-06-05
 
 Tracks alpenglow `ag-v0.4.0`. Major release adds the Live tab — a

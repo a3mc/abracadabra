@@ -27,6 +27,10 @@ cargo build --release
 ./target/release/abracadabra --unit solana.service --since "30 min ago"
 ```
 
+`--since` bounds the historical scan only; the Live tab follows from
+"now" once tailing starts, regardless of the `--since` window.
+Journal mode requires `journalctl` on PATH and runs Linux-only.
+
 Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/releases) — Linux `gnu` (glibc ≥ 2.35) or fully-static `musl`.
 
 ## Tour
