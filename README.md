@@ -15,8 +15,16 @@
 ## Build
 
 ```sh
+# with logfile
 cargo build --release
 ./target/release/abracadabra path/to/validator.log
+
+# with reading from journal assuming your unit is called solana
+./target/release/abracadabra --unit solana.service
+# or with last N hours/minutes
+./target/release/abracadabra --unit solana.service --since "1 hour ago"
+./target/release/abracadabra --unit solana.service --since "2 hours ago"
+./target/release/abracadabra --unit solana.service --since "30 min ago"
 ```
 
 Or grab a prebuilt binary from [Releases](https://github.com/a3mc/abracadabra/releases) — Linux `gnu` (glibc ≥ 2.35) or fully-static `musl`.

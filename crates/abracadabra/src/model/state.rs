@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 
 use crate::model::alerts::{Alert, Severity};
 use crate::model::slot::SlotRecord;
+use crate::source::LogSource;
 
 /// Upper bound on the number of timestamps retained per `LogIssueGroup`.
 ///
@@ -52,6 +53,7 @@ pub struct FileMeta {
     pub size_bytes: u64,
     pub line_count: u64,
     pub time_range: Option<(OffsetDateTime, OffsetDateTime)>,
+    pub source: LogSource,
 }
 
 /// Cluster-wide and own-node counters accumulated across the full log.
@@ -301,12 +303,18 @@ pub struct State {
 
 impl State {
     pub fn new(path: PathBuf, size_bytes: u64) -> Self {
+        Self::with_source(LogSource::File(path), size_bytes)
+    }
+
+    pub fn with_source(source: LogSource, size_bytes: u64) -> Self {
+        let path = source.as_display_path();
         Self {
             file_meta: FileMeta {
                 path,
                 size_bytes,
                 line_count: 0,
                 time_range: None,
+                source,
             },
             ..Self::default()
         }

@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use thiserror::Error;
@@ -14,6 +15,7 @@ use crate::model::alerts::Severity;
 use crate::model::analysis;
 use crate::model::state::State;
 use crate::parser::{self, Parsed};
+use crate::source::LogSource;
 use crate::tui::theme;
 
 #[derive(Debug, Error)]
@@ -36,6 +38,12 @@ pub enum RunError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to spawn journalctl for unit {unit:?}: {source}")]
+    JournalSpawn {
+        unit: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Per-run counters not stored on State (transient).
@@ -47,9 +55,16 @@ pub struct RunStats {
     pub elapsed_ms: u128,
 }
 
-/// Stream the log at `path` through parser → aggregator. Returns the
+/// Stream the log source through parser → aggregator. Returns the
 /// finalized State plus per-run counters.
-pub fn run(path: PathBuf) -> Result<(State, RunStats), RunError> {
+pub fn run(source: LogSource) -> Result<(State, RunStats), RunError> {
+    match source {
+        LogSource::File(path) => run_file(path),
+        LogSource::Journal { unit, since } => run_journal(unit, since),
+    }
+}
+
+fn run_file(path: PathBuf) -> Result<(State, RunStats), RunError> {
     let metadata = std::fs::metadata(&path).map_err(|source| RunError::Stat {
         path: path.clone(),
         source,
@@ -66,21 +81,64 @@ pub fn run(path: PathBuf) -> Result<(State, RunStats), RunError> {
     let mut stats = RunStats::default();
     let started = Instant::now();
 
-    for line in reader.lines() {
-        let line = line.map_err(|source| RunError::Read {
-            lines: state.file_meta.line_count,
+    ingest_lines(reader.lines(), &mut state, &mut stats);
+
+    aggregator::analyze(&mut state);
+    stats.elapsed_ms = started.elapsed().as_millis();
+    Ok((state, stats))
+}
+
+fn run_journal(unit: String, since: String) -> Result<(State, RunStats), RunError> {
+    let mut child = Command::new("journalctl")
+        .args(["-u", &unit, "--no-pager", "-o", "cat", "--since", &since])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| RunError::JournalSpawn {
+            unit: unit.clone(),
             source,
         })?;
+
+    let stdout = child.stdout.take().unwrap_or_else(|| {
+        // stdout was requested via Stdio::piped(); this branch is unreachable
+        // in practice but satisfies the type system without expect.
+        unreachable!("journalctl stdout not captured")
+    });
+    let reader = BufReader::with_capacity(64 * 1024, stdout);
+
+    let mut state = State::with_source(LogSource::Journal { unit, since }, 0);
+    let mut stats = RunStats::default();
+    let started = Instant::now();
+
+    ingest_lines(reader.lines(), &mut state, &mut stats);
+
+    let _ = child.wait();
+
+    aggregator::analyze(&mut state);
+    stats.elapsed_ms = started.elapsed().as_millis();
+    Ok((state, stats))
+}
+
+fn ingest_lines<R: BufRead>(
+    lines: std::io::Lines<R>,
+    state: &mut State,
+    stats: &mut RunStats,
+) {
+    for line in lines {
+        let Ok(line) = line else {
+            stats.parse_errors = stats.parse_errors.saturating_add(1);
+            continue;
+        };
         state.file_meta.line_count = state.file_meta.line_count.saturating_add(1);
 
         match parser::parse(&line) {
-            Ok(Parsed::Event(ev)) => aggregator::ingest(&mut state, ev),
+            Ok(Parsed::Event(ev)) => aggregator::ingest(state, ev),
             Ok(Parsed::Issue {
                 ts,
                 level,
                 module,
                 body,
-            }) => aggregator::ingest_issue(&mut state, ts, level, module, body),
+            }) => aggregator::ingest_issue(state, ts, level, module, body),
             Ok(Parsed::Continuation) => {
                 stats.continuation_lines = stats.continuation_lines.saturating_add(1);
             }
@@ -92,11 +150,6 @@ pub fn run(path: PathBuf) -> Result<(State, RunStats), RunError> {
             }
         }
     }
-
-    aggregator::analyze(&mut state);
-    stats.elapsed_ms = started.elapsed().as_millis();
-
-    Ok((state, stats))
 }
 
 /// Print a human-readable summary to stdout.
