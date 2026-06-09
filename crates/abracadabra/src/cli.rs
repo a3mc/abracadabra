@@ -71,39 +71,48 @@ pub struct Cli {
     ///
     /// Accepts `30s`, `5m`, `1h`, etc. Bounds: 1m..=24h.
     ///
-    /// Smaller → finer trend resolution but noisier per-bucket
-    /// aggregates and more bars to render. Larger → smoother trend
-    /// but loses sub-bucket detail.
+    /// Trade-off:
+    ///
+    ///   smaller  → finer trend resolution, noisier per-bucket
+    ///              aggregates, more bars to render
+    ///   larger   → smoother trend, loses sub-bucket detail
     #[arg(
         long,
         default_value = "10m",
         value_name = "DUR",
         value_parser = parse_bucket_duration,
+        verbatim_doc_comment,
     )]
     pub bucket: i64,
 
     /// Force the 256-colour ANSI fallback instead of 24-bit RGB.
     ///
-    /// Use this on terminals that report `TERM=xterm-256color` but do
-    /// not implement the SGR 38;2;R;G;B / 48;2;R;G;B sequences (most
-    /// notably the macOS built-in Terminal.app, which renders chip
-    /// backgrounds as fragmented multi-colour text on encountering
-    /// the unrecognised parameters). Auto-detected via `COLORTERM` /
+    /// Use on terminals that report `TERM=xterm-256color` but do not
+    /// implement the SGR 38;2;R;G;B / 48;2;R;G;B sequences.
+    ///
+    /// Most notably: macOS built-in Terminal.app, which renders chip
+    /// backgrounds as fragmented multi-colour text when it encounters
+    /// the unrecognised parameters.
+    ///
+    /// Truecolor capability is auto-detected via `COLORTERM` /
     /// `TERM_PROGRAM` / `TERM` at startup, so this flag is only needed
-    /// for terminals whose env-var advertisement lies about their
+    /// when the env-var advertisement lies about the terminal's
     /// capabilities.
     #[arg(long, default_value_t = false)]
     pub no_truecolor: bool,
 
     /// Force 24-bit RGB output, skipping the detection ladder.
     ///
-    /// Use when the env-var ladder guessed wrong — e.g. running inside
-    /// `tmux` from a truecolor-capable outer terminal that does not
-    /// propagate `COLORTERM`, or any terminal whose advertisement is
-    /// conservative. Mutually exclusive with `--no-truecolor`; if both
-    /// are passed clap rejects the invocation. If neither is passed,
-    /// the detection ladder runs (with `NO_COLOR` honoured as the
-    /// no-color.org convention).
+    /// Use when the env-var ladder guessed wrong — for example running
+    /// inside `tmux` from a truecolor-capable outer terminal that does
+    /// not propagate `COLORTERM`, or any terminal whose advertisement
+    /// is conservative.
+    ///
+    /// Mutually exclusive with `--no-truecolor`; clap rejects the
+    /// invocation if both are passed.
+    ///
+    /// If neither flag is passed, the detection ladder runs and
+    /// `NO_COLOR` is honoured per the no-color.org convention.
     #[arg(long, default_value_t = false, conflicts_with = "no_truecolor")]
     pub force_truecolor: bool,
 }
