@@ -173,6 +173,28 @@ impl LaneSpark {
             }
         }
     }
+
+    /// Peak value across the most recent `window` buckets, including
+    /// the partially-filled `current` bucket. Matches what's visible
+    /// in the chart at the same width: pass `chart_area.width` and
+    /// the peak corresponds 1:1 to the brightest bucket on screen.
+    /// `window == 0` returns 0.
+    fn peak_recent(&self, window: usize) -> u32 {
+        if window == 0 {
+            return 0;
+        }
+        // The `current` bucket counts as one of the visible cells, so
+        // history contributes `window - 1` past buckets.
+        let history_window = window.saturating_sub(1);
+        let history_skip = self.history.len().saturating_sub(history_window);
+        self.history
+            .iter()
+            .skip(history_skip)
+            .chain(std::iter::once(&self.current))
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// One emitted `ShredFetch` event, stored as a single record. At
@@ -471,10 +493,20 @@ impl ShredIngressPane {
         let err = fmt_opt(self.numbers.err);
         let particles = self.turbine_stream.particle_count();
 
+        // LIVE-70: err is rare-batch-with-zeros-between. Last-sample
+        // alone reads `0 err` whenever the most recent batch was
+        // clean, contradicting the chart which clearly shows recent
+        // dots. Append `(peak N)` ONLY for err — surgical, matches
+        // the chart's visible-window scale, doesn't disturb the
+        // other lanes' meanings (sh / rep / drop are batch sizes
+        // where last-sample stays informative).
+        let err_last = self.numbers.err.unwrap_or(0);
+        let err_peak = u64::from(self.err_lane.peak_recent(area.width as usize));
+
         // Compact snapshot — half-width laptop pane is ~70 cells of
         // inner width. Drop "latest sample:" prefix and abbreviate
         // "turbine particles in flight" → "particles".
-        let line = Line::from(vec![
+        let mut spans: Vec<Span<'static>> = vec![
             Span::styled(" ", theme::label_style()),
             Span::styled(fetch, Style::default().fg(COL_TURBINE)),
             Span::styled(" sh", theme::label_style()),
@@ -508,15 +540,31 @@ impl ShredIngressPane {
                 },
             ),
             Span::styled(" err", theme::label_style()),
-            sep(),
-            Span::styled(
-                format!("{particles} particles"),
+        ];
+
+        // `(peak N)` annotation appears only when the visible window
+        // has SEEN a larger value than the most recent batch.
+        // Suppressing it when `peak == last` keeps the line compact
+        // in the steady state where last sample already tells the
+        // truth.
+        if err_peak > err_last {
+            spans.push(Span::styled(
+                format!(" (peak {err_peak})"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+            ));
+        }
+
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{particles} particles"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
 
@@ -884,6 +932,89 @@ mod tests {
             num_errors: 3,
         })));
         assert_eq!(p.err_lane.current, 3);
+    }
+
+    #[test]
+    fn peak_recent_returns_zero_for_zero_window() {
+        // LIVE-70: peak window=0 is a degenerate render path (zero-
+        // width snapshot area). Return 0 cleanly instead of falling
+        // into `iter::once(&current)` and reporting the live bucket.
+        let now = std::time::Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.accumulate(99);
+        assert_eq!(spark.peak_recent(0), 0);
+    }
+
+    #[test]
+    fn peak_recent_includes_current_bucket() {
+        // The partially-filled `current` bucket counts as one of the
+        // visible cells; if it carries the largest value, it wins.
+        let now = std::time::Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(1);
+        spark.history.push_back(2);
+        spark.accumulate(7);
+        // Window 3 = 2 history buckets + current. Peak is 7.
+        assert_eq!(spark.peak_recent(3), 7);
+    }
+
+    #[test]
+    fn peak_recent_caps_at_window_size_from_the_back() {
+        // The chart shows the MOST RECENT `window` cells; older
+        // buckets are off-screen. peak_recent must mirror that —
+        // an old large value outside the window must NOT win over
+        // a recent small value.
+        let now = std::time::Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(99); // very old
+        spark.history.push_back(1);
+        spark.history.push_back(2);
+        spark.history.push_back(3);
+        // current = 0
+        // Window 3 looks at the last 2 history buckets + current.
+        // Peak inside window: max(2, 3, 0) = 3. NOT 99.
+        assert_eq!(spark.peak_recent(3), 3);
+    }
+
+    #[test]
+    fn peak_recent_handles_history_shorter_than_window() {
+        // Early-in-process render: history < window. Peak is just
+        // the max of what we have, no underflow.
+        let now = std::time::Instant::now();
+        let mut spark = LaneSpark::new(now);
+        spark.history.push_back(5);
+        spark.accumulate(3);
+        assert_eq!(spark.peak_recent(100), 5);
+    }
+
+    #[test]
+    fn err_lane_peak_recent_survives_zero_last_sample() {
+        // LIVE-70 regression: the operator's exact scenario.
+        // Several batches with non-zero errors followed by a clean
+        // batch (num_errors=0). last_sample reports 0; peak_recent
+        // must still report the highest of the recent batches so
+        // the snapshot's `(peak N)` annotation matches the chart
+        // dots the operator can see.
+        let mut p = ShredIngressPane::new();
+        for n in [3u64, 1, 5, 2, 0] {
+            p.on_event(&mk(EventKind::Metric(MetricEvent::RecvWindowInsert {
+                num_shreds_received: 100,
+                num_errors: n,
+            })));
+        }
+        assert_eq!(p.numbers.err, Some(0), "last-sample is the trailing zero");
+        // Window 1 = just the current bucket = the trailing zero accumulated
+        // alongside earlier values (they all land in `current` until the
+        // first `advance(...)` rolls the bucket over). For peak across
+        // anything ≥ 1 the highest single sample wins.
+        let peak = p.err_lane.peak_recent(100);
+        assert!(
+            peak >= 5,
+            "peak must include the 5-error batch from earlier in the window; \
+             got {peak}, history={:?}, current={}",
+            p.err_lane.history,
+            p.err_lane.current
+        );
     }
 
     #[test]
