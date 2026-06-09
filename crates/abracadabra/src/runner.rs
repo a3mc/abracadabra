@@ -119,11 +119,7 @@ fn run_journal(unit: String, since: String) -> Result<(State, RunStats), RunErro
     Ok((state, stats))
 }
 
-fn ingest_lines<R: BufRead>(
-    lines: std::io::Lines<R>,
-    state: &mut State,
-    stats: &mut RunStats,
-) {
+fn ingest_lines<R: BufRead>(lines: std::io::Lines<R>, state: &mut State, stats: &mut RunStats) {
     for line in lines {
         let Ok(line) = line else {
             stats.parse_errors = stats.parse_errors.saturating_add(1);

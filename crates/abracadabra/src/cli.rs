@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use clap::ArgGroup;
+use clap::Parser;
 
 /// Bucket-size floor: smaller than this and per-bucket aggregates become
 /// statistically noisy on a 21h log, and bucket counts climb into the
