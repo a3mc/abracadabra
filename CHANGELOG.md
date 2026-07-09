@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-09
+
+Minor release. Aligns the parser with the community cluster's move
+to the main Agave repository (Alpenglow: 200 ms blocks, ~250 ms
+finalization) and adds two visible features in the TUI: a
+selected-slot detail card in the Slots tab and a top-3 packed
+blocks leaderboard in the Live tab's chain widget.
+
+### Changed
+
+- **Parser format alignment.** Upstream Alpenglow refactored the
+  `Block` type from a `(Slot, Hash)` tuple to `struct Block { slot,
+  block_id }`; the `Debug` output that abracadabra scrapes changed
+  shape for six event categories (`Block`, `Block Notarized`,
+  `Block notar-fallback`, `Finalized`, `Parent ready`, `Produce
+  window`). All six parsers now consume the new struct form. **Old
+  tuple-format logs are no longer parseable** — block, notarize,
+  and finalize events will silently drop. This is intentional: the
+  community cluster restarted onto the Alpenglow build, so historic
+  tuple logs from the pre-move chain are no longer operationally
+  relevant. Includes a regression guard (`DRIFT-01`) that
+  `include_str!`s a slab of real log lines and asserts every event
+  category yields at least one parse — future upstream drifts fire
+  on the first `cargo test` after a rebase.
+- **Latency band recalibration.** Old thresholds (assembly 500/600,
+  lifecycle 600/1000 ms) were tuned for the pre-Alpenglow slot
+  cadence; under Alpenglow every value coloured green (p99 lifecycle
+  = 495 ms, well below the old warn line). Recalibrated to
+  assembly 250/300 ms and lifecycle 380/500 ms, backed by empirical
+  p50/p95/p99 measurements on a 3 h reference log. The middle band
+  now uses cyan (`accent_style`) instead of yellow via a new
+  `band_latency_soft` helper — yellow reads too harsh for the small
+  window between "healthy" and "degraded" under the new cadence.
+  Skip-rate and canonical-skip bands keep their yellow warning
+  semantics.
+
+### Added
+
+- **Selected-slot detail card in the Slots tab.** The reference
+  panel now shows a compact per-slot timeline for the cursor-focused
+  row: block id (short), signature count, and every captured event
+  timestamp as a delta from an anchor. Anchor labels name the event
+  class (`(start)` for `first_shred`, `(emit)` for our own leader
+  slots, `(replay)` for repair-fetched slots, `(anchor)` for
+  skipped-slot fallbacks) so the reader can tell what the deltas
+  span without consulting the footer. Every value is a direct
+  log-event timestamp — no inference.
+- **`sigs` column in the Slots table** — `signature_count` from
+  the `bank frozen` log line. Empty for slots the local node did
+  not bank (repair-fetched, gossip-observed).
+- **Top-3 packed blocks leaderboard in the chain pane** (Live tab).
+  Small right-side panel listing the three signature-heaviest
+  blocks observed since the pane started. Fork-safe (first-wins on
+  the underlying `signature_count`), zero-sig blocks excluded,
+  session-long (no reset). Layout mirrors the tx stream on the
+  right side of the bucket with a one-column border gap.
+
+### Fixed
+
+- **Slots detail card path tags.** The `(slow-path)` suffix on
+  `notar_fallback` rows was unconditional, but the vast majority of
+  `BlockNotarFallback` events are benign auto-emitted companions of
+  successful notarize certs — on any fast-finalized slot the card
+  printed `notar_fallback (slow-path)` immediately followed by
+  `finalized (fast-path)`, contradicting itself. Now gated on the
+  row's actual path.
+- **Slots detail card anchor note.** The footer text branched on
+  `we_are_leader` and claimed `t0 = our local replay complete` for
+  every non-leader slot — but for the majority of observed slots
+  the anchor is `first_shred_at` (shred receipt), not replay. The
+  note now branches on the actual anchor event and describes each
+  case correctly.
+- **Latency-band legend labels** now use `<` / `≥` to match the
+  underlying band function's inequality (previously `≤` / `>` — a
+  one-off at exact boundaries).
+
 ## [0.4.1] — 2026-06-09
 
 Minor release. Adds an alternative input source — operators can now
