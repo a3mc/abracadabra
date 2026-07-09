@@ -106,15 +106,17 @@ fn render_kpi(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     } else {
         theme::warn_style()
     };
-    // p95 (lifecycle) health: good if ≤ LIFECYCLE_WARN_MS (matches the
-    // band shown in the right-panel reference). Replaces the buried
+    // p95 (lifecycle) health: same three-band mapping as the reference
+    // legend so the KPI colour and the band table read consistently
+    // (green ≤ WARN, cyan WARN..BAD, red > BAD). Replaces the buried
     // `p95 (lifecycle) X ms [✓]` line that used to live in the Latency
-    // bands section — same threshold, same colour mapping.
-    let p95_style = if p95 <= theme::LIFECYCLE_WARN_MS as i64 {
-        theme::good_style()
-    } else {
-        theme::warn_style()
-    };
+    // bands section — same thresholds, same colour ramp.
+    #[allow(clippy::cast_precision_loss)]
+    let p95_style = theme::band_latency_soft(
+        p95 as f64,
+        theme::LIFECYCLE_WARN_MS,
+        theme::LIFECYCLE_BAD_MS,
+    );
 
     let pipe = || Span::styled("  |  ", theme::label_style());
 
@@ -246,20 +248,20 @@ fn render_latency_reference(_app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  assembly  ", theme::label_style()),
-            Span::styled("≤ 500", theme::good_style()),
+            Span::styled("< 250", theme::good_style()),
             Span::styled("  ·  ", theme::label_style()),
-            Span::styled("500–600", theme::warn_style()),
+            Span::styled("250–300", theme::accent_style()),
             Span::styled("  ·  ", theme::label_style()),
-            Span::styled("> 600", theme::bad_style()),
+            Span::styled("≥ 300", theme::bad_style()),
             Span::styled(" ms", theme::label_style()),
         ]),
         Line::from(vec![
             Span::styled("  lifecycle ", theme::label_style()),
-            Span::styled("≤ 600", theme::good_style()),
+            Span::styled("< 380", theme::good_style()),
             Span::styled("  ·  ", theme::label_style()),
-            Span::styled("600–1000", theme::warn_style()),
+            Span::styled("380–500", theme::accent_style()),
             Span::styled("  ·  ", theme::label_style()),
-            Span::styled("> 1000", theme::bad_style()),
+            Span::styled("≥ 500", theme::bad_style()),
             Span::styled(" ms", theme::label_style()),
         ]),
     ];
@@ -388,22 +390,26 @@ fn render_slot_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             } else {
                 format!("{delta_ms:+7.1} ms")
             };
-            // Suffix tag on notar_fallback → the "slow path" marker.
-            let suffix = if *label == "notar_fallback" {
-                "  (slow-path)"
-            } else if *label == "finalized" && matches!(row.fast, Some(true)) {
-                "  (fast-path)"
-            } else if *label == "finalized" && matches!(row.fast, Some(false)) {
-                "  (slow-path)"
-            } else {
-                ""
-            };
+            let suffix = path_suffix(label, row.fast);
             lines.push(Line::from(vec![
                 Span::styled("  ", theme::label_style()),
                 Span::styled(format!("{label:<20}"), theme::label_style()),
                 Span::styled(delta_str, theme::value_style()),
                 Span::styled(suffix.to_string(), theme::label_style()),
             ]));
+        }
+
+        // Anchor note: what `t0` means depends on which event fired
+        // first. `first_shred_at` is shred-receipt time (non-leader,
+        // full lifecycle observed). `block_emitted_at` is a LOCAL
+        // timestamp — leader-production for our slots, local
+        // replay-complete for repair-fetched non-leader slots. Skipped
+        // slots may anchor on a vote or timeout event. Different
+        // anchors mean different portions of the round are covered.
+        lines.push(Line::from(""));
+        let note = anchor_note(present[0].1, row.we_are_leader);
+        for text in note {
+            lines.push(Line::from(Span::styled(text, theme::label_style())));
         }
     }
 
@@ -755,10 +761,10 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
     // Per-stage health bands. `None` (pending) -> gray so we don't
     // accidentally paint missing data green.
     let asm_style = s.assembly_ms.map_or_else(theme::label_style, |ms| {
-        theme::band_lower_better(ms, theme::ASSEMBLY_WARN_MS, theme::ASSEMBLY_BAD_MS)
+        theme::band_latency_soft(ms, theme::ASSEMBLY_WARN_MS, theme::ASSEMBLY_BAD_MS)
     });
     let lat_style = s.lifecycle_ms.map_or_else(theme::label_style, |ms| {
-        theme::band_lower_better(ms, theme::LIFECYCLE_WARN_MS, theme::LIFECYCLE_BAD_MS)
+        theme::band_latency_soft(ms, theme::LIFECYCLE_WARN_MS, theme::LIFECYCLE_BAD_MS)
     });
     let leader_mark = if s.we_are_leader { "[*]" } else { "" };
     let events = events_str(s);
@@ -788,6 +794,56 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
         )),
         Line::from(Span::styled(events, theme::warn_style())),
     ])
+}
+
+/// Path-tag suffix appended to a timeline row's label.
+///
+/// `notar_fallback` is only tagged `(slow-path)` when the cluster
+/// actually took the slow path — the vast majority of NotarFallback
+/// events are benign auto-emitted companions of a successful 60%
+/// Notarize cert (see `theme.rs::TRUE_FB_ELEVATED_PCT`). Tagging
+/// them unconditionally would contradict the `(fast-path)` tag on
+/// the same slot's `finalized` row.
+fn path_suffix(label: &str, fast: Option<bool>) -> &'static str {
+    match (label, fast) {
+        ("notar_fallback", Some(false)) => "  (slow-path)",
+        ("finalized", Some(true)) => "  (fast-path)",
+        ("finalized", Some(false)) => "  (slow-path)",
+        _ => "",
+    }
+}
+
+/// Two-line explanatory note about what `t0` means in the detail
+/// card's timeline, branched on the label of the earliest observed
+/// event and whether we were the leader for the slot.
+///
+/// - `first_shred` → shred-receipt anchor (non-leader, full lifecycle
+///   observed from first hop of shred propagation).
+/// - `block_emitted` + leader → we produced the block; deltas span the
+///   full consensus round.
+/// - `block_emitted` + non-leader → repair-fetched slot with no
+///   first-shred event; the anchor is our local replay-complete.
+/// - anything else → generic fallback (skipped slots anchored on a
+///   vote or timeout event).
+fn anchor_note(t0_label: &str, we_are_leader: bool) -> [&'static str; 2] {
+    match (t0_label, we_are_leader) {
+        ("first_shred", _) => [
+            "  t0 = first shred arrived; deltas span shred-receipt",
+            "  → finalized (round minus leader production).",
+        ],
+        ("block_emitted", true) => [
+            "  t0 = we produced this slot; deltas span the full",
+            "  consensus round (~250 ms target).",
+        ],
+        ("block_emitted", false) => [
+            "  t0 = our local replay complete; leader emitted",
+            "  earlier — deltas cover only the tail of the round.",
+        ],
+        _ => [
+            "  t0 = earliest observed event for this slot; deltas",
+            "  cover only the portion that fired locally.",
+        ],
+    }
 }
 
 /// Compact signature_count formatter matching the Live tab's leader-
@@ -826,5 +882,101 @@ fn pct(num: u64, denom: u64) -> f64 {
         0.0
     } else {
         num as f64 * 100.0 / denom as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{anchor_note, fmt_sigs, path_suffix};
+
+    // SLOTS-01 regression guard. The `notar_fallback` suffix must
+    // only fire on genuine slow-path finalizations; on the ~99.9% of
+    // NotarFallback events that are benign auto-emitted companions
+    // (`row.fast == Some(true)` or `None`), the suffix must be empty
+    // so it does not contradict a `(fast-path)` tag on the same
+    // slot's `finalized` row.
+    #[test]
+    fn path_suffix_notar_fallback_only_tags_slow_finalized() {
+        assert_eq!(path_suffix("notar_fallback", Some(true)), "");
+        assert_eq!(path_suffix("notar_fallback", Some(false)), "  (slow-path)");
+        assert_eq!(path_suffix("notar_fallback", None), "");
+    }
+
+    #[test]
+    fn path_suffix_finalized_reflects_fast_flag() {
+        assert_eq!(path_suffix("finalized", Some(true)), "  (fast-path)");
+        assert_eq!(path_suffix("finalized", Some(false)), "  (slow-path)");
+        assert_eq!(path_suffix("finalized", None), "");
+    }
+
+    #[test]
+    fn path_suffix_other_labels_have_no_tag() {
+        assert_eq!(path_suffix("voted_notarize", Some(true)), "");
+        assert_eq!(path_suffix("voted_notarize", Some(false)), "");
+        assert_eq!(path_suffix("voted_notarize", None), "");
+        assert_eq!(path_suffix("first_shred", Some(true)), "");
+        assert_eq!(path_suffix("block_emitted", Some(false)), "");
+    }
+
+    // SLOTS-02 regression guard. Anchor-note text branches on the
+    // label of the earliest observed event, not on `we_are_leader`
+    // alone. The pre-fix code claimed "t0 = our local replay
+    // complete" for every non-leader slot, which is wrong for
+    // non-leader slots with a `first_shred` event (the majority).
+    #[test]
+    fn anchor_note_first_shred_describes_shred_receipt() {
+        for we_are_leader in [true, false] {
+            let note = anchor_note("first_shred", we_are_leader);
+            assert!(
+                note[0].contains("first shred") && note[0].contains("t0"),
+                "line 0 = {:?}",
+                note[0],
+            );
+            assert!(note[1].contains("finalized"), "line 1 = {:?}", note[1]);
+        }
+    }
+
+    #[test]
+    fn anchor_note_block_emitted_leader_describes_production() {
+        let note = anchor_note("block_emitted", true);
+        assert!(note[0].contains("we produced"), "line 0 = {:?}", note[0]);
+        assert!(
+            note[1].contains("consensus round"),
+            "line 1 = {:?}",
+            note[1]
+        );
+    }
+
+    #[test]
+    fn anchor_note_block_emitted_non_leader_describes_replay() {
+        let note = anchor_note("block_emitted", false);
+        assert!(
+            note[0].contains("local replay complete"),
+            "line 0 = {:?}",
+            note[0]
+        );
+        assert!(
+            note[1].contains("tail of the round"),
+            "line 1 = {:?}",
+            note[1]
+        );
+    }
+
+    #[test]
+    fn fmt_sigs_none_is_empty() {
+        assert_eq!(fmt_sigs(None), "");
+    }
+
+    #[test]
+    fn fmt_sigs_small_counts_render_as_integer() {
+        assert_eq!(fmt_sigs(Some(0)), "0");
+        assert_eq!(fmt_sigs(Some(999)), "999");
+    }
+
+    #[test]
+    fn fmt_sigs_large_counts_render_as_k() {
+        assert_eq!(fmt_sigs(Some(1_000)), "1k");
+        // 33_747 observed max on cadabra.log — rounds to 34k.
+        assert_eq!(fmt_sigs(Some(33_747)), "34k");
     }
 }

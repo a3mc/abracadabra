@@ -125,17 +125,30 @@ pub const CANONICAL_SKIP_BAD_PCT: f64 = 2.0;
 /// multi-day, multi-validator corpus is available.
 pub const TRUE_FB_ELEVATED_PCT: f64 = 0.5;
 
-/// Per-slot assembly time (first_shred → block_emitted) in ms. Baseline
-/// sits ≈ 450 ms in a healthy 21h log; 500 ms is the visible-spike
-/// floor (shred propagation / replay bottlenecks); >600 ms is well
-/// past the 400 ms slot target and starts crowding the next slot.
-pub const ASSEMBLY_WARN_MS: f64 = 500.0;
-pub const ASSEMBLY_BAD_MS: f64 = 600.0;
+/// Per-slot assembly time (first_shred → block_emitted) in ms.
+/// Alpenglow-era baseline: only the first slot of each 4-slot leader
+/// window carries a `First shred` event (subsequent slots inherit the
+/// same shred stream), so the sample is window-starts only. Observed
+/// distribution on cadabra.log: p50 ≈ 245 ms, p95 ≈ 300 ms. Green
+/// covers the healthy p50 band, cyan the upper tail, red flags
+/// genuine spikes past shred-propagation / replay stalls.
+pub const ASSEMBLY_WARN_MS: f64 = 250.0;
+pub const ASSEMBLY_BAD_MS: f64 = 300.0;
 
-/// Per-slot lifecycle time (first_shred → finalized) in ms. 600 ms is
-/// the healthy-cluster line; >1000 ms is degraded.
-pub const LIFECYCLE_WARN_MS: f64 = 600.0;
-pub const LIFECYCLE_BAD_MS: f64 = 1000.0;
+/// Per-slot lifecycle time (first_shred → finalized) in ms.
+/// Alpenglow-era: same window-start sampling as assembly. Observed
+/// distribution on cadabra.log: p50 ≈ 302 ms, p95 ≈ 440 ms,
+/// p99 ≈ 495 ms, max ≈ 880 ms.
+///
+/// Thresholds are calibrated for a "healthy = green, tail = red"
+/// reading rather than pinned to the ~250 ms Alpenglow target
+/// (which the empirical median already exceeds). At the current
+/// bounds the distribution splits ~90/9/1 green/cyan/red on the
+/// reference log: green covers the healthy operating envelope,
+/// cyan flags the upper tail, red marks genuine spikes past
+/// double the median.
+pub const LIFECYCLE_WARN_MS: f64 = 380.0;
+pub const LIFECYCLE_BAD_MS: f64 = 500.0;
 
 /// Three-tier band for "higher is better" metrics (fast-finalize %,
 /// FIN %, anything where larger values are healthier).
@@ -157,6 +170,23 @@ pub fn band_lower_better(v: f64, warn_at: f64, bad_at: f64) -> Style {
         good_style()
     } else if v < bad_at {
         warn_style()
+    } else {
+        bad_style()
+    }
+}
+
+/// Three-tier band for latency metrics where yellow reads too harsh
+/// for the small window between "healthy" and "degraded". Same shape
+/// as `band_lower_better`, but the middle band uses accent (cyan)
+/// instead of warn (yellow) so operators don't over-react to slots
+/// sitting a few ms above the green line under normal Alpenglow
+/// jitter. Reserve `band_lower_better` for metrics where the middle
+/// band genuinely warrants a warning colour (skip rate, error rate).
+pub fn band_latency_soft(v: f64, warn_at: f64, bad_at: f64) -> Style {
+    if v < warn_at {
+        good_style()
+    } else if v < bad_at {
+        accent_style()
     } else {
         bad_style()
     }
