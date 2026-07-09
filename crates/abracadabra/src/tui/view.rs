@@ -38,6 +38,11 @@ pub struct SlotViewRow {
     pub safe_to_notar: bool,
     pub safe_to_skip: bool,
     pub crashed_leader: bool,
+    /// `signature_count` from the `bank frozen` log line — signed tx
+    /// count in the block. `None` when the local node did not bank
+    /// this slot (repair-fetched slots, gossip-only observed slots).
+    /// Direct log field; no derivation.
+    pub signature_count: Option<u64>,
 }
 
 impl SlotViewRow {
@@ -70,6 +75,7 @@ impl SlotViewRow {
             safe_to_notar: r.safe_to_notar_at.is_some(),
             safe_to_skip: r.safe_to_skip_at.is_some(),
             crashed_leader: r.timeout_crashed_leader_at.is_some(),
+            signature_count: r.signature_count,
         }
     }
 
@@ -298,6 +304,7 @@ mod tests {
             safe_to_notar: false,
             safe_to_skip: false,
             crashed_leader: false,
+            signature_count: None,
         };
         assert_eq!(mk(false, false, false).vote_pattern(), "-");
         assert_eq!(mk(true, false, false).vote_pattern(), "N");

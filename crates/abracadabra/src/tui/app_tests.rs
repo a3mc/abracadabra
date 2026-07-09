@@ -173,6 +173,7 @@ fn row(status: SlotStatus, skip: SkipClassification) -> SlotViewRow {
         safe_to_notar: false,
         safe_to_skip: false,
         crashed_leader: false,
+        signature_count: None,
     }
 }
 

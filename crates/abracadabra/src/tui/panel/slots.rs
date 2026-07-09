@@ -222,15 +222,18 @@ fn render_reference(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // top pad — breathing room above "Latency bands:"
-            Constraint::Length(4), // latency content (1 title + 1 spacer + 2 bands)
-            Constraint::Length(1), // gap
-            Constraint::Min(12),   // legend — grows to fit wrap (title + spacer + 12 entries)
+            Constraint::Length(1),  // top pad — breathing room above "Latency bands:"
+            Constraint::Length(4),  // latency content (1 title + 1 spacer + 2 bands)
+            Constraint::Length(1),  // gap
+            Constraint::Length(18), // legend — title + spacer + 12 entries + wraps
+            Constraint::Length(1),  // gap
+            Constraint::Min(0),     // selected-slot detail card fills remaining space
         ])
         .split(inner);
 
     render_latency_reference(app, frame, chunks[1]);
     render_legend(app.slot_filters, frame, chunks[3]);
+    render_slot_detail(app, frame, chunks[5]);
 }
 
 fn render_latency_reference(_app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
@@ -260,6 +263,150 @@ fn render_latency_reference(_app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Span::styled(" ms", theme::label_style()),
         ]),
     ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Selected-slot detail card.
+///
+/// Uses `app.slot_scroll` as the cursor into `app.slot_indices` to
+/// find the slot currently focused in the table. Looks up the full
+/// `SlotRecord` from `app.state.slots` for direct access to every
+/// captured timestamp + `signature_count` + `block_id`.
+///
+/// **Every displayed field is a literal log-event timestamp or a
+/// direct log field.** No inference, no correlation, no derived
+/// state. Deltas are simple subtraction from a `t0` anchor:
+///
+/// - Leader slots: `t0 = block_emitted_at`. `first_shred_at` is
+///   unavailable (we don't receive our own first shred), so the
+///   `assembly` window is not shown.
+/// - Non-leader slots: `t0 = first_shred_at` when present, else
+///   `block_emitted_at`. Assembly window (`t0` → `block_emitted_at`)
+///   is displayed.
+/// - Skipped slots: whichever event fires first is `t0`.
+///
+/// Rows appear in temporal order (naturally sorted by ascending
+/// timestamp). Missing events are omitted entirely — the card
+/// shows only what actually happened.
+fn render_slot_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
+    if area.height < 3 || area.width < 30 {
+        return;
+    }
+
+    let Some(&row_ix) = app.slot_indices.get(app.slot_scroll) else {
+        return;
+    };
+    let Some(row) = app.slot_rows.get(row_ix) else {
+        return;
+    };
+    let Some(rec) = app.state.slots.get(&row.slot) else {
+        return;
+    };
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Header: slot · status · path/leader tags.
+    lines.push(section_title("Selected slot:"));
+    lines.push(Line::from(""));
+    let path_tag = match (row.status, row.fast) {
+        (SlotStatus::FastFinalized, _) | (_, Some(true)) => " fast",
+        (SlotStatus::SlowFinalized, _) | (_, Some(false)) => " slow",
+        _ => "",
+    };
+    let ldr_tag = if row.we_are_leader {
+        "  ·  leader"
+    } else {
+        ""
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  slot ", theme::label_style()),
+        Span::styled(commas(row.slot), theme::value_style()),
+        Span::styled("  ·  ", theme::label_style()),
+        Span::styled(row.status_str().to_string(), theme::value_style()),
+        Span::styled(path_tag.to_string(), theme::label_style()),
+        Span::styled(ldr_tag.to_string(), theme::label_style()),
+    ]));
+
+    // block_id (short) + signature_count if present.
+    if rec.block_id.is_some() || rec.signature_count.is_some() {
+        let mut meta = vec![Span::styled("  ", theme::label_style())];
+        if let Some(bid) = &rec.block_id {
+            let short = if bid.len() > 8 {
+                format!("{}…", &bid[..8])
+            } else {
+                bid.clone()
+            };
+            meta.push(Span::styled("block ", theme::label_style()));
+            meta.push(Span::styled(short, theme::value_style()));
+        }
+        if let Some(sigs) = rec.signature_count {
+            if rec.block_id.is_some() {
+                meta.push(Span::styled("  ·  ", theme::label_style()));
+            }
+            meta.push(Span::styled("sigs ", theme::label_style()));
+            meta.push(Span::styled(commas(sigs), theme::value_style()));
+        }
+        lines.push(Line::from(meta));
+    }
+
+    lines.push(Line::from(""));
+
+    // Timeline.
+    // Collect (timestamp, label) pairs for events that actually fired.
+    // Then sort ascending and format as "+X ms label" against t0.
+    let events: [(Option<time::OffsetDateTime>, &str); 12] = [
+        (rec.first_shred_at, "first_shred"),
+        (rec.block_emitted_at, "block_emitted"),
+        (rec.voted_notarize_at, "voted_notarize"),
+        (rec.block_notarized_at, "block_notarized"),
+        (rec.notar_fallback_at, "notar_fallback"),
+        (rec.voted_finalize_at, "voted_finalize"),
+        (rec.voted_skip_at, "voted_skip"),
+        (rec.safe_to_notar_at, "safe_to_notar"),
+        (rec.safe_to_skip_at, "safe_to_skip"),
+        (rec.timeout_at, "timeout"),
+        (rec.timeout_crashed_leader_at, "timeout_crashed_leader"),
+        (rec.finalized_at, "finalized"),
+    ];
+    let mut present: Vec<(time::OffsetDateTime, &str)> = events
+        .iter()
+        .filter_map(|(t, l)| t.map(|ts| (ts, *l)))
+        .collect();
+    present.sort_by_key(|(t, _)| *t);
+
+    if present.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no events observed for this slot yet",
+            theme::label_style(),
+        )));
+    } else {
+        let t0 = present[0].0;
+        for (ts, label) in &present {
+            let delta_ms = (*ts - t0).whole_microseconds() as f64 / 1000.0;
+            let delta_str = if delta_ms.abs() < 0.05 {
+                "     +0 ms".to_owned()
+            } else {
+                format!("{delta_ms:+7.1} ms")
+            };
+            // Suffix tag on notar_fallback → the "slow path" marker.
+            let suffix = if *label == "notar_fallback" {
+                "  (slow-path)"
+            } else if *label == "finalized" && matches!(row.fast, Some(true)) {
+                "  (fast-path)"
+            } else if *label == "finalized" && matches!(row.fast, Some(false)) {
+                "  (slow-path)"
+            } else {
+                ""
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", theme::label_style()),
+                Span::styled(format!("{label:<20}"), theme::label_style()),
+                Span::styled(delta_str, theme::value_style()),
+                Span::styled(suffix.to_string(), theme::label_style()),
+            ]));
+        }
+    }
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -480,6 +627,7 @@ fn render_table(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         "consensus",
         "lifecycle",
         "vote",
+        "sigs",
         "events",
     ])
     .style(theme::label_style().add_modifier(Modifier::BOLD));
@@ -521,6 +669,7 @@ fn render_table(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
             Constraint::Length(11), // consensus
             Constraint::Length(11), // lifecycle
             Constraint::Length(7),  // vote
+            Constraint::Length(7),  // sigs — signature_count from `bank frozen`
             Constraint::Min(15),    // events — fills remaining width
         ],
     )
@@ -633,8 +782,25 @@ fn row_for(s: &SlotViewRow) -> Row<'_> {
         Line::from(Span::styled(consensus_text, consensus_style)),
         Line::from(Span::styled(fmt_ms(s.lifecycle_ms), lat_style)),
         Line::from(Span::styled(s.vote_pattern(), theme::value_style())),
+        Line::from(Span::styled(
+            fmt_sigs(s.signature_count),
+            theme::value_style(),
+        )),
         Line::from(Span::styled(events, theme::warn_style())),
     ])
+}
+
+/// Compact signature_count formatter matching the Live tab's leader-
+/// pane style. Empty when we did not bank the slot.
+fn fmt_sigs(v: Option<u64>) -> String {
+    let Some(n) = v else {
+        return String::new();
+    };
+    if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn events_str(s: &SlotViewRow) -> String {
