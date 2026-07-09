@@ -170,7 +170,7 @@ pub enum EventKind {
         /// Parent block id.
         parent_hash: String,
     },
-    /// `Parent ready N (parent_slot, parent_hash)` — normal-path ParentReady
+    /// `Parent ready N Block { slot: parent_slot, block_id: parent_hash }` — normal-path ParentReady
     /// trigger from `ParentReadyTracker`. Marks slot `N` as ready to be
     /// produced or voted on (parent block is itself notarized).
     ///

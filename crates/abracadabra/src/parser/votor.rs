@@ -5,8 +5,8 @@
 //! pubkey here and dispatch on the first token of the event text.
 //!
 //! Dispatch is keyed on the first word to avoid running every regex on every
-//! line. Patterns with tuple payloads (Block, Finalized, SafeToNotar,
-//! ProduceWindow, StandstillEnded) use regex; the rest use plain `strip_prefix`.
+//! line. Patterns with `Block`-struct payloads (Block, Finalized, SafeToNotar,
+//! ProduceWindow, ParentReady) use regex; the rest use plain `strip_prefix`.
 
 use std::sync::OnceLock;
 
@@ -49,22 +49,21 @@ fn first_word(s: &str) -> &str {
 
 fn parse_block_variant(event: &str) -> Option<EventKind> {
     let after = event.strip_prefix("Block ")?;
-    if after.starts_with('(') {
-        parse_block_with_parent(after)
-    } else if let Some(rest) = after.strip_prefix("Notarized ") {
+    if let Some(rest) = after.strip_prefix("Notarized ") {
         let (slot, hash) = parse_tuple(rest)?;
         Some(EventKind::BlockNotarized { slot, hash })
     } else if let Some(rest) = after.strip_prefix("notar-fallback ") {
         let (slot, hash) = parse_tuple(rest)?;
         Some(EventKind::BlockNotarFallback { slot, hash })
+    } else if after.starts_with("Block { slot: ") {
+        parse_block_with_parent(after)
     } else {
         None
     }
 }
 
 fn parse_block_with_parent(after_block: &str) -> Option<EventKind> {
-    let re = re_block_with_parent();
-    let caps = re.captures(after_block)?;
+    let caps = re_block_with_parent().captures(after_block)?;
     let slot = caps[1].parse().ok()?;
     let hash = caps[2].to_owned();
     let parent_slot = caps[3].parse().ok()?;
@@ -143,7 +142,7 @@ fn parse_safe_to_skip(event: &str) -> Option<EventKind> {
     Some(EventKind::SafeToSkip { slot })
 }
 
-// ---- Tuple-payload events ----
+// ---- Block-struct-payload events ----
 
 fn parse_safe_to_notar(event: &str) -> Option<EventKind> {
     let rest = event.strip_prefix("SafeToNotar ")?;
@@ -152,8 +151,7 @@ fn parse_safe_to_notar(event: &str) -> Option<EventKind> {
 }
 
 fn parse_finalized(event: &str) -> Option<EventKind> {
-    let re = re_finalized();
-    let caps = re.captures(event)?;
+    let caps = re_finalized().captures(event)?;
     let slot = caps[1].parse().ok()?;
     let hash = caps[2].to_owned();
     let fast = match &caps[3] {
@@ -165,8 +163,7 @@ fn parse_finalized(event: &str) -> Option<EventKind> {
 }
 
 fn parse_produce_window(event: &str) -> Option<EventKind> {
-    let re = re_produce_window();
-    let caps = re.captures(event)?;
+    let caps = re_produce_window().captures(event)?;
     let start = caps[1].parse().ok()?;
     let end = caps[2].parse().ok()?;
     let parent_slot = caps[3].parse().ok()?;
@@ -250,26 +247,30 @@ fn parse_parent_ready(event: &str) -> Option<EventKind> {
 
 // ---- Shared helpers ----
 
-/// Parse `(SLOT, HASH)` into `(u64, String)`.
+/// Parse `Block { slot: SLOT, block_id: HASH }REST` into `(u64, String)`.
 ///
-/// Used by the `strip_prefix` dispatch paths (`Block Notarized`, `Block
-/// notar-fallback`, `SafeToNotar`) which — unlike the regex paths — have
-/// no inline alphabet check. The hash is length- and alphabet-validated
-/// via `validate_base58_hash` to match the regex paths' `HASH_CHARS`
-/// bound; the trailing slice after `)` must be ASCII whitespace only,
-/// mirroring `VotingNotarize` (PARSE-02) so a future emitter that
+/// `REST` must be ASCII whitespace only. Used by the `strip_prefix` dispatch
+/// paths (`Block Notarized`, `Block notar-fallback`, `SafeToNotar`) which —
+/// unlike the regex paths — have no inline alphabet check. The hash is length-
+/// and alphabet-validated via `validate_base58_hash` to match the regex paths'
+/// `HASH_CHARS` bound; the trailing slice after `}` must be ASCII whitespace
+/// only, mirroring `VotingNotarize` (PARSE-02) so a future emitter that
 /// appends a trailing field cannot be silently swallowed.
+///
+/// The tuple form `(SLOT, HASH)` was the pre-refactor Alpenglow Debug output
+/// (`type Block = (Slot, Hash)`). Upstream refactored to
+/// `struct Block { slot, block_id }` and the tuple form no longer emits;
+/// the parser targets the struct form only.
 fn parse_tuple(s: &str) -> Option<(u64, String)> {
-    let inner = s.strip_prefix('(')?;
-    let close = inner.find(')')?;
-    let pair = &inner[..close];
-    let tail = &inner[close + 1..];
+    let inner = s.strip_prefix("Block { slot: ")?;
+    let (slot_str, after_slot) = inner.split_once(", block_id: ")?;
+    let slot: u64 = slot_str.parse().ok()?;
+    let close = after_slot.find(" }")?;
+    let hash = validate_base58_hash(&after_slot[..close])?.to_owned();
+    let tail = &after_slot[close + 2..];
     if !tail.as_bytes().iter().all(|b| matches!(b, b' ' | b'\t')) {
         return None;
     }
-    let (slot_str, hash) = pair.split_once(", ")?;
-    let slot = slot_str.parse().ok()?;
-    let hash = validate_base58_hash(hash)?.to_owned();
     Some((slot, hash))
 }
 
@@ -282,7 +283,7 @@ fn re_block_with_parent() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^\(({SLOT_DIGITS}), ({HASH_CHARS})\) parent \(({SLOT_DIGITS}), ({HASH_CHARS})\)$"
+            r"^Block \{{ slot: ({SLOT_DIGITS}), block_id: ({HASH_CHARS}) \}} parent Block \{{ slot: ({SLOT_DIGITS}), block_id: ({HASH_CHARS}) \}}$"
         ))
     })
 }
@@ -291,7 +292,7 @@ fn re_finalized() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^Finalized \(({SLOT_DIGITS}), ({HASH_CHARS})\) fast: (true|false)$"
+            r"^Finalized Block \{{ slot: ({SLOT_DIGITS}), block_id: ({HASH_CHARS}) \}} fast: (true|false)$"
         ))
     })
 }
@@ -300,7 +301,7 @@ fn re_produce_window() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^ProduceWindow LeaderWindowInfo \{{ start_slot: ({SLOT_DIGITS}), end_slot: ({SLOT_DIGITS}), parent_block: \(({SLOT_DIGITS}), ({HASH_CHARS})\)"
+            r"^ProduceWindow LeaderWindowInfo \{{ start_slot: ({SLOT_DIGITS}), end_slot: ({SLOT_DIGITS}), parent_block: Block \{{ slot: ({SLOT_DIGITS}), block_id: ({HASH_CHARS}) \}}"
         ))
     })
 }
@@ -328,7 +329,7 @@ fn re_parent_ready() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         must_compile(&format!(
-            r"^Parent ready ({SLOT_DIGITS}) \(({SLOT_DIGITS}), ({HASH_CHARS})\)$"
+            r"^Parent ready ({SLOT_DIGITS}) Block \{{ slot: ({SLOT_DIGITS}), block_id: ({HASH_CHARS}) \}}$"
         ))
     })
 }
@@ -337,9 +338,9 @@ fn re_parent_ready() -> &'static Regex {
 mod tests {
     use super::*;
 
-    // Verbatim samples lifted from docs/alpenglow/log-strings-reference.md.
-    // Each test feeds the parser the same body shape it would see at runtime:
-    // `<pubkey>: <event-text>`.
+    // Verbatim samples lifted from cadabra.log (2026-07-09 Alpenglow
+    // 200ms-blocks capture). Each test feeds the parser the same body shape
+    // it would see at runtime: `<pubkey>: <event-text>`.
 
     const PK: &str = "ALNSCyaSLbRDwmFcGoBV1irHDKPgRxZjfNTex9HPvkWu";
 
@@ -350,15 +351,16 @@ mod tests {
     #[test]
     fn block_with_parent() {
         let s = body(
-            "Block (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) \
-             parent (1028069, CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW)",
+            "Block Block { slot: 702540, block_id: \
+             6mARivgNupeinAsK1sssaP4P8QezwYwW73wb35Njr8jv } parent Block { slot: 702535, \
+             block_id: 6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }",
         );
         let ev = parse_body(&s).unwrap();
         assert!(matches!(
             ev,
             EventKind::Block {
-                slot: 1028070,
-                parent_slot: 1028069,
+                slot: 702540,
+                parent_slot: 702535,
                 ..
             }
         ));
@@ -366,22 +368,24 @@ mod tests {
 
     #[test]
     fn block_notarized() {
-        let s = body("Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)");
+        let s = body(
+            "Block Notarized Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }",
+        );
         let ev = parse_body(&s).unwrap();
-        assert!(matches!(
-            ev,
-            EventKind::BlockNotarized { slot: 1028070, .. }
-        ));
+        assert!(matches!(ev, EventKind::BlockNotarized { slot: 702535, .. }));
     }
 
     #[test]
     fn block_notar_fallback() {
-        let s =
-            body("Block notar-fallback (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)");
+        let s = body(
+            "Block notar-fallback Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }",
+        );
         let ev = parse_body(&s).unwrap();
         assert!(matches!(
             ev,
-            EventKind::BlockNotarFallback { slot: 1028070, .. }
+            EventKind::BlockNotarFallback { slot: 702535, .. }
         ));
     }
 
@@ -451,10 +455,13 @@ mod tests {
 
     #[test]
     fn safe_to_notar() {
-        let s = body("SafeToNotar (1051172, DTBC1p4b31RH7hRZFZxg4pSxwrsyE4ycmZrTKcTc6ygz)");
+        let s = body(
+            "SafeToNotar Block { slot: 706643, block_id: \
+             EzNUMTPeenPo6d194TAzn3eonj6KJZWd7ynaachXjgqG }",
+        );
         assert!(matches!(
             parse_body(&s).unwrap(),
-            EventKind::SafeToNotar { slot: 1051172, .. }
+            EventKind::SafeToNotar { slot: 706643, .. }
         ));
     }
 
@@ -470,10 +477,10 @@ mod tests {
     #[test]
     fn produce_window() {
         let s = body(
-            "ProduceWindow LeaderWindowInfo { \
-             start_slot: 1028248, end_slot: 1028251, \
-             parent_block: (1028247, GG5ybXkSgf97V5BWgRFQKkweMMvabhaMy16XPsNtjwbB), \
-             block_timer: Instant { tv_sec: 654042, tv_nsec: 317064752 } }",
+            "ProduceWindow LeaderWindowInfo { start_slot: 702540, \
+             end_slot: 702543, parent_block: Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }, block_timer: \
+             Instant { tv_sec: 216365, tv_nsec: 811320941 } }",
         );
         let ev = parse_body(&s).unwrap();
         let EventKind::ProduceWindow {
@@ -485,20 +492,22 @@ mod tests {
         else {
             panic!("expected ProduceWindow");
         };
-        assert_eq!(start, 1_028_248);
-        assert_eq!(end, 1_028_251);
-        assert_eq!(parent_slot, 1_028_247);
+        assert_eq!(start, 702_540);
+        assert_eq!(end, 702_543);
+        assert_eq!(parent_slot, 702_535);
     }
 
     #[test]
     fn finalized_fast_true() {
-        let s =
-            body("Finalized (1207084, 5RBfaAmnWYr2R4WVRHUatyMdpKQr7FU9yeqHuwzBgpqc) fast: true");
+        let s = body(
+            "Finalized Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } fast: true",
+        );
         let ev = parse_body(&s).unwrap();
         assert!(matches!(
             ev,
             EventKind::Finalized {
-                slot: 1207084,
+                slot: 702535,
                 fast: true,
                 ..
             }
@@ -507,10 +516,19 @@ mod tests {
 
     #[test]
     fn finalized_fast_false() {
-        let s =
-            body("Finalized (1207084, 5RBfaAmnWYr2R4WVRHUatyMdpKQr7FU9yeqHuwzBgpqc) fast: false");
+        let s = body(
+            "Finalized Block { slot: 702664, block_id: \
+             9sFV88boAJkE231ME6aj2uYcEYa6tp6BxFGVmx4SzrWJ } fast: false",
+        );
         let ev = parse_body(&s).unwrap();
-        assert!(matches!(ev, EventKind::Finalized { fast: false, .. }));
+        assert!(matches!(
+            ev,
+            EventKind::Finalized {
+                slot: 702664,
+                fast: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -581,16 +599,19 @@ mod tests {
 
     #[test]
     fn parent_ready_normal_path() {
-        let s = body("Parent ready 282584 (282579, 5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM)");
+        let s = body(
+            "Parent ready 702536 Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }",
+        );
         match parse_body(&s).unwrap() {
             EventKind::ParentReady {
                 slot,
                 parent_slot,
                 parent_hash,
             } => {
-                assert_eq!(slot, 282_584);
-                assert_eq!(parent_slot, 282_579);
-                assert_eq!(parent_hash, "5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM");
+                assert_eq!(slot, 702_536);
+                assert_eq!(parent_slot, 702_535);
+                assert_eq!(parent_hash, "6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2");
             }
             other => panic!("expected ParentReady, got {other:?}"),
         }
@@ -598,17 +619,23 @@ mod tests {
 
     #[test]
     fn parent_ready_garbage_hash_rejected() {
-        let s = body("Parent ready 282584 (282579, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        // OIl0 contains four invalid Base58 chars.
+        let s = body(
+            "Parent ready 702536 Block { slot: 702535, block_id: \
+             OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA }",
+        );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn parent_ready_distinct_from_triggering() {
-        let normal =
-            body("Parent ready 282584 (282579, 5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM)");
+        let normal = body(
+            "Parent ready 702536 Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }",
+        );
         let trig = body(
-            "Triggering parent ready for slot 282584 with parent 282579 \
-             5eUpus9uoYxorimbnhrg6h1HmrS5tsH7p3SEAokGYmmM",
+            "Triggering parent ready for slot 702536 with parent 702535 \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2",
         );
         assert!(matches!(
             parse_body(&normal).unwrap(),
@@ -630,8 +657,8 @@ mod tests {
     fn malformed_body_returns_none() {
         // Missing pubkey prefix.
         assert!(parse_body("Voting notarize for 1028070 EEZ").is_none());
-        // Truncated tuple.
-        assert!(parse_body(&body("Block Notarized (123, ")).is_none());
+        // Truncated struct payload.
+        assert!(parse_body(&body("Block Notarized Block { slot: 123, block_id: ")).is_none());
     }
 
     // ---- PARSE-02: Voting notarize must not silently swallow trailing fields ----
@@ -665,29 +692,37 @@ mod tests {
         assert!(parse_body(&s).is_none());
     }
 
-    // ---- PARSE-01: tuple-payload hashes must be Base58-validated ----
+    // ---- PARSE-01 + COV-02: struct-payload hashes must be Base58-validated ----
 
     #[test]
     fn block_notarized_garbage_hash_rejected() {
-        // OIl0 contains four invalid Base58 chars; previously accepted.
-        let s = body("Block Notarized (123, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        // OIl0 contains four invalid Base58 chars.
+        let s = body(
+            "Block Notarized Block { slot: 123, block_id: \
+             OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA }",
+        );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn safe_to_notar_garbage_hash_rejected() {
-        let s = body("SafeToNotar (1051172, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        let s = body(
+            "SafeToNotar Block { slot: 1051172, block_id: \
+             OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA }",
+        );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn block_notar_fallback_garbage_hash_rejected() {
-        let s =
-            body("Block notar-fallback (1028070, OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)");
+        let s = body(
+            "Block notar-fallback Block { slot: 1028070, block_id: \
+             OIl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA }",
+        );
         assert!(parse_body(&s).is_none());
     }
 
-    // ---- PARSE-04: numeric-overflow handling ----
+    // ---- PARSE-04 + COV-03: numeric-overflow handling ----
 
     #[test]
     fn slot_overflow_returns_none() {
@@ -697,39 +732,72 @@ mod tests {
     }
 
     #[test]
-    fn slot_overflow_in_tuple_returns_none() {
+    fn slot_overflow_in_struct_returns_none() {
+        // COV-03: struct-form slot overflow must return None.
         let s = body(
-            "Block Notarized (18446744073709551616, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)",
+            "Block Notarized Block { slot: 18446744073709551616, block_id: \
+             EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv }",
         );
         assert!(parse_body(&s).is_none());
     }
 
-    // ---- PARSE-05: tuple-payload hash length must be bounded (32..=48) ----
+    // ---- PARSE-05 + COV-02: hash length must be bounded (32..=48) ----
 
     #[test]
-    fn block_notarized_short_hash_rejected() {
-        // 4-char hash is base58-alphabet-valid but below the 32-char minimum.
-        let s = body("Block Notarized (1028070, EEZ7)");
+    fn block_notarized_31_char_hash_rejected() {
+        // COV-02: 31 chars is one below the 32-char minimum.
+        let h = "1".repeat(31);
+        let s = body(&format!(
+            "Block Notarized Block {{ slot: 1028070, block_id: {h} }}"
+        ));
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
-    fn block_notarized_overlong_hash_rejected() {
-        // 49 chars exceeds the 48-char maximum.
-        let h = "A".repeat(49);
-        let s = body(&format!("Block Notarized (1028070, {h})"));
+    fn block_notarized_hash_at_min_length_accepted() {
+        // COV-02: 32 chars is exactly the lower bound.
+        let h = "1".repeat(32);
+        let s = body(&format!(
+            "Block Notarized Block {{ slot: 1028070, block_id: {h} }}"
+        ));
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::BlockNotarized { slot: 1028070, .. }
+        ));
+    }
+
+    #[test]
+    fn block_notarized_hash_at_max_length_accepted() {
+        // COV-02: 48 chars is exactly the upper bound.
+        let h = "1".repeat(48);
+        let s = body(&format!(
+            "Block Notarized Block {{ slot: 1028070, block_id: {h} }}"
+        ));
+        assert!(matches!(
+            parse_body(&s).unwrap(),
+            EventKind::BlockNotarized { slot: 1028070, .. }
+        ));
+    }
+
+    #[test]
+    fn block_notarized_49_char_hash_rejected() {
+        // COV-02: 49 chars exceeds the 48-char maximum.
+        let h = "1".repeat(49);
+        let s = body(&format!(
+            "Block Notarized Block {{ slot: 1028070, block_id: {h} }}"
+        ));
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn block_notar_fallback_short_hash_rejected() {
-        let s = body("Block notar-fallback (1028070, EEZ7)");
+        let s = body("Block notar-fallback Block { slot: 1028070, block_id: EEZ7 }");
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn safe_to_notar_short_hash_rejected() {
-        let s = body("SafeToNotar (1028070, EEZ7)");
+        let s = body("SafeToNotar Block { slot: 1028070, block_id: EEZ7 }");
         assert!(parse_body(&s).is_none());
     }
 
@@ -746,60 +814,80 @@ mod tests {
         assert!(parse_body(&s).is_none());
     }
 
-    #[test]
-    fn block_notarized_hash_at_min_length_accepted() {
-        // 32 chars is exactly the lower bound; must accept.
-        let h = "1".repeat(32);
-        let s = body(&format!("Block Notarized (1028070, {h})"));
-        assert!(matches!(
-            parse_body(&s).unwrap(),
-            EventKind::BlockNotarized { slot: 1028070, .. }
-        ));
-    }
-
-    #[test]
-    fn block_notarized_hash_at_max_length_accepted() {
-        // 48 chars is exactly the upper bound; must accept.
-        let h = "1".repeat(48);
-        let s = body(&format!("Block Notarized (1028070, {h})"));
-        assert!(matches!(
-            parse_body(&s).unwrap(),
-            EventKind::BlockNotarized { slot: 1028070, .. }
-        ));
-    }
-
-    // ---- PARSE-06: tuple-payload events must reject trailing junk ----
+    // ---- PARSE-06 + COV-01: struct-payload events must reject trailing junk ----
 
     #[test]
     fn block_notarized_trailing_junk_rejected() {
         let s = body(
-            "Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) (forced)",
+            "Block Notarized Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } (forced)",
         );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn block_notar_fallback_trailing_junk_rejected() {
+        // COV-01: mirrors PARSE-06 for the notar-fallback path.
         let s = body(
-            "Block notar-fallback (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) (forced)",
+            "Block notar-fallback Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } (forced)",
         );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn safe_to_notar_trailing_junk_rejected() {
-        let s =
-            body("SafeToNotar (1051172, DTBC1p4b31RH7hRZFZxg4pSxwrsyE4ycmZrTKcTc6ygz) (forced)");
+        // COV-01: mirrors PARSE-06 for the SafeToNotar path.
+        let s = body(
+            "SafeToNotar Block { slot: 706643, block_id: \
+             EzNUMTPeenPo6d194TAzn3eonj6KJZWd7ynaachXjgqG } (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn finalized_trailing_junk_rejected() {
+        // COV-01: mirrors PARSE-06 for the Finalized path. The `fast: BOOL`
+        // tail is required and anchored (`$`) by `re_finalized`; a trailing
+        // ` (forced)` after `fast: true` must not be silently swallowed.
+        let s = body(
+            "Finalized Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } fast: true (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn parent_ready_trailing_junk_rejected() {
+        // COV-01: mirrors PARSE-06 for the ParentReady path.
+        let s = body(
+            "Parent ready 702536 Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } (forced)",
+        );
+        assert!(parse_body(&s).is_none());
+    }
+
+    #[test]
+    fn block_with_parent_trailing_junk_rejected() {
+        // COV-01: mirrors PARSE-06 for the compound Block-with-parent path.
+        let s = body(
+            "Block Block { slot: 702540, block_id: \
+             6mARivgNupeinAsK1sssaP4P8QezwYwW73wb35Njr8jv } parent Block { slot: 702535, \
+             block_id: 6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 } (forced)",
+        );
         assert!(parse_body(&s).is_none());
     }
 
     #[test]
     fn block_notarized_trailing_whitespace_accepted() {
         // Pure trailing whitespace is benign, matching PARSE-02's stance on VotingNotarize.
-        let s = body("Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)  ");
+        let s = body(
+            "Block Notarized Block { slot: 702535, block_id: \
+             6ynog2g3R2cFhW8zFJbCSHjRkUCTSErP2XrifRJ9Cyx2 }  ",
+        );
         assert!(matches!(
             parse_body(&s).unwrap(),
-            EventKind::BlockNotarized { slot: 1028070, .. }
+            EventKind::BlockNotarized { slot: 702535, .. }
         ));
     }
 
@@ -812,5 +900,75 @@ mod tests {
             "Voting notarize for 1028070 EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv\u{00A0}",
         );
         assert!(parse_body(&s).is_none());
+    }
+
+    // ---- DRIFT-01: regression guard against upstream Debug-format drift ----
+    //
+    // The parser hard-codes the literal prefix `"Block { slot: "` and separator
+    // `", block_id: "` that Alpenglow's `#[derive(Debug)]` emits for
+    // `struct Block { slot, block_id }`. If a future upstream refactor adds a
+    // field, reorders them, or renames one, every affected event silently
+    // drops from parse counts — no error, just a metric that goes to zero.
+    //
+    // This test consumes a verbatim slab of cadabra.log (25 lines of each of
+    // the 8 struct-payload event kinds) and asserts every category yields at
+    // least one successful parse. The first `cargo test` after a rebase that
+    // changes Debug output will fail loudly here.
+
+    #[test]
+    fn drift_guard_cadabra_slab_parses_all_event_kinds() {
+        use crate::parser::{parse, EventKind, Parsed};
+
+        let slab = include_str!("testdata/cadabra_slab.log");
+
+        let mut n_block = 0u32;
+        let mut n_block_notarized = 0u32;
+        let mut n_block_notar_fallback = 0u32;
+        let mut n_finalized_fast = 0u32;
+        let mut n_finalized_slow = 0u32;
+        let mut n_safe_to_notar = 0u32;
+        let mut n_parent_ready = 0u32;
+        let mut n_produce_window = 0u32;
+        let mut total_lines = 0u32;
+        let mut parsed_lines = 0u32;
+
+        for line in slab.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            total_lines += 1;
+            let Ok(Parsed::Event(ev)) = parse(line) else {
+                continue;
+            };
+            parsed_lines += 1;
+            match ev.kind {
+                EventKind::Block { .. } => n_block += 1,
+                EventKind::BlockNotarized { .. } => n_block_notarized += 1,
+                EventKind::BlockNotarFallback { .. } => n_block_notar_fallback += 1,
+                EventKind::Finalized { fast: true, .. } => n_finalized_fast += 1,
+                EventKind::Finalized { fast: false, .. } => n_finalized_slow += 1,
+                EventKind::SafeToNotar { .. } => n_safe_to_notar += 1,
+                EventKind::ParentReady { .. } => n_parent_ready += 1,
+                EventKind::ProduceWindow { .. } => n_produce_window += 1,
+                _ => {}
+            }
+        }
+
+        assert!(total_lines > 0, "slab is empty");
+        assert_eq!(
+            parsed_lines, total_lines,
+            "some slab lines failed to parse (upstream Debug format drift?)"
+        );
+        assert!(n_block > 0, "Block-with-parent count is zero");
+        assert!(n_block_notarized > 0, "BlockNotarized count is zero");
+        assert!(
+            n_block_notar_fallback > 0,
+            "BlockNotarFallback count is zero"
+        );
+        assert!(n_finalized_fast > 0, "Finalized fast count is zero");
+        assert!(n_finalized_slow > 0, "Finalized slow count is zero");
+        assert!(n_safe_to_notar > 0, "SafeToNotar count is zero");
+        assert!(n_parent_ready > 0, "ParentReady count is zero");
+        assert!(n_produce_window > 0, "ProduceWindow count is zero");
     }
 }

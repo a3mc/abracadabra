@@ -17,16 +17,16 @@ fn ingest_lifecycle_round_trip() {
         "[2026-05-23T16:00:07.187019566Z INFO  agave_votor::event_handler] \
          ALNSCya: First shred 1028070",
         "[2026-05-23T16:00:07.257045933Z INFO  agave_votor::event_handler] \
-         ALNSCya: Block (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) \
-         parent (1028069, CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW)",
+         ALNSCya: Block Block { slot: 1028070, block_id: EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv } \
+         parent Block { slot: 1028069, block_id: CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW }",
         "[2026-05-23T16:00:07.257052546Z INFO  agave_votor::event_handler] \
          ALNSCya: Voting notarize for 1028070 EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv",
         "[2026-05-23T16:00:07.301219441Z INFO  agave_votor::event_handler] \
-         ALNSCya: Block Notarized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)",
+         ALNSCya: Block Notarized Block { slot: 1028070, block_id: EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv }",
         "[2026-05-23T16:00:07.301228498Z INFO  agave_votor::event_handler] \
          ALNSCya: Voting finalize for 1028070",
         "[2026-05-23T16:00:07.339120015Z INFO  agave_votor::event_handler] \
-         ALNSCya: Finalized (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) fast: true",
+         ALNSCya: Finalized Block { slot: 1028070, block_id: EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv } fast: true",
         "[2026-05-23T16:00:07.339131506Z INFO  agave_votor::root_utils] \
          ALNSCya: setting root 1028070",
         "[2026-05-23T16:00:07.346089002Z INFO  agave_votor::root_utils] \
@@ -79,7 +79,7 @@ fn block_notar_fallback_persists_hash() {
     parse_and_ingest(
         &mut state,
         "[2026-05-23T16:00:07.301219441Z INFO  agave_votor::event_handler] \
-         ALNSCya: Block notar-fallback (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)",
+         ALNSCya: Block notar-fallback Block { slot: 1028070, block_id: EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv }",
     );
     let rec = &state.slots[&1_028_070];
     assert!(rec.notar_fallback_at.is_some());
@@ -97,7 +97,7 @@ fn safe_to_notar_persists_hash() {
     parse_and_ingest(
         &mut state,
         "[2026-05-23T16:00:07.301219441Z INFO  agave_votor::event_handler] \
-         ALNSCya: SafeToNotar (1051172, DTBC1p4b31RH7hRZFZxg4pSxwrsyE4ycmZrTKcTc6ygz)",
+         ALNSCya: SafeToNotar Block { slot: 1051172, block_id: DTBC1p4b31RH7hRZFZxg4pSxwrsyE4ycmZrTKcTc6ygz }",
     );
     let rec = &state.slots[&1_051_172];
     assert!(rec.safe_to_notar_at.is_some());
@@ -116,14 +116,14 @@ fn block_notar_fallback_does_not_overwrite_existing_block_id() {
     parse_and_ingest(
         &mut state,
         "[2026-05-23T16:00:07.257045933Z INFO  agave_votor::event_handler] \
-         ALNSCya: Block (1028070, EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv) \
-         parent (1028069, CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW)",
+         ALNSCya: Block Block { slot: 1028070, block_id: EEZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv } \
+         parent Block { slot: 1028069, block_id: CdJR4iF3xpkfSH62aMfBfJqKdpTR55KvFnHN93kPDUaW }",
     );
     // Hypothetical conflicting fallback hash on the same slot.
     parse_and_ingest(
         &mut state,
         "[2026-05-23T16:00:07.301219441Z INFO  agave_votor::event_handler] \
-         ALNSCya: Block notar-fallback (1028070, FFZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv)",
+         ALNSCya: Block notar-fallback Block { slot: 1028070, block_id: FFZ7rFBjoTPWcA4wY1Gyxbe5qWMCKfq6A7bM1nRKB3Pv }",
     );
     assert_eq!(
         state.slots[&1_028_070].block_id.as_deref(),

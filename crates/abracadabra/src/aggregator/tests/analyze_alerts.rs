@@ -16,7 +16,7 @@ fn analyze_double_call_panics_in_debug() {
         "[2026-05-23T16:01:22.065145178Z INFO  agave_votor::event_handler] \
          ALNSCya: ProduceWindow LeaderWindowInfo { \
          start_slot: 1028248, end_slot: 1028251, \
-         parent_block: (1028247, GG5ybXkSgf97V5BWgRFQKkweMMvabhaMy16XPsNtjwbB), \
+         parent_block: Block { slot: 1028247, block_id: GG5ybXkSgf97V5BWgRFQKkweMMvabhaMy16XPsNtjwbB }, \
          block_timer: Instant { tv_sec: 654042, tv_nsec: 317064752 } }",
     );
     analyze(&mut state);

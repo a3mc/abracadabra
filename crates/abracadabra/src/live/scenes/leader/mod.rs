@@ -3,10 +3,10 @@
 //! The pane joins the event streams keyed on our `ProduceWindow`
 //! ranges to produce honest per-slot status:
 //!
-//! - `Block (N, hash) parent (…)` — our block emitted
+//! - `Block Block { slot: N, block_id: HASH } parent Block { … }` — our block emitted
 //! - `First shred N`              — first shred for the slot retransmitted
 //! - `bank frozen N hash` … sig=K — block banked, K transactions
-//! - `Finalized (N, hash) fast`   — finalization arrived (with fast/slow tag)
+//! - `Finalized Block { slot: N, block_id: HASH } fast: BOOL` — finalization arrived (fast/slow tag)
 //! - `Voting skip for N`          — local validator cast a skip vote
 //! - `Voting skip-fallback for N` — fallback-round skip vote
 //! - `Unable to produce window N-M, skipping window: <reason>` —
