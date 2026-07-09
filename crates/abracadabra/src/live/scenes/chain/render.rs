@@ -246,6 +246,8 @@ fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
     render_bucket(pane, frame, bucket_area, pane.cannon.last_tick());
     let stream_area = compute_tx_stream_area(viz, bucket_area);
     render_tx_stream(pane, frame, stream_area);
+    let packed_area = compute_top_packed_area(viz, bucket_area);
+    render_top_packed(pane, frame, packed_area);
 }
 
 /// Width budget for the left-side tx stream — `slot bar count`
@@ -253,6 +255,12 @@ fn render_visualisation(pane: &ChainPane, frame: &mut Frame<'_>, viz: Rect) {
 /// stream is skipped entirely (returns zero-area rect).
 const TX_STREAM_MAX_WIDTH: u16 = 14;
 const TX_STREAM_MIN_WIDTH: u16 = 10;
+
+/// Width budget for the right-side top-3 packed leaderboard.
+/// Row shape `#N SLOT COUNT` takes ~14 cells; the title line
+/// takes 12. Below the minimum the panel is skipped entirely.
+const TOP_PACKED_MAX_WIDTH: u16 = 16;
+const TOP_PACKED_MIN_WIDTH: u16 = 14;
 
 /// 9-level horizontal-bar glyphs for the tx-stream column. Cell 0
 /// is blank (renders only when the slot's count is missing or
@@ -520,6 +528,130 @@ fn render_tx_stream(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
         }
         for ch in count_text.chars().take(remaining) {
             buf[(x, y)].set_char(ch).set_style(count_style);
+            x = x.saturating_add(1);
+        }
+    }
+}
+
+/// Position the right-side top-packed leaderboard rect: the strip
+/// between the right edge of `bucket` (plus one column of breathing
+/// space on the left) and the right edge of `viz`, with a matching
+/// one-column gap on the right so the count text does not render
+/// flush against the pane border. Returns a zero-area rect when the
+/// available width is below [`TOP_PACKED_MIN_WIDTH`].
+fn compute_top_packed_area(viz: Rect, bucket: Rect) -> Rect {
+    let viz_right = viz.x.saturating_add(viz.width);
+    let bucket_right = bucket.x.saturating_add(bucket.width);
+    // Need at least: bucket-right | left-gap | panel | right-gap | viz-right.
+    if bucket_right.saturating_add(2) >= viz_right {
+        return Rect::new(viz.x, viz.y, 0, 0);
+    }
+    let panel_right = viz_right.saturating_sub(1);
+    let raw_w = panel_right.saturating_sub(bucket_right).saturating_sub(1);
+    let w = raw_w.min(TOP_PACKED_MAX_WIDTH);
+    if w < TOP_PACKED_MIN_WIDTH {
+        return Rect::new(viz.x, viz.y, 0, 0);
+    }
+    let x = panel_right.saturating_sub(w);
+    Rect::new(x, viz.y, w, viz.height)
+}
+
+/// Paint the top-3 super-block leaderboard. Row shape:
+/// ```text
+/// top packed
+///  #1 849087  10k
+///  #2 849091   9k
+///  #3 849096   8k
+/// ```
+/// Entries with `sigs == 0` are hidden (empty slot); on a fresh log
+/// the panel shows only the title until the first non-zero
+/// `BankFrozen` lands. Renders inline via the buffer so wrapping /
+/// alignment stays under our control.
+fn render_top_packed(pane: &ChainPane, frame: &mut Frame<'_>, area: Rect) {
+    if area.width < TOP_PACKED_MIN_WIDTH || area.height < 2 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let dim_gray = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let count_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    // Row 0 — title.
+    let title = " top packed";
+    for (col, ch) in title.chars().enumerate() {
+        let x = area
+            .x
+            .saturating_add(u16::try_from(col).unwrap_or(u16::MAX));
+        if x >= area.x.saturating_add(area.width) {
+            break;
+        }
+        buf[(x, area.y)].set_char(ch).set_style(title_style);
+    }
+
+    // Rows 1..=3 — leaderboard entries. Skip zero-slot rows (unfilled).
+    for (rank_idx, (slot, sigs)) in pane.top_packed.iter().enumerate() {
+        let row_y = area
+            .y
+            .saturating_add(u16::try_from(rank_idx + 1).unwrap_or(u16::MAX));
+        if row_y >= area.y.saturating_add(area.height) {
+            break;
+        }
+        if *sigs == 0 {
+            continue;
+        }
+        let rank = rank_idx + 1;
+        let count_text = compact_count(*sigs);
+        // Layout: " #R SSSSSS   CCC" — 1 pad + 2 rank + 1 sp + 6 slot
+        // + right-aligned count in the remaining width.
+        let mut x = area.x;
+        let end = area.x.saturating_add(area.width);
+        buf[(x, row_y)].set_char(' ');
+        x = x.saturating_add(1);
+        let rank_field = format!("#{rank}");
+        for ch in rank_field.chars() {
+            if x >= end {
+                break;
+            }
+            buf[(x, row_y)].set_char(ch).set_style(dim_gray);
+            x = x.saturating_add(1);
+        }
+        if x < end {
+            buf[(x, row_y)].set_char(' ');
+            x = x.saturating_add(1);
+        }
+        let slot_field = format!("{slot:>6}");
+        for ch in slot_field.chars() {
+            if x >= end {
+                break;
+            }
+            buf[(x, row_y)].set_char(ch).set_style(dim_gray);
+            x = x.saturating_add(1);
+        }
+        // Right-align count into remaining width.
+        #[allow(clippy::cast_possible_truncation)]
+        let remaining = end.saturating_sub(x) as usize;
+        if remaining == 0 {
+            continue;
+        }
+        let pad = remaining.saturating_sub(count_text.len());
+        for _ in 0..pad {
+            if x >= end {
+                break;
+            }
+            buf[(x, row_y)].set_char(' ');
+            x = x.saturating_add(1);
+        }
+        for ch in count_text.chars().take(remaining) {
+            if x >= end {
+                break;
+            }
+            buf[(x, row_y)].set_char(ch).set_style(count_style);
             x = x.saturating_add(1);
         }
     }
@@ -885,6 +1017,149 @@ mod tests {
             "LSKIP slot must NOT appear in stream (bucket already paints ▴): \
              {collected:?}"
         );
+    }
+
+    #[test]
+    fn render_top_packed_paints_title_and_ranked_rows() {
+        // NIT-02: drive three BankFrozen events with sig counts
+        // 5_000, 12_000, 8_000. Expected ordering after inserts:
+        // #1 slot 101 = 12k, #2 slot 102 = 8k, #3 slot 100 = 5k.
+        // Assert the title row, the top rank row, and the last
+        // rank row against a `TestBackend` buffer to anchor the
+        // panel layout.
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        let inserts: [(u64, u64); 3] = [(100, 5_000), (101, 12_000), (102, 8_000)];
+        for (slot, sigs) in inserts {
+            pane.on_event(&crate::parser::Event {
+                ts: OffsetDateTime::UNIX_EPOCH,
+                kind: EventKind::BankFrozen {
+                    slot,
+                    hash: "h".into(),
+                    signature_count: sigs,
+                },
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 16, 5);
+        terminal
+            .draw(|f| render_top_packed(&pane, f, area))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+
+        // Row 0 — title.
+        let row0 = row_text(0);
+        assert!(
+            row0.contains("top packed"),
+            "row 0 missing title `top packed`: {row0:?}"
+        );
+
+        // Row 1 — #1 slot 101, count 12k (highest tracked).
+        let row1 = row_text(1);
+        assert!(
+            row1.contains("101"),
+            "row 1 missing top slot digits 101: {row1:?}"
+        );
+        assert!(
+            row1.contains("12k"),
+            "row 1 missing top compact count 12k: {row1:?}"
+        );
+
+        // Row 3 — #3 slot 100, count 5k (smallest tracked).
+        let row3 = row_text(3);
+        assert!(
+            row3.contains("100"),
+            "row 3 missing smallest slot digits 100: {row3:?}"
+        );
+        assert!(
+            row3.contains("5k"),
+            "row 3 missing smallest compact count 5k: {row3:?}"
+        );
+    }
+
+    #[test]
+    fn render_top_packed_hides_zero_entries() {
+        // NIT-02: on a fresh pane with no BankFrozen observed, the
+        // leaderboard entries are all `(0, 0)` and must be hidden
+        // (`sigs == 0` skip). Only the title row is painted; rows
+        // 1..=3 must not carry any `#N` rank marker.
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+
+        let pane = ChainPane::new();
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 16, 5);
+        terminal
+            .draw(|f| render_top_packed(&pane, f, area))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        };
+
+        for y in 1..=3u16 {
+            let text = row_text(y);
+            for marker in ["#1", "#2", "#3"] {
+                assert!(
+                    !text.contains(marker),
+                    "row {y} must not contain rank marker {marker:?} on empty pane: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_top_packed_returns_early_on_narrow_area() {
+        // NIT-02: area width below `TOP_PACKED_MIN_WIDTH` (14) must
+        // trigger the early return. Drive a populated pane so any
+        // stray write would materialise as digits or a `#N` marker,
+        // then render into a 13-cell-wide rect and assert the
+        // buffer stays entirely blank (no cells written anywhere).
+        use crate::live::animation::Pane;
+        use crate::parser::EventKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::buffer::Buffer;
+        use ratatui::Terminal;
+        use time::OffsetDateTime;
+
+        let mut pane = ChainPane::new();
+        pane.on_event(&crate::parser::Event {
+            ts: OffsetDateTime::UNIX_EPOCH,
+            kind: EventKind::BankFrozen {
+                slot: 100,
+                hash: "h".into(),
+                signature_count: 12_000,
+            },
+        });
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let area = Rect::new(0, 0, 13, 5);
+        terminal
+            .draw(|f| render_top_packed(&pane, f, area))
+            .unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        for y in 0..5u16 {
+            for x in 0..20u16 {
+                let ch = buffer[(x, y)].symbol().chars().next().unwrap_or(' ');
+                assert_eq!(
+                    ch, ' ',
+                    "narrow-area early return must leave cell ({x},{y}) blank; found {ch:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1128,4 +1128,55 @@ mod tests {
             "pruned-slot cache must persist; got {cached_before:?} -> {cached_after:?}",
         );
     }
+
+    fn bank_frozen_ev(slot: u64, sigs: u64) -> Event {
+        mk(EventKind::BankFrozen {
+            slot,
+            hash: "h".into(),
+            signature_count: sigs,
+        })
+    }
+
+    #[test]
+    fn top_packed_records_first_three_in_descending_order() {
+        let mut p = ChainPane::new();
+        p.on_event(&bank_frozen_ev(100, 5_000));
+        p.on_event(&bank_frozen_ev(101, 12_000));
+        p.on_event(&bank_frozen_ev(102, 8_000));
+        assert_eq!(p.top_packed[0], (101, 12_000));
+        assert_eq!(p.top_packed[1], (102, 8_000));
+        assert_eq!(p.top_packed[2], (100, 5_000));
+    }
+
+    #[test]
+    fn top_packed_evicts_smallest_when_full() {
+        let mut p = ChainPane::new();
+        p.on_event(&bank_frozen_ev(100, 5_000));
+        p.on_event(&bank_frozen_ev(101, 12_000));
+        p.on_event(&bank_frozen_ev(102, 8_000));
+        p.on_event(&bank_frozen_ev(103, 20_000)); // new #1
+        assert_eq!(p.top_packed[0], (103, 20_000));
+        assert_eq!(p.top_packed[1], (101, 12_000));
+        assert_eq!(p.top_packed[2], (102, 8_000));
+    }
+
+    #[test]
+    fn top_packed_ignores_zero_signature_slots() {
+        let mut p = ChainPane::new();
+        p.on_event(&bank_frozen_ev(100, 0));
+        p.on_event(&bank_frozen_ev(101, 0));
+        assert_eq!(p.top_packed, [(0, 0); 3]);
+    }
+
+    #[test]
+    fn top_packed_first_wins_on_repeated_bank_frozen() {
+        // Fork case: same slot BankFrozen twice with different hashes.
+        // The first-wins guard on `signature_count` means the leaderboard
+        // takes the first observation and ignores the second.
+        let mut p = ChainPane::new();
+        p.on_event(&bank_frozen_ev(100, 5_000));
+        p.on_event(&bank_frozen_ev(100, 99_000)); // fork with higher sigs
+        assert_eq!(p.top_packed[0], (100, 5_000));
+        assert_eq!(p.top_packed[1], (0, 0));
+    }
 }

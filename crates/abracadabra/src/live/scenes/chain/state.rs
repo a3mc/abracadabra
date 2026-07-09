@@ -161,6 +161,14 @@ pub struct ChainPane {
     /// duration. Render reads `particles` (in flight) and `matrix`
     /// (landed) to paint the visualisation. See [`super::particle`].
     pub(super) cannon: CannonSystem,
+    /// Session-long top-3 leaderboard of packed blocks, sorted
+    /// descending by `signature_count`. Populated on the FIRST
+    /// `BankFrozen` for a slot (fork-safe: matches
+    /// `SlotState::signature_count` first-wins semantics). Never reset
+    /// — persists across bucket wipes. Zero-count entries are hidden
+    /// at render time so the panel is empty until the first non-zero
+    /// slot is observed.
+    pub(super) top_packed: [(u64, u64); 3],
 }
 
 impl ChainPane {
@@ -175,7 +183,35 @@ impl ChainPane {
             event_count: 0,
             last_event_at: None,
             cannon: CannonSystem::new(),
+            top_packed: [(0, 0); 3],
         }
+    }
+
+    /// Attempt to insert `(slot, sigs)` into the top-3 leaderboard.
+    /// The array is kept sorted descending by `sigs`. `sigs == 0` is
+    /// rejected (matches the reference log's typical `sig_count: 0`
+    /// on a sparse-traffic testnet — those slots are not "packed").
+    /// Idempotent on repeat calls for the same slot: if the slot is
+    /// already in the array the call is a no-op regardless of the
+    /// new `sigs` value (the first-wins invariant on the underlying
+    /// `SlotState::signature_count` means the caller should only
+    /// invoke this on the first `BankFrozen` for a slot).
+    pub(super) fn record_packed(&mut self, slot: u64, sigs: u64) {
+        if sigs == 0 {
+            return;
+        }
+        if self.top_packed.iter().any(|&(s, _)| s == slot) {
+            return;
+        }
+        // Find insertion index: first slot with strictly-lower sigs.
+        let Some(pos) = self.top_packed.iter().position(|&(_, s)| sigs > s) else {
+            return;
+        };
+        // Shift lower entries down, then place the new one.
+        for i in (pos + 1..self.top_packed.len()).rev() {
+            self.top_packed[i] = self.top_packed[i - 1];
+        }
+        self.top_packed[pos] = (slot, sigs);
     }
 
     pub(super) fn tip_slot(&self) -> Option<u64> {
@@ -523,7 +559,11 @@ impl ChainPane {
                 // bucket renders a ⊕ fork glyph anyway, so the tx
                 // stream value for a forked slot is informative not
                 // authoritative.
+                let was_none = s.signature_count.is_none();
                 s.signature_count.get_or_insert(*signature_count);
+                if was_none {
+                    self.record_packed(*slot, *signature_count);
+                }
                 Some(*slot)
             }
             EventKind::VotingNotarize { slot, .. } => {
