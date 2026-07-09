@@ -383,9 +383,12 @@ fn render_slot_detail(app: &App<'_>, frame: &mut Frame<'_>, area: Rect) {
         )));
     } else {
         let t0 = present[0].0;
-        for (ts, label) in &present {
+        let anchor = anchor_label(present[0].1, row.we_are_leader);
+        for (idx, (ts, label)) in present.iter().enumerate() {
             let delta_ms = (*ts - t0).whole_microseconds() as f64 / 1000.0;
-            let delta_str = if delta_ms.abs() < 0.05 {
+            let delta_str = if idx == 0 {
+                anchor.to_owned()
+            } else if delta_ms.abs() < 0.05 {
                 "     +0 ms".to_owned()
             } else {
                 format!("{delta_ms:+7.1} ms")
@@ -813,6 +816,27 @@ fn path_suffix(label: &str, fast: Option<bool>) -> &'static str {
     }
 }
 
+/// Anchor-column label for the earliest event in the detail-card
+/// timeline. Named after the actual event class so the reader can tell
+/// what kind of anchor `t0` is from the delta column alone, without
+/// having to consult the footer note.
+///
+/// - `first_shred` → `(start)`: shred-receipt anchor, the operator-
+///   observable start of the slot's local lifecycle.
+/// - `block_emitted` + leader → `(emit)`: we produced the block.
+/// - `block_emitted` + non-leader → `(replay)`: repair-fetched slot,
+///   no first-shred event; the anchor is local replay-complete.
+/// - anything else → `(anchor)`: generic fallback for skipped-slot
+///   anchors on vote or timeout events.
+fn anchor_label(t0_label: &str, we_are_leader: bool) -> &'static str {
+    match (t0_label, we_are_leader) {
+        ("first_shred", _) => "   (start)",
+        ("block_emitted", true) => "    (emit)",
+        ("block_emitted", false) => "  (replay)",
+        _ => "  (anchor)",
+    }
+}
+
 /// Two-line explanatory note about what `t0` means in the detail
 /// card's timeline, branched on the label of the earliest observed
 /// event and whether we were the leader for the slot.
@@ -887,7 +911,7 @@ fn pct(num: u64, denom: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_note, fmt_sigs, path_suffix};
+    use super::{anchor_label, anchor_note, fmt_sigs, path_suffix};
 
     // SLOTS-01 regression guard. The `notar_fallback` suffix must
     // only fire on genuine slow-path finalizations; on the ~99.9% of
@@ -960,6 +984,65 @@ mod tests {
             "line 1 = {:?}",
             note[1]
         );
+    }
+
+    #[test]
+    fn anchor_label_first_shred_reads_start() {
+        for we_are_leader in [true, false] {
+            assert!(
+                anchor_label("first_shred", we_are_leader).contains("(start)"),
+                "label = {:?}",
+                anchor_label("first_shred", we_are_leader),
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_label_block_emitted_leader_reads_emit() {
+        assert!(
+            anchor_label("block_emitted", true).contains("(emit)"),
+            "label = {:?}",
+            anchor_label("block_emitted", true),
+        );
+    }
+
+    #[test]
+    fn anchor_label_block_emitted_non_leader_reads_replay() {
+        assert!(
+            anchor_label("block_emitted", false).contains("(replay)"),
+            "label = {:?}",
+            anchor_label("block_emitted", false),
+        );
+    }
+
+    #[test]
+    fn anchor_label_fallback_reads_anchor() {
+        assert!(
+            anchor_label("voted_skip", false).contains("(anchor)"),
+            "label = {:?}",
+            anchor_label("voted_skip", false),
+        );
+    }
+
+    #[test]
+    fn anchor_label_column_width_matches_delta_column() {
+        // The anchor label must occupy the same column width (10 chars)
+        // as `"     +0 ms"` / `"{:+7.1} ms"` so the delta column stays
+        // aligned when the first row is the anchor.
+        for (label, ldr) in [
+            ("first_shred", true),
+            ("first_shred", false),
+            ("block_emitted", true),
+            ("block_emitted", false),
+            ("voted_skip", false),
+        ] {
+            assert_eq!(
+                anchor_label(label, ldr).chars().count(),
+                10,
+                "label = {:?}",
+                anchor_label(label, ldr),
+            );
+        }
     }
 
     #[test]
